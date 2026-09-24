@@ -12,7 +12,7 @@
 //! after "X is not"? A model that has read a lot of text knows how things
 //! are usually said, and this puts that knowledge to work.
 
-use crate::brain::Brain;
+use crate::brain::{Brain, Prefix};
 use crate::config::{load_persona, Persona, Settings};
 use crate::knowledge::{Hit, KnowledgeStore};
 use crate::rng::Rng;
@@ -155,10 +155,20 @@ fn evidence_then(text: &str, passages: &[&Hit]) -> String {
     parts.join("\n\n")
 }
 
-pub fn negation_test(brain: &Brain, neg: &Negation, passages: &[&Hit], settings: &Settings, mut rng: Option<&mut Rng>) -> NegationTest {
+/// Room the negation test needs after the evidence.
+fn negation_room(brain: &Brain, neg: &Negation) -> usize {
+    let len = |t: &str| brain.tokenizer.encode(t).len();
+    len(&neg.stated_prefix).max(len(&neg.flipped_prefix)) + len(&neg.rest) + 3
+}
+
+/// `evidence`: the knowledge-base passages already run through the model
+/// (`evidence_prefix`), shared by both versions of the claim.
+pub fn negation_test(brain: &Brain, neg: &Negation, evidence: &Prefix, settings: &Settings, mut rng: Option<&mut Rng>) -> NegationTest {
     let rest = vec![format!(" {}", neg.rest)];
-    let stated = brain.score(&evidence_then(&neg.stated_prefix, passages), &rest, rng.as_deref_mut())[0];
-    let flipped = brain.score(&evidence_then(&neg.flipped_prefix, passages), &rest, rng)[0];
+    let stated_p = brain.extend(evidence, &neg.stated_prefix, rng.as_deref_mut());
+    let stated = brain.score_after(&stated_p, &rest, rng.as_deref_mut())[0];
+    let flipped_p = brain.extend(evidence, &neg.flipped_prefix, rng.as_deref_mut());
+    let flipped = brain.score_after(&flipped_p, &rest, rng)[0];
     let contrast = stated - flipped;
     NegationTest {
         flipped: neg.flipped.clone(),
@@ -318,6 +328,14 @@ impl<'a> Scorer<'a> {
         scores.iter().zip(&self.baseline).map(|(s, b)| s - b).collect()
     }
 
+    fn pmi_after(&self, prefix: &Prefix, rng: Option<&mut Rng>) -> Vec<f32> {
+        if self.probes.is_empty() {
+            return Vec::new();
+        }
+        let scores = self.brain.score_after(prefix, &self.probes, rng);
+        scores.iter().zip(&self.baseline).map(|(s, b)| s - b).collect()
+    }
+
     fn signal(&self, pmi: &[f32], persona: &Persona) -> f32 {
         let mean = |qs: &[String]| {
             if qs.is_empty() {
@@ -336,14 +354,17 @@ pub struct Pass {
     pub judge: Judgement,
 }
 
-fn speak(brain: &Brain, prompt: &str, persona: &Persona, settings: &Settings, rng: &mut Rng) -> String {
+/// The persona's position, in the model's words, continuing after the prompt.
+fn speak(brain: &Brain, prompt: &Prefix, persona: &Persona, settings: &Settings, rng: &mut Rng) -> String {
     let g = &settings.council.generate;
-    let text = brain.generate(&format!("{prompt} {}", persona.lead_in), g.max_new_tokens, g.temperature, g.top_k, rng);
+    let lead = brain.extend(prompt, &format!(" {}", persona.lead_in), None);
+    let text = brain.generate_after(&lead, g.max_new_tokens, g.temperature, g.top_k, rng);
     format!("{} {text}", persona.lead_in).trim().to_string()
 }
 
 /// One pass: panel then Judge. `stochastic` switches dropout on while
-/// scoring (Monte Carlo dropout), used by the repeat run.
+/// scoring (Monte Carlo dropout), used by the repeat run - which only
+/// scores: the positions in words are left empty.
 pub fn run_council(
     brain: &Brain, claim: &str, routing: &Routing, passages: &[Hit], familiarity: &Familiarity,
     settings: &Settings, stochastic: bool, seed: u64,
@@ -360,10 +381,23 @@ pub fn run_council(
     let rng_opt = |r: &mut Rng| if stochastic { Some(Rng::new(r.next_u64())) } else { None };
 
     let refs: Vec<&Hit> = passages.iter().collect();
-    let full_prompt = build_prompt(claim, &refs);
-    let full = scorer.pmi_all(&full_prompt, rng_opt(&mut score_rng).as_mut());
-    let bare = if passages.is_empty() { full.clone() } else { scorer.pmi_all(&build_prompt(claim, &[]), rng_opt(&mut score_rng).as_mut()) };
-    let per_passage: Vec<Vec<f32>> = refs.iter().map(|h| scorer.pmi_all(&build_prompt(claim, &[*h]), rng_opt(&mut score_rng).as_mut())).collect();
+    // The evidence runs through the model once: the claim follows it (then
+    // every persona is scored against, and continues, that), and so do both
+    // versions of the negation test.
+    let negation = negate(claim);
+    let claim_text = as_sentence(claim);
+    let reserve = (brain.tokenizer.encode(&claim_text).len() + settings.council.generate.max_new_tokens + 32)
+        .max(negation.as_ref().map_or(0, |n| negation_room(brain, n)));
+    let evidence = brain.prefix(&evidence_then("", &refs), reserve, rng_opt(&mut score_rng).as_mut());
+    let full_prefix = brain.extend(&evidence, &claim_text, rng_opt(&mut score_rng).as_mut());
+    let full = scorer.pmi_after(&full_prefix, rng_opt(&mut score_rng).as_mut());
+    // Which passages moved each persona (shown for the first pass only)
+    let bare = if passages.is_empty() || stochastic { full.clone() } else { scorer.pmi_all(&build_prompt(claim, &[]), None) };
+    let per_passage: Vec<Vec<f32>> = if stochastic {
+        Vec::new()
+    } else {
+        refs.iter().map(|h| scorer.pmi_all(&build_prompt(claim, &[*h]), None)).collect()
+    };
 
     let mut panel = Vec::new();
     for (name, persona) in names.iter().zip(&personas) {
@@ -389,15 +423,15 @@ pub fn run_council(
         panel.push(PersonaResult {
             persona: name.to_string(),
             role: persona.role.clone(),
-            position: speak(brain, &full_prompt, persona, settings, &mut gen_rng),
+            position: if stochastic { String::new() } else { speak(brain, &full_prefix, persona, settings, &mut gen_rng) },
             key_points,
             signal: (signal * 1000.0).round() / 1000.0,
             confidence,
             confidence_before_cap: (confidence != own).then_some(own),
         });
     }
-    let negation = negate(claim).map(|n| negation_test(brain, &n, &refs, settings, rng_opt(&mut score_rng).as_mut()));
-    let own_words = speak(brain, &full_prompt, &judge_persona, settings, &mut gen_rng);
+    let negation = negation.map(|n| negation_test(brain, &n, &evidence, settings, rng_opt(&mut score_rng).as_mut()));
+    let own_words = if stochastic { String::new() } else { speak(brain, &full_prefix, &judge_persona, settings, &mut gen_rng) };
     let judge = judge(&panel, negation.as_ref(), familiarity, settings, own_words);
     Ok(Pass { panel, negation, judge })
 }
@@ -517,7 +551,8 @@ pub fn evaluate(brain: &Brain, claim: &str, settings: &Settings, opts: &Options,
     let (mut consistency, mut note) = (None, None);
     if opts.recheck.unwrap_or(settings.uncertainty.enabled) {
         log("Re-running with dropout on, to check the council agrees with itself");
-        let rerun = run_council(brain, claim, &routing, &memory, &familiarity, settings, true, seed.wrapping_add(1))?;
+        let mut rerun = run_council(brain, claim, &routing, &memory, &familiarity, settings, true, seed.wrapping_add(1))?;
+        rerun.judge.in_its_own_words = first.judge.in_its_own_words.clone();
         let reasons = compare_verdicts(&first.judge, &rerun.judge);
         if !reasons.is_empty() {
             overall = Confidence::Low;
@@ -614,9 +649,10 @@ mod tests {
     fn a_trained_model_prefers_what_it_read_to_its_negation() {
         let (_tmp, s) = trained(150);
         let brain = Brain::load(&s).unwrap();
-        let read = negation_test(&brain, &negate("Light is refracted when it passes from air into glass").unwrap(), &[], &s, None);
+        let none = brain.prefix("", 40, None);
+        let read = negation_test(&brain, &negate("Light is refracted when it passes from air into glass").unwrap(), &none, &s, None);
         assert!(read.contrast > 0.0, "{read:?}");
-        let flipped = negation_test(&brain, &negate("Light is not refracted when it passes from air into glass").unwrap(), &[], &s, None);
+        let flipped = negation_test(&brain, &negate("Light is not refracted when it passes from air into glass").unwrap(), &none, &s, None);
         assert!((flipped.contrast + read.contrast).abs() < 1e-3, "{flipped:?} vs {read:?}");
     }
 

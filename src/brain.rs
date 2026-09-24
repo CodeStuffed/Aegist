@@ -28,6 +28,18 @@ impl std::fmt::Display for NoBrain {
 }
 impl std::error::Error for NoBrain {}
 
+/// A prompt already run through the model: score or continue after it
+/// without recomputing it.
+#[derive(Clone)]
+pub struct Prefix {
+    ids: Vec<u32>,
+    cache: KvCache,
+    /// log-probabilities of the next token
+    logp: Vec<f32>,
+    /// positions kept free after it for what follows
+    reserve: usize,
+}
+
 pub struct Brain {
     pub model: InferModel,
     pub tokenizer: Tokenizer,
@@ -91,23 +103,65 @@ impl Brain {
         (cache, last)
     }
 
-    /// Mean log-probability per token of each continuation after `prompt`.
-    pub fn score(&self, prompt: &str, continuations: &[String], mut rng: Option<&mut Rng>) -> Vec<f32> {
-        let v = self.model.cfg.vocab_size;
-        let conts: Vec<Vec<u32>> = continuations
+    fn encode_continuations(&self, continuations: &[String], room: usize) -> Vec<Vec<u32>> {
+        continuations
             .iter()
             .map(|s| {
                 let mut ids = self.tokenizer.encode(s);
-                ids.truncate(self.block() / 2);
+                ids.truncate((self.block() / 2).min(room).max(1));
                 if ids.is_empty() {
                     ids.push(self.lead[0]);
                 }
                 ids
             })
-            .collect();
+            .collect()
+    }
+
+    /// Run `prompt` through the model (cut from the left to leave `reserve`
+    /// positions free), to score or continue after it.
+    pub fn prefix(&self, prompt: &str, reserve: usize, rng: Option<&mut Rng>) -> Prefix {
+        let ids = self.fit_prompt(prompt, reserve);
+        let (cache, logp) = self.prefill(&ids, rng);
+        Prefix { ids, cache, logp, reserve }
+    }
+
+    /// `p` followed by `text`, run on top of p's cache.
+    pub fn extend(&self, p: &Prefix, text: &str, rng: Option<&mut Rng>) -> Prefix {
+        let new = self.tokenizer.encode(text);
+        if new.is_empty() {
+            return p.clone();
+        }
+        if p.ids.len() + new.len() + p.reserve > self.block() {
+            // doesn't fit on top: start again from the text, cut from the left
+            let own = p.ids.strip_prefix(self.lead.as_slice()).unwrap_or(&p.ids);
+            return self.prefix(&format!("{}{text}", self.tokenizer.decode(own)), p.reserve, rng);
+        }
+        let (c, v) = (self.model.cfg.d_model, self.model.cfg.vocab_size);
+        let out = self.model.infer(&p.cache, &new, 1, new.len(), rng);
+        let mut cache = p.cache.clone();
+        for r in 0..new.len() {
+            cache.push_row(&out, r, c);
+        }
+        let mut logp = out.logits[(new.len() - 1) * v..new.len() * v].to_vec();
+        log_softmax(&mut logp);
+        let mut ids = p.ids.clone();
+        ids.extend(new);
+        Prefix { ids, cache, logp, reserve: p.reserve }
+    }
+
+    /// Mean log-probability per token of each continuation after `prompt`.
+    pub fn score(&self, prompt: &str, continuations: &[String], mut rng: Option<&mut Rng>) -> Vec<f32> {
+        let longest = self.encode_continuations(continuations, self.block()).iter().map(Vec::len).max().unwrap_or(1);
+        let p = self.prefix(prompt, longest, rng.as_deref_mut());
+        self.score_after(&p, continuations, rng)
+    }
+
+    /// Mean log-probability per token of each continuation after `p`.
+    pub fn score_after(&self, p: &Prefix, continuations: &[String], rng: Option<&mut Rng>) -> Vec<f32> {
+        let v = self.model.cfg.vocab_size;
+        let conts = self.encode_continuations(continuations, self.block() - p.ids.len());
         let longest = conts.iter().map(Vec::len).max().unwrap_or(1);
-        let prompt_ids = self.fit_prompt(prompt, longest);
-        let (cache, first) = self.prefill(&prompt_ids, rng.as_deref_mut());
+        let (cache, first) = (&p.cache, &p.logp);
 
         // Every continuation minus its last token, padded to the same length;
         // the padding sits after the real tokens, so causal attention never sees it.
@@ -117,7 +171,7 @@ impl Brain {
             for (i, c) in conts.iter().enumerate() {
                 toks[i * ext_len..i * ext_len + c.len() - 1].copy_from_slice(&c[..c.len() - 1]);
             }
-            Some(self.model.infer(&cache, &toks, conts.len(), ext_len, rng))
+            Some(self.model.infer(cache, &toks, conts.len(), ext_len, rng))
         } else {
             None
         };
@@ -161,10 +215,15 @@ impl Brain {
 
     /// Sample a continuation. Stops at a paragraph break or after two sentences.
     pub fn generate(&self, prompt: &str, max_new: usize, temperature: f32, top_k: usize, rng: &mut Rng) -> String {
+        let p = self.prefix(prompt, max_new.min(self.block() - 1), None);
+        self.generate_after(&p, max_new, temperature, top_k, rng)
+    }
+
+    /// `generate`, continuing after `p`.
+    pub fn generate_after(&self, p: &Prefix, max_new: usize, temperature: f32, top_k: usize, rng: &mut Rng) -> String {
         let (c, v) = (self.model.cfg.d_model, self.model.cfg.vocab_size);
-        let max_new = max_new.min(self.block() - 1);
-        let ids = self.fit_prompt(prompt, max_new);
-        let (mut cache, mut logp) = self.prefill(&ids, None);
+        let max_new = max_new.min(self.block() - p.ids.len());
+        let (mut cache, mut logp) = (p.cache.clone(), p.logp.clone());
         let mut out: Vec<u32> = Vec::new();
         for _ in 0..max_new {
             let next = sample(&logp, temperature, top_k, rng);
@@ -236,6 +295,22 @@ mod tests {
         let noisy: Vec<f32> = (0..4).map(|i| brain.score("The market", &conts[..1], Some(&mut Rng::new(i)))[0]).collect();
         assert!(noisy.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-6));
         assert_eq!(brain.score("The market", &conts[..1], None), brain.score("The market", &conts[..1], None));
+    }
+
+    #[test]
+    fn prefixes_give_the_same_scores_as_whole_prompts() {
+        let (_tmp, s) = trained(30);
+        let brain = Brain::load(&s).unwrap();
+        let conts = vec![" glass.".to_string(), " a prism of light.".to_string()];
+        let whole = brain.score("Light is refracted when it passes from air into", &conts, None);
+        let p = brain.prefix("Light is refracted when it passes from air", 16, None);
+        let extended = brain.extend(&p, " into", None);
+        let after = brain.score_after(&extended, &conts, None);
+        assert!(whole.iter().zip(&after).all(|(a, b)| (a - b).abs() < 1e-4), "{whole:?} vs {after:?}");
+        // the same sample from a shared prefix as from the whole prompt
+        let a = brain.generate("White light is", 8, 0.8, 40, &mut Rng::new(3));
+        let b = brain.generate_after(&brain.prefix("White light is", 8, None), 8, 0.8, 40, &mut Rng::new(3));
+        assert_eq!(a, b);
     }
 
     #[test]

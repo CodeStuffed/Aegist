@@ -35,7 +35,7 @@ const LINK_MIN: f64 = 0.15;
 const TAIL_COMMIT: usize = 5_000;
 /// Opening indexes on disk first when more passage text than this isn't
 /// (a fresh import, an old index version): never load it all into RAM.
-const MAX_UNINDEXED_BYTES: u64 = 256 << 20;
+const MAX_UNINDEXED_BYTES: u64 = 16 << 20;
 /// Postings held in memory while building a segment before spilling a sorted
 /// run to disk (~8 bytes each, plus the words): bounds RAM at any size.
 const CHUNK_POSTINGS: usize = 30_000_000;
