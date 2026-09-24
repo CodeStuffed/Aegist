@@ -1,17 +1,53 @@
 backend:
-  prefer: cloud   # cloud | local | auto
+  # auto  - cloud if ANTHROPIC_API_KEY is set and the API answers, else local
+  # cloud - always the Anthropic API (errors if no key)
+  # local - always Ollama
+  prefer: auto
 
 cloud:
   judge_model: claude-opus-5-5
-  panel_model: claude-sonnet-5
+  panel_model: claude-sonnet-5     # Believer / Skeptic / Investor
+  router_model: claude-sonnet-5    # the cheap "is this a money idea?" call
+  max_tokens: 16000
+  # How hard each role thinks (low | medium | high | xhigh | max).
+  # Both default models always use adaptive thinking; effort is the knob.
+  effort:
+    judge: high
+    panel: medium
+    router: low
+  reachability_timeout_s: 5
 
 local:
+  host: http://localhost:11434     # OLLAMA_HOST env var overrides this
+  # The tier is picked from total RAM (or VRAM, if larger): the first tier
+  # whose max_ram_gb is >= this machine's memory. See README for why these tags.
   tiers:
-    tiny:   {max_ram_gb: 8,    ollama_model: "<pick a ~3B-class tag>"}
-    small:  {max_ram_gb: 16,   ollama_model: "<pick a ~7-8B-class tag>"}
-    medium: {max_ram_gb: 32,   ollama_model: "<pick a ~13-14B-class tag>"}
-    large:  {max_ram_gb: 9999, ollama_model: "<pick a ~30B+-class tag>"}
+    tiny:   {max_ram_gb: 8,    ollama_model: "qwen3:4b"}
+    small:  {max_ram_gb: 16,   ollama_model: "qwen3:8b"}
+    medium: {max_ram_gb: 32,   ollama_model: "qwen3:14b"}
+    large:  {max_ram_gb: 9999, ollama_model: "qwen3:32b"}
+  model_override: null             # set a tag here to skip tier selection
+  think: false                     # sent to Ollama; set null for models without a thinking mode switch
+  num_ctx: 8192                    # Ollama's default window is too small for the Judge's prompt
+  request_timeout_s: 600
+
+memory:
+  top_k: 3                         # knowledge-base hits passed to each persona
+  max_distance: 0.6                # cosine distance; hits further away are dropped as irrelevant
+
+uncertainty:
+  enabled: true                    # re-run the council once and compare verdicts
+  rerun_temperature: 0.8           # applied on the local backend; see README for cloud
 
 research:
-  max_calls_per_hour: 6
+  model: claude-sonnet-5
+  effort: medium
+  web_search_tool: web_search_20260209
+  max_searches_per_call: 5
+  max_calls_per_hour: 6            # hard cap on Messages API requests from the loop
+  refresh_hours: 168               # don't re-research a topic more often than this
+  idle_recheck_minutes: 10         # when nothing is due, how long to wait before looking again
   seed_topics: []
+
+paths:
+  data_dir: data                   # relative to the repo root

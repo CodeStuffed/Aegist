@@ -3,4 +3,5 @@ chromadb
 psutil
 python-dotenv
 PyYAML
+pytest
 requests
