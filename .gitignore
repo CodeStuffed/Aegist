@@ -1,0 +1,11 @@
+# Runtime data: knowledge base, session log, research state
+data/*
+!data/knowledge_base/
+data/knowledge_base/*
+!data/knowledge_base/.gitkeep
+
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

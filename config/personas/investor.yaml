@@ -1,0 +1,11 @@
+name: Investor
+role: Only runs for money ideas; weighs whether it would pay off.
+lead_in: "Financially, this"
+probes:
+  - " It will make money."
+  - " Customers will pay for it."
+  - " It is profitable."
+counter_probes:
+  - " It will lose money."
+  - " Nobody will pay for it."
+  - " It is unprofitable."

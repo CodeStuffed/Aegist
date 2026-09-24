@@ -1,6 +1,6 @@
-anthropic
-chromadb
+numpy
 psutil
-python-dotenv
 PyYAML
 requests
+threadpoolctl
+pytest

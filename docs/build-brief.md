@@ -1,3 +1,7 @@
+> **Superseded.** This was the original plan, built on Claude and Ollama. The project
+> has since changed direction: it now runs on a transformer written and trained from
+> scratch, with no outside AI. See the README for the current design.
+
 # The Council — Build Brief for Claude Opus 5.5
 
 *Evaluation-pipeline module for your business-agent system: Believer / Skeptic / Investor / Judge, running on a self-researching, hardware-aware backend.*

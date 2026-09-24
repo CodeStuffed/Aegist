@@ -1,17 +1,69 @@
-backend:
-  prefer: cloud   # cloud | local | auto
+# Everything here runs on this machine: a transformer written from scratch,
+# trained only on text you give it or that the research loop collects.
+# No outside AI services, no pretrained weights.
 
-cloud:
-  judge_model: claude-opus-5-5
-  panel_model: claude-sonnet-5
-
-local:
+model:
+  # Size of a NEW model, picked from total RAM: the first tier whose
+  # max_ram_gb is >= this machine's RAM. An existing trained model keeps
+  # the size it was created with.
   tiers:
-    tiny:   {max_ram_gb: 8,    ollama_model: "<pick a ~3B-class tag>"}
-    small:  {max_ram_gb: 16,   ollama_model: "<pick a ~7-8B-class tag>"}
-    medium: {max_ram_gb: 32,   ollama_model: "<pick a ~13-14B-class tag>"}
-    large:  {max_ram_gb: 9999, ollama_model: "<pick a ~30B+-class tag>"}
+    tiny:   {max_ram_gb: 8,    n_layer: 2, n_head: 4, d_model: 128, block_size: 128, vocab_size: 1024}
+    small:  {max_ram_gb: 16,   n_layer: 4, n_head: 6, d_model: 192, block_size: 128, vocab_size: 2048}
+    medium: {max_ram_gb: 32,   n_layer: 6, n_head: 8, d_model: 256, block_size: 192, vocab_size: 4096}
+    large:  {max_ram_gb: 9999, n_layer: 8, n_head: 8, d_model: 384, block_size: 256, vocab_size: 4096}
+  dropout: 0.1
+
+training:
+  batch_size: 16
+  learning_rate: 0.001       # peak; cosine-decays to 10% over each training session
+  warmup_steps: 100
+  weight_decay: 0.1
+  grad_clip: 1.0
+  val_fraction: 0.05         # tail of the corpus held out to measure real progress
+  eval_every_s: 60
+  checkpoint_every_s: 300
+  log_every_s: 10
+  tokenizer_train_chars: 3000000
+  min_corpus_tokens: 5000    # refuse to train on less than this
+  min_new_model_chars: 200000 # a new model's vocabulary is learned once, from at least this much text
+
+council:
+  generate:
+    max_new_tokens: 48
+    temperature: 0.8
+    top_k: 40
+  # Signals are PMI in nats/token: how much the claim raises the model's
+  # probability of a persona's probe phrases, versus a neutral lead-in.
+  neutral_prompt: "."
+  confidence_thresholds: {high: 0.5, medium: 0.15}
+  mixed_margin: 0.1          # |for - against| below this => "mixed"
+  # Familiarity = model loss on the claim / model's validation loss.
+  # Claims unlike anything it has read can't get high confidence.
+  familiarity: {medium_above: 1.25, low_above: 1.5}
+  min_tokens_trained: 2000000  # below this, everything is capped at Low
+
+router:
+  money_keywords: [price, pricing, prices, revenue, profit, profitable, margin, margins,
+                   subscription, subscriptions, customer, customers, market, sell, selling,
+                   sales, startup, business, monetize, monetization, charge, fee, fees,
+                   saas, invest, investment, investors, funding, cost, costs, "$"]
+
+memory:
+  top_k: 3                   # knowledge-base passages given to the council
+  min_relevance: 0.35        # share of the claim's (rarity-weighted) words a passage must match
+
+uncertainty:
+  enabled: true              # re-run the council with dropout on and compare
 
 research:
-  max_calls_per_hour: 6
-  seed_topics: []
+  wikipedia_api: https://en.wikipedia.org/w/api.php
+  articles_per_topic: 2
+  max_topics_per_hour: 6     # politeness cap on Wikipedia fetches
+  refresh_hours: 168         # don't re-fetch a topic more often than this
+  train_minutes_per_topic: 5 # self-training burst after each fetch
+  min_passage_chars: 150
+  seed_topics: [pricing strategy, unit economics, business model, startup company,
+                market (economics), logical fallacy, scientific method, evidence]
+
+paths:
+  data_dir: data             # relative to the repo root
