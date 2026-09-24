@@ -31,6 +31,9 @@ def test_empty_corpus_is_a_clear_error(settings):
 def test_tiny_corpus_is_a_clear_error(settings, tmp_path):
     (tmp_path / "t.txt").write_text("too short")
     trainer.import_texts(tmp_path / "t.txt", settings)
+    with pytest.raises(trainer.TrainingError, match="KB of text so far"):
+        trainer.train(steps=1, settings=settings, log=lambda *_: None)
+    settings["training"]["min_new_model_chars"] = 1
     with pytest.raises(trainer.TrainingError, match="only"):
         trainer.train(steps=1, settings=settings, log=lambda *_: None)
 

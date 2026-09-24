@@ -39,7 +39,8 @@ python cli.py research --hours 4                   # read Wikipedia, keep traini
 ```
 
 Plan on **several MB of text** at least. Books, articles, your own notes,
-anything in plain text. With a small corpus the model memorizes it:
+anything in plain text. A new model won't start from less than 200 KB,
+because its vocabulary is learned once, from whatever text is there at the start. With a small corpus the model memorizes it:
 training loss keeps falling while the held-out loss stalls, and `train`
 prints both so you can see it happen. `research` grows the corpus from
 Wikipedia on its own if you don't have text handy.

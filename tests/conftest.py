@@ -37,8 +37,8 @@ def settings():
     s = load_settings()
     s["model"]["tiers"] = {"test": {"max_ram_gb": 9999, "n_layer": 1, "n_head": 2, "d_model": 32,
                                     "block_size": 48, "vocab_size": 320}}
-    s["training"].update(batch_size=8, min_corpus_tokens=100, warmup_steps=5, learning_rate=3e-3,
-                         eval_every_s=3600,
+    s["training"].update(batch_size=8, min_corpus_tokens=100, min_new_model_chars=1000,
+                         warmup_steps=5, learning_rate=3e-3, eval_every_s=3600,
                          log_every_s=3600, checkpoint_every_s=3600)
     s["council"]["generate"]["max_new_tokens"] = 12
     s["council"]["min_tokens_trained"] = 0

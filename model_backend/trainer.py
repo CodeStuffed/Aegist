@@ -216,6 +216,11 @@ def _new_model(settings: dict, log) -> tuple[TransformerLM, Tokenizer, dict]:
     hw = detect_hardware(settings)
     size = hw["model_size"]
     text = read_corpus(settings)[: settings["training"]["tokenizer_train_chars"]]
+    needed = settings["training"]["min_new_model_chars"]
+    if len(text) < needed:
+        # The vocabulary is fixed once learned, so don't learn it from a scrap.
+        raise TrainingError(f"Only {len(text) / 1000:.0f} KB of text so far; a new model needs at "
+                            f"least {needed / 1000:.0f} KB to learn its vocabulary from.")
     log(f"Creating a new model for the '{hw['tier']}' tier ({hw['ram_gb']} GB RAM).")
     log(f"Learning a {size['vocab_size']}-token vocabulary from the corpus...")
     tokenizer = Tokenizer.train(text, size["vocab_size"])

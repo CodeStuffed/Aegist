@@ -25,6 +25,7 @@ training:
   log_every_s: 10
   tokenizer_train_chars: 3000000
   min_corpus_tokens: 5000    # refuse to train on less than this
+  min_new_model_chars: 200000 # a new model's vocabulary is learned once, from at least this much text
 
 council:
   generate:
