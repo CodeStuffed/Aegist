@@ -1,6 +1,10 @@
 //! The training corpus: every .txt / .md file under data/corpus/ - text you
-//! import, plus articles the research loop collects - and its tokens,
-//! cached per file so a growing corpus stays cheap to reload.
+//! import, Wikipedia dumps, articles the research loop collects - and its
+//! tokens, cached per file so a growing corpus stays cheap to reload.
+//!
+//! All the tokens are joined into one file on disk (brain/token_cache/all.bin)
+//! that training memory-maps instead of loading: billions of tokens cost
+//! disk space, not RAM, and the operating system keeps the hot parts cached.
 
 use crate::config::Settings;
 use crate::tokenizer::Tokenizer;
@@ -8,7 +12,9 @@ use crate::util::{fnv1a, write_atomic};
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub fn corpus_dir(settings: &Settings) -> PathBuf {
@@ -93,17 +99,37 @@ fn read(path: &Path) -> String {
     normalize_text(&String::from_utf8_lossy(&bytes))
 }
 
-/// The corpus as one string (paragraph break between files), capped at `max_chars`.
+/// Up to `max_chars` of the corpus as one string (paragraph break between
+/// files). If the corpus is bigger, every file gives the same share of its
+/// size, so the sample looks like the whole corpus, not just its first files.
 pub fn read_corpus(settings: &Settings, max_chars: usize) -> String {
+    let files = corpus_files(settings);
+    let sizes: Vec<u64> = files.iter().map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0)).collect();
+    let total: u64 = sizes.iter().sum();
     let mut out = String::new();
-    for f in corpus_files(settings) {
-        if out.len() >= max_chars {
-            break;
+    for (f, &size) in files.iter().zip(&sizes) {
+        let text = if total as usize <= max_chars {
+            read(f)
+        } else {
+            let share = (size as u128 * max_chars as u128 / total.max(1) as u128) as u64;
+            let mut bytes = Vec::new();
+            if share == 0 || File::open(f).and_then(|h| h.take(share).read_to_end(&mut bytes)).is_err() {
+                continue;
+            }
+            if (share as usize) < size as usize {
+                // end on a whole word
+                let cut = bytes.iter().rposition(|b| b.is_ascii_whitespace()).unwrap_or(0);
+                bytes.truncate(cut);
+            }
+            normalize_text(&String::from_utf8_lossy(&bytes))
+        };
+        if text.is_empty() {
+            continue;
         }
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str(&read(&f));
+        out.push_str(&text);
     }
     let mut end = max_chars.min(out.len());
     while !out.is_char_boundary(end) {
@@ -116,7 +142,36 @@ pub fn read_corpus(settings: &Settings, max_chars: usize) -> String {
 #[derive(Default, Serialize, Deserialize)]
 struct Manifest {
     merges_hash: u64,
+    /// file -> (size, modified) when its tokens were cached
     files: BTreeMap<String, (u64, u128)>,
+    /// the files whose tokens are in all.bin, in order, with their token counts
+    #[serde(default)]
+    order: Vec<(String, (u64, u128), u64)>,
+}
+
+/// The corpus's tokens, memory-mapped from disk; use it like a `&[u16]`.
+pub struct Tokens {
+    map: Option<memmap2::Mmap>,
+}
+
+#[cfg(target_endian = "big")]
+compile_error!("token files are little-endian");
+
+impl std::ops::Deref for Tokens {
+    type Target = [u16];
+    fn deref(&self) -> &[u16] {
+        match &self.map {
+            // Safety: mappings start page-aligned, and the file holds u16s
+            // written little-endian (checked above) and is never truncated
+            // while mapped (rebuilds write a new file and rename it).
+            Some(m) => unsafe { std::slice::from_raw_parts(m.as_ptr() as *const u16, m.len() / 2) },
+            None => &[],
+        }
+    }
+}
+
+fn u16_bytes(ids: &[u16]) -> Vec<u8> {
+    ids.iter().flat_map(|i| i.to_le_bytes()).collect()
 }
 
 fn stamp(p: &Path) -> (u64, u128) {
@@ -131,17 +186,21 @@ fn stamp(p: &Path) -> (u64, u128) {
 }
 
 /// Token ids for the whole corpus, re-encoding only files that changed.
-pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Vec<u16>> {
+pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
     assert!(tok.vocab_size() <= u16::MAX as usize + 1);
     let root = corpus_dir(settings);
     let cache = settings.data_path("brain/token_cache");
+    std::fs::create_dir_all(&cache)?;
+    // one process at a time (e.g. `research` and `train` in two terminals)
+    let lock = File::create(cache.join(".lock"))?;
+    lock.lock()?;
     let manifest_path = cache.join("manifest.json");
     let merges_hash = fnv1a(serde_json::to_string(&tok.merges)?.as_bytes());
-    let mut manifest: Manifest = std::fs::read(&manifest_path)
+    let manifest: Manifest = std::fs::read(&manifest_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .filter(|m: &Manifest| m.merges_hash == merges_hash)
-        .unwrap_or(Manifest { merges_hash, files: BTreeMap::new() });
+        .unwrap_or(Manifest { merges_hash, ..Default::default() });
 
     let files = corpus_files(settings);
     let entries: Vec<(String, PathBuf, (u64, u128), PathBuf)> = files
@@ -152,36 +211,79 @@ pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Vec<u16>> {
             (rel, f.clone(), stamp(f), bin)
         })
         .collect();
-    let encoded: Vec<Result<Vec<u16>>> = entries
+    // every file's own token cache, brought up to date in parallel
+    let counts: Vec<Result<u64>> = entries
         .par_iter()
         .map(|(rel, path, st, bin)| {
             if manifest.files.get(rel) == Some(st) {
-                if let Ok(bytes) = std::fs::read(bin) {
-                    return Ok(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect());
+                if let Ok(m) = std::fs::metadata(bin) {
+                    return Ok(m.len() / 2);
                 }
             }
             let ids: Vec<u16> = tok.encode(&read(path)).into_iter().map(|i| i as u16).collect();
-            let bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
-            write_atomic(bin, &bytes)?;
-            Ok(ids)
+            write_atomic(bin, &u16_bytes(&ids))?;
+            Ok(ids.len() as u64)
         })
         .collect();
-    let sep: Vec<u16> = tok.encode("\n\n").into_iter().map(|i| i as u16).collect();
-    let mut all = Vec::new();
-    manifest.files.clear();
-    for ((rel, _, st, _), ids) in entries.into_iter().zip(encoded) {
-        all.extend(ids?);
-        all.extend_from_slice(&sep);
-        manifest.files.insert(rel, st);
+    let mut current: HashMap<&str, ((u64, u128), u64, &Path)> = HashMap::new();
+    for ((rel, _, st, bin), n) in entries.iter().zip(counts) {
+        current.insert(rel.as_str(), (*st, n?, bin.as_path()));
     }
-    write_atomic(&manifest_path, &serde_json::to_vec(&manifest)?)?;
-    Ok(all)
+
+    // all.bin: every file's tokens plus a paragraph break. If the files
+    // already in it are unchanged, new files are appended; otherwise rebuilt.
+    let sep = u16_bytes(&tok.encode("\n\n").into_iter().map(|i| i as u16).collect::<Vec<_>>());
+    let all = cache.join("all.bin");
+    let expected: u64 = manifest.order.iter().map(|(_, _, n)| 2 * n + sep.len() as u64).sum();
+    let reusable = std::fs::metadata(&all).is_ok_and(|m| m.len() == expected)
+        && manifest.order.iter().all(|(rel, st, n)| current.get(rel.as_str()).is_some_and(|c| (c.0, c.1) == (*st, *n)));
+    let mut order = if reusable { manifest.order } else { Vec::new() };
+    let listed: HashSet<String> = order.iter().map(|(rel, _, _)| rel.clone()).collect();
+    let target = if reusable { all.clone() } else { cache.join("all.tmp") };
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::OpenOptions::new().create(true).append(true).open(&target)?);
+    if !reusable {
+        out.get_ref().set_len(0)?;
+    }
+    for (rel, _, st, bin) in &entries {
+        if listed.contains(rel) {
+            continue;
+        }
+        let bytes = std::fs::read(bin)?;
+        out.write_all(&bytes)?;
+        out.write_all(&sep)?;
+        order.push((rel.clone(), *st, bytes.len() as u64 / 2));
+    }
+    out.flush()?;
+    drop(out);
+    if !reusable {
+        std::fs::rename(&target, &all)?;
+    }
+    let files = entries.iter().map(|(rel, _, st, _)| (rel.clone(), *st)).collect();
+    write_atomic(&manifest_path, &serde_json::to_vec(&Manifest { merges_hash, files, order })?)?;
+    let f = File::open(&all)?;
+    let map = if f.metadata()?.len() == 0 { None } else { Some(unsafe { memmap2::Mmap::map(&f)? }) };
+    drop(lock);
+    Ok(Tokens { map })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::testing;
+
+    #[test]
+    fn a_big_corpus_is_sampled_evenly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = testing::settings(tmp.path());
+        std::fs::create_dir_all(corpus_dir(&s)).unwrap();
+        std::fs::write(corpus_dir(&s).join("a.txt"), "apple ".repeat(1000)).unwrap();
+        std::fs::write(corpus_dir(&s).join("b.txt"), "banana ".repeat(3000)).unwrap();
+        let sample = read_corpus(&s, 2000);
+        let (a, b) = (sample.matches("apple").count(), sample.matches("banana").count());
+        assert!(a > 50 && b > 150 && sample.len() <= 2000, "{a} {b} {}", sample.len());
+        assert!(!sample.contains("appl ") && !sample.ends_with("banan"));
+        assert_eq!(read_corpus(&s, 1_000_000).matches("banana").count(), 3000);
+    }
 
     #[test]
     fn normalize_unwraps_hard_wrapped_lines() {
@@ -202,11 +304,20 @@ mod tests {
         assert_eq!(names, vec!["a.txt", "b.md"]);
 
         let tok = Tokenizer::train(&read_corpus(&s, 10_000), 280);
+        let text = |t: &Tokens| tok.decode(&t.iter().map(|&i| i as u32).collect::<Vec<_>>());
         let first = corpus_tokens(&tok, &s).unwrap();
-        assert_eq!(tok.decode(&first.iter().map(|&i| i as u32).collect::<Vec<_>>()), "alpha beta gamma\n\ndelta epsilon\n\n");
+        assert_eq!(text(&first), "alpha beta gamma\n\ndelta epsilon\n\n");
         let bin = std::fs::read_dir(s.data_path("brain/token_cache")).unwrap().count();
-        assert_eq!(corpus_tokens(&tok, &s).unwrap(), first);
+        assert_eq!(&*corpus_tokens(&tok, &s).unwrap(), &*first);
         assert_eq!(std::fs::read_dir(s.data_path("brain/token_cache")).unwrap().count(), bin);
+
+        // a new file is appended; a changed one rebuilds everything in order
+        std::fs::write(corpus_dir(&s).join("zeta.txt"), "zeta").unwrap();
+        assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha beta gamma\n\ndelta epsilon\n\nzeta\n\n");
+        std::fs::write(corpus_dir(&s).join("imported/src/a.txt"), "alpha").unwrap();
+        assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha\n\ndelta epsilon\n\nzeta\n\n");
+        std::fs::remove_file(corpus_dir(&s).join("zeta.txt")).unwrap();
+        assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha\n\ndelta epsilon\n\n");
         assert!(import_texts(&tmp.path().join("missing"), &s).is_err());
     }
 }

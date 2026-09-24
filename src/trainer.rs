@@ -80,6 +80,84 @@ fn config_for(settings: &Settings, tier: &crate::config::Tier, vocab_size: usize
     }
 }
 
+/// How to size a NEW model (an existing one keeps its size).
+#[derive(Clone, Copy, Debug)]
+pub enum Size<'a> {
+    /// A tier from settings.yaml, by name.
+    Tier(&'a str),
+    /// Whatever will be smartest after this many hours of training in total.
+    ForHours(f64),
+    /// The automatic tier for this machine's RAM.
+    FromRam,
+}
+
+/// Training cost of one token, forward and backward: ~6 operations per
+/// weight, plus attention across the context.
+pub fn flops_per_token(cfg: &ModelConfig) -> f64 {
+    6.0 * crate::model::Layout::new(cfg).total as f64 + 12.0 * (cfg.n_layer * cfg.block_size * cfg.d_model) as f64
+}
+
+/// Useful training FLOP/s on this machine's CPU: a matrix multiply timed on
+/// every core, times ~0.6 (about what the whole training loop reaches).
+pub fn measure_cpu_flops() -> f64 {
+    let measure = || {
+        let n = 768;
+        let (a, b) = (vec![0.5f32; n * n], vec![0.25f32; n * n]);
+        let mut c = vec![0f32; n * n];
+        crate::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
+        let start = Instant::now();
+        for _ in 0..8 {
+            crate::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
+        }
+        0.6 * 8.0 * 2.0 * (n * n * n) as f64 / start.elapsed().as_secs_f64()
+    };
+    rayon::ThreadPoolBuilder::new().build().map(|p| p.install(measure)).unwrap_or_else(|_| measure())
+}
+
+/// Repeating text more than about this many times stops helping.
+pub const MAX_EPOCHS: f64 = 4.0;
+
+/// The size that ends up smartest after `hours` of training at `flops_per_s`:
+/// the biggest tier that fits in memory and can still read ~20 tokens per
+/// parameter in that time (bigger would be cut off half-trained; smaller
+/// would stop improving early) without repeating the corpus more than
+/// MAX_EPOCHS times. Returns the tier's name and why.
+pub fn pick_for_hours(settings: &Settings, hours: f64, flops_per_s: f64, corpus_tokens: f64, ram_gb: f64) -> (String, String) {
+    let mut sized: Vec<(&String, f64, f64)> = settings
+        .model
+        .tiers
+        .iter()
+        .map(|(name, t)| {
+            let cfg = config_for(settings, t, t.vocab_size);
+            let fits = (training_bytes(&cfg, settings) as f64) <= 0.85 * ram_gb * (1u64 << 30) as f64;
+            (name, crate::model::Layout::new(&cfg).total as f64, if fits { flops_per_s / flops_per_token(&cfg) } else { 0.0 })
+        })
+        .filter(|&(_, _, tps)| tps > 0.0)
+        .collect();
+    sized.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let Some(&smallest) = sized.first() else {
+        return (hardware::pick_tier(ram_gb, &settings.model.tiers), "nothing fits in memory; using the smallest automatic size".into());
+    };
+    let readable = |tps: f64| (tps * hours * 3600.0).min(MAX_EPOCHS * corpus_tokens);
+    let ok = |&(_, params, tps): &(&String, f64, f64)| readable(tps) >= TOKENS_PER_PARAM * params;
+    let pick = sized.iter().rev().find(|t| ok(t)).copied().unwrap_or(smallest);
+    let (name, params, tps) = pick;
+    let per_param = readable(tps) / params;
+    let tokens = |n: f64| if n >= 1e9 { format!("{:.1}B", n / 1e9) } else if n >= 1e7 { format!("{:.0}M", n / 1e6) } else { format!("{:.1}M", n / 1e6) };
+    let ratio = |r: f64| if r >= 10.0 { format!("{r:.0}") } else { format!("{r:.1}") };
+    let mut why = format!("{name} ({:.1}M parameters): {} h at ~{} tokens/s reads ~{} tokens, {} per parameter",
+        params / 1e6, hours, commas(tps as u64), tokens(readable(tps)), ratio(per_param));
+    if let Some(&(next, next_params, next_tps)) = sized.iter().find(|t| t.1 > params) {
+        let limit = if tps * hours * 3600.0 > MAX_EPOCHS * corpus_tokens { " (the corpus is the limit: add more text)" } else { "" };
+        why += &format!("; the next size up ({next}, {:.1}M) would get only {} per parameter - about 20 is needed to train well{limit}",
+            next_params / 1e6, ratio(readable(next_tps) / next_params));
+    }
+    if !ok(&pick) {
+        why += ". Even this, the smallest size, won't be trained well in that time";
+    }
+    (name.clone(), why)
+}
+
 /// Weights + gradients + two AdamW moments, plus activations for one step.
 pub fn training_bytes(cfg: &ModelConfig, settings: &Settings) -> usize {
     let b = (settings.training.tokens_per_step / cfg.block_size).max(1);
@@ -98,7 +176,7 @@ fn check_memory(cfg: &ModelConfig, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-fn new_model(settings: &Settings, seed: u64, tier: Option<&str>, log: &mut dyn FnMut(String)) -> Result<(Model, Tokenizer, Meta)> {
+fn new_model(settings: &Settings, seed: u64, size: Size, log: &mut dyn FnMut(String)) -> Result<(Model, Tokenizer, Meta)> {
     let text = corpus::read_corpus(settings, settings.training.tokenizer_train_chars);
     let needed = settings.training.min_new_model_chars;
     if text.len() < needed {
@@ -107,9 +185,16 @@ fn new_model(settings: &Settings, seed: u64, tier: Option<&str>, log: &mut dyn F
             text.len() / 1000, needed / 1000)).into());
     }
     let hw = hardware::detect();
-    let tier_name = match tier {
-        Some(name) => name.to_string(),
-        None => hardware::pick_tier(hw.ram_gb, &settings.model.tiers),
+    let tier_name = match size {
+        Size::Tier(name) => name.to_string(),
+        Size::FromRam => hardware::pick_tier(hw.ram_gb, &settings.model.tiers),
+        Size::ForHours(hours) => {
+            let bytes: u64 = corpus::corpus_files(settings).iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+            let (name, why) = pick_for_hours(settings, hours, measure_cpu_flops(), bytes as f64 / 4.0, hw.ram_gb);
+            log(format!("Size for {hours} hour(s) of training: {why}. (Training longer in later sessions? \
+                         Start with --plan-hours <total>, or pick one with --tier.)"));
+            name
+        }
     };
     let tier = settings.model.tiers.get(&tier_name).ok_or_else(|| {
         anyhow::anyhow!("No tier named {tier_name:?}; settings.yaml has: {}",
@@ -119,7 +204,7 @@ fn new_model(settings: &Settings, seed: u64, tier: Option<&str>, log: &mut dyn F
     let planned = config_for(settings, tier, tier.vocab_size);
     planned.validate()?;
     check_memory(&planned, settings)?;
-    log(format!("Creating a new model for the '{tier_name}' tier ({:.1} GB RAM).", hw.ram_gb));
+    log(format!("Creating a new model at the '{tier_name}' size."));
     log(format!("Learning a {}-token vocabulary from the corpus...", tier.vocab_size));
     let tokenizer = Tokenizer::train(&text, tier.vocab_size);
     let cfg = config_for(settings, tier, tokenizer.vocab_size());
@@ -140,9 +225,8 @@ fn new_model(settings: &Settings, seed: u64, tier: Option<&str>, log: &mut dyn F
 
 /// Train, or keep training, for the given budget. Saves as it goes; on a
 /// stop request it saves and returns with `interrupted` set.
-/// `tier`: size for a NEW model by name (default: picked from RAM). An
-/// existing model keeps its size.
-pub fn train(settings: &Settings, budget: Budget, tier: Option<&str>, log: &mut dyn FnMut(String), seed: Option<u64>, stop: &AtomicBool) -> Result<Report> {
+/// `size`: how to size a NEW model; an existing model keeps its size.
+pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMut(String), seed: Option<u64>, stop: &AtomicBool) -> Result<Report> {
     let tcfg = &settings.training;
     if corpus::corpus_files(settings).is_empty() {
         return Err(NotEnoughText("The corpus is empty. Add text with `council train --data <folder>`, \
@@ -151,7 +235,7 @@ pub fn train(settings: &Settings, budget: Budget, tier: Option<&str>, log: &mut 
     let seed = seed.unwrap_or_else(|| Rng::from_time().next_u64());
     let (mut model, tokenizer, mut meta) = match checkpoint::load(settings)? {
         Some(loaded) => {
-            if let Some(name) = tier {
+            if let Size::Tier(name) = size {
                 let want = settings.model.tiers.get(name);
                 let c = &loaded.0.cfg;
                 if want.map_or(true, |t| (t.n_layer, t.d_model, t.block_size) != (c.n_layer, c.d_model, c.block_size)) {
@@ -162,7 +246,7 @@ pub fn train(settings: &Settings, budget: Budget, tier: Option<&str>, log: &mut 
             check_memory(&loaded.0.cfg, settings)?;
             loaded
         }
-        None => new_model(settings, seed, tier, log)?,
+        None => new_model(settings, seed, size, log)?,
     };
     let cfg = model.cfg.clone();
     let tokens = corpus::corpus_tokens(&tokenizer, settings)?;
@@ -315,7 +399,7 @@ gravity accelerates every body at the same rate.\n\n";
         let src = tmp.path().join("notes.txt");
         std::fs::write(&src, CORPUS.repeat(20)).unwrap();
         corpus::import_texts(&src, &s).unwrap();
-        train(&s, Budget::Steps(steps), None, &mut |_| {}, Some(0), &AtomicBool::new(false)).unwrap();
+        train(&s, Budget::Steps(steps), Size::FromRam, &mut |_| {}, Some(0), &AtomicBool::new(false)).unwrap();
         (tmp, s)
     }
 
@@ -324,14 +408,14 @@ gravity accelerates every body at the same rate.\n\n";
         let tmp = tempfile::tempdir().unwrap();
         let mut s = testing::settings(&tmp.path().join("data"));
         let stop = AtomicBool::new(false);
-        let err = train(&s, Budget::Steps(1), None, &mut |_| {}, None, &stop).unwrap_err();
+        let err = train(&s, Budget::Steps(1), Size::FromRam, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.downcast_ref::<NotEnoughText>().unwrap().0.contains("corpus is empty"));
         std::fs::write(tmp.path().join("t.txt"), "too short").unwrap();
         corpus::import_texts(&tmp.path().join("t.txt"), &s).unwrap();
-        let err = train(&s, Budget::Steps(1), None, &mut |_| {}, None, &stop).unwrap_err();
+        let err = train(&s, Budget::Steps(1), Size::FromRam, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.to_string().contains("KB of text so far"));
         s.training.min_new_model_chars = 1;
-        let err = train(&s, Budget::Steps(1), None, &mut |_| {}, None, &stop).unwrap_err();
+        let err = train(&s, Budget::Steps(1), Size::FromRam, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.to_string().contains("only"));
     }
 
@@ -342,10 +426,10 @@ gravity accelerates every body at the same rate.\n\n";
         let vocab = meta.config.vocab_size as f32;
         assert!(meta.stats.val_loss.unwrap() < vocab.ln() - 1.0, "held-out loss {:?}", meta.stats.val_loss);
         assert!(meta.stats.val_bpb.unwrap() > 0.0);
-        let again = train(&s, Budget::Steps(10), None, &mut |_| {}, Some(1), &AtomicBool::new(false)).unwrap();
+        let again = train(&s, Budget::Steps(10), Size::FromRam, &mut |_| {}, Some(1), &AtomicBool::new(false)).unwrap();
         assert_eq!((again.stats.steps, again.steps_this_session), (50, 10));
         assert!(checkpoint::brain_dir(&s).join("optim.bin").is_file());
-        let stopped = train(&s, Budget::Steps(1000), None, &mut |_| {}, Some(2), &AtomicBool::new(true)).unwrap();
+        let stopped = train(&s, Budget::Steps(1000), Size::FromRam, &mut |_| {}, Some(2), &AtomicBool::new(true)).unwrap();
         assert!(stopped.interrupted && stopped.steps_this_session == 0 && stopped.stats.steps == 50);
     }
 
@@ -363,7 +447,7 @@ gravity accelerates every body at the same rate.\n\n";
         let (_tmp, mut s) = trained(5);
         // an existing model keeps its size
         s.model.tiers.insert("big".into(), crate::config::Tier { max_ram_gb: 1e9, n_layer: 2, n_head: 2, d_model: 64, block_size: 48, vocab_size: 320, manual: true });
-        let err = train(&s, Budget::Steps(1), Some("big"), &mut |_| {}, None, &AtomicBool::new(false)).unwrap_err();
+        let err = train(&s, Budget::Steps(1), Size::Tier("big"), &mut |_| {}, None, &AtomicBool::new(false)).unwrap_err();
         assert!(err.to_string().contains("already exists"));
         // a model that can't fit in memory is refused before anything is allocated
         let huge = crate::config::Tier { max_ram_gb: 1e9, n_layer: 96, n_head: 96, d_model: 12288, block_size: 2048, vocab_size: 50000, manual: true };
@@ -373,6 +457,37 @@ gravity accelerates every body at the same rate.\n\n";
         assert_eq!(human_duration(90.0), "2 minutes");
         assert_eq!(human_duration(3.0 * 3600.0), "3.0 hours");
         assert_eq!(human_duration(6e8), "19 years");
+    }
+
+    #[test]
+    fn the_size_follows_the_time_and_text_available() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let s = Settings::from_file(&root.join("config/settings.yaml"), &root).unwrap();
+        let (gflops, ram) = (200e9, 1024.0);
+        let pick = |hours: f64, tokens: f64| pick_for_hours(&s, hours, gflops, tokens, ram).0;
+        let lots = 1e12;
+        // more time, bigger model - exactly the biggest the time can train well
+        let mut needed: Vec<(f64, &String)> = s.model.tiers.iter().map(|(name, t)| {
+            let cfg = config_for(&s, t, t.vocab_size);
+            (TOKENS_PER_PARAM * crate::model::Layout::new(&cfg).total as f64 * flops_per_token(&cfg) / gflops / 3600.0, name)
+        }).collect();
+        needed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(needed.iter().map(|n| n.1.as_str()).collect::<Vec<_>>(), ["tiny", "small", "medium", "large", "xl", "xxl", "1b"]);
+        for w in needed.windows(2) {
+            let ((h, name), (next_h, _)) = (w[0], w[1]);
+            assert_eq!(pick(h * 1.01, lots), *name, "{name} needs {h:.1} h");
+            assert_eq!(pick(next_h * 0.99, lots), *name);
+        }
+        assert_eq!(pick(0.01, lots), "tiny");
+        // plenty of time but little text: a small model (big ones would just memorise it)
+        assert_eq!(pick(1e6, 3e6), "tiny");
+        let (_, why) = pick_for_hours(&s, 1e6, gflops, 3e6, ram);
+        assert!(why.contains("the corpus is the limit"), "{why}");
+        // too little memory for the big ones: the biggest that fits
+        let small_ram = pick_for_hours(&s, 1e6, gflops, lots, 2.0).0;
+        let fits = |name: &str| training_bytes(&config_for(&s, &s.model.tiers[name], s.model.tiers[name].vocab_size), &s) as f64 <= 0.85 * 2.0 * (1u64 << 30) as f64;
+        assert!(fits(&small_ram) && small_ram != "1b");
+        assert!(s.model.tiers.keys().filter(|n| fits(n)).all(|n| s.model.tiers[n].d_model <= s.model.tiers[&small_ram].d_model));
     }
 
     #[test]

@@ -31,7 +31,7 @@ training:
   eval_every_s: 60
   checkpoint_every_s: 300
   log_every_s: 10
-  tokenizer_train_chars: 3000000
+  tokenizer_train_chars: 50000000 # text sampled evenly from the corpus to learn the vocabulary (~5 s)
   min_corpus_tokens: 5000    # refuse to train on less than this
   min_new_model_chars: 200000 # a new model's vocabulary is learned once, from at least this much text
 

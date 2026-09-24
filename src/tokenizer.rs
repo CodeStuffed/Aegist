@@ -4,7 +4,8 @@
 //! (ids 0-255, so any text at all can be encoded), and training repeatedly
 //! merges the most frequent adjacent pair into a new token.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 pub const BYTE_VOCAB: u32 = 256;
 
@@ -131,19 +132,22 @@ impl Tokenizer {
             }
         }
 
+        // Most frequent pair first (ties: the smaller pair). Counts change as
+        // words merge; stale heap entries are skipped when they surface.
+        let mut heap: BinaryHeap<(i64, Reverse<(u32, u32)>)> = pair_counts.iter().map(|(&p, &c)| (c, Reverse(p))).collect();
         let mut merges = Vec::new();
         while (BYTE_VOCAB as usize + merges.len()) < vocab_size {
-            let best = pair_counts
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-                .map(|(&p, &c)| (p, c));
-            let Some((best, count)) = best else { break };
+            let Some((count, Reverse(best))) = heap.pop() else { break };
+            if pair_counts.get(&best) != Some(&count) {
+                continue;
+            }
             if count < 2 {
                 break;
             }
             let new_id = BYTE_VOCAB + merges.len() as u32;
             merges.push(best);
             let affected = where_.remove(&best).unwrap_or_default();
+            let mut changed: HashSet<(u32, u32)> = HashSet::new();
             for wi in affected {
                 let c = counts[wi];
                 let old = std::mem::take(&mut words[wi]);
@@ -153,6 +157,8 @@ impl Tokenizer {
                         *v -= c;
                         if *v <= 0 {
                             pair_counts.remove(&pair);
+                        } else {
+                            changed.insert(pair);
                         }
                     }
                 }
@@ -171,10 +177,16 @@ impl Tokenizer {
                     let pair = (p[0], p[1]);
                     *pair_counts.entry(pair).or_default() += c;
                     where_.entry(pair).or_default().insert(wi);
+                    changed.insert(pair);
                 }
                 words[wi] = merged;
             }
             pair_counts.remove(&best);
+            for pair in changed.drain() {
+                if let Some(&c) = pair_counts.get(&pair) {
+                    heap.push((c, Reverse(pair)));
+                }
+            }
         }
         Tokenizer::new(merges)
     }
@@ -227,6 +239,57 @@ mod tests {
     use super::*;
 
     const TEXT: &str = "The rays of light are refracted by the prism. The prism separates the colours. ";
+
+    /// Textbook BPE: count every pair, merge the most frequent (ties: the smaller pair), repeat.
+    fn reference_merges(text: &str, n: usize) -> Vec<(u32, u32)> {
+        let mut words: Vec<Vec<u32>> = pretokenize(text).iter().map(|w| w.bytes().map(u32::from).collect()).collect();
+        let mut merges = Vec::new();
+        while merges.len() < n {
+            let mut counts: HashMap<(u32, u32), i64> = HashMap::new();
+            for w in &words {
+                for p in w.windows(2) {
+                    *counts.entry((p[0], p[1])).or_default() += 1;
+                }
+            }
+            let Some((&best, &c)) = counts.iter().max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0))) else { break };
+            if c < 2 {
+                break;
+            }
+            let id = BYTE_VOCAB + merges.len() as u32;
+            merges.push(best);
+            for w in &mut words {
+                let mut out = Vec::with_capacity(w.len());
+                let mut i = 0;
+                while i < w.len() {
+                    if i + 1 < w.len() && (w[i], w[i + 1]) == best {
+                        out.push(id);
+                        i += 2;
+                    } else {
+                        out.push(w[i]);
+                        i += 1;
+                    }
+                }
+                *w = out;
+            }
+        }
+        merges
+    }
+
+    #[test]
+    fn training_matches_textbook_bpe() {
+        let mut rng = crate::rng::Rng::new(3);
+        let syllables = ["ka", "to", "ri", "ma", "nel", "sio", "pra", "ven", "a", "e", "th", "qu"];
+        let text: String = (0..4000)
+            .map(|_| {
+                let n = 1 + rng.below(4);
+                let w: String = (0..n).map(|_| syllables[(rng.uniform().powi(2) * syllables.len() as f32) as usize]).collect();
+                w + if rng.below(8) == 0 { ". " } else { " " }
+            })
+            .collect();
+        let want = reference_merges(&text, 300);
+        assert!(want.len() > 100);
+        assert_eq!(Tokenizer::train(&text, BYTE_VOCAB as usize + 300).merges, want);
+    }
 
     #[test]
     fn pretokenize_keeps_every_byte_and_attaches_spaces_to_words() {
