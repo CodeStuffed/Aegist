@@ -6,6 +6,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod corpus;
 pub mod council;
+pub mod eval;
 pub mod gpu;
 pub mod hardware;
 pub mod kernels;

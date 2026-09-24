@@ -16,6 +16,7 @@ council <command> [options]
 | [`ask`](#ask) | Put a claim in front of the council | **Yes** | No |
 | [`import-wikipedia`](#import-wikipedia) | Add a Wikipedia download to the text and the knowledge base | No | No (you download the file) |
 | [`gpu-check`](#gpu-check) | Test an NVIDIA GPU for training | No | No |
+| [`eval`](#eval) | Measure how well the model tells true from false | **Yes** | No |
 
 - `council --help` lists the commands; `council <command> --help` lists one
   command's options.
@@ -315,6 +316,38 @@ council gpu-check
 
 Exits with status 1 when no usable GPU is found (the message says what's
 missing). Setup steps and troubleshooting: [GPU_TRAINING.md](GPU_TRAINING.md).
+
+---
+
+## `eval`
+
+**Measures how well the trained model tells true claims from false ones.**
+
+```bash
+council eval [--pairs N]
+```
+
+It builds claim pairs from the first sentences of articles in your corpus
+("Antimony is a chemical element ..."): each true sentence, and the same
+subject with another article's description ("Antimony is a coin issued by
+..."). Then it runs the negation test on both. A pair is right when the true
+one scores higher, so chance is 50%. You get four numbers: the raw and the
+calibrated score, each without and with knowledge-base evidence in front.
+
+Real output on a 2.2M-parameter model trained for one hour on WikiText-2 (751
+Wikipedia articles, 12 MB):
+
+```
+73 pairs: the true claim should score higher than the false one (chance: 50%)
+  negation test, raw                without evidence  41.1%   with knowledge-base evidence  46.6%
+  negation test, calibrated (used)  without evidence  52.1%   with knowledge-base evidence  47.9%
+```
+
+That's chance: a model that small, trained that briefly, hasn't learned the
+facts yet. Run it on your own model after long training (for example after
+a GPU run on Wikipedia) to see how far it has come. It needs articles in the
+corpus, which `import-wikipedia` provides. `--pairs` (default 200) caps the
+number of pairs.
 
 ---
 

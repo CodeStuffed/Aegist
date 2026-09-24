@@ -21,6 +21,7 @@ council ask "We should switch to usage-based pricing"
 council research --hours 4                   # read Wikipedia, keep training
 council import-wikipedia enwiki-latest-pages-articles-multistream.xml.bz2
 council gpu-check                            # test an NVIDIA GPU for training
+council eval                                 # how often it tells true from false
 ```
 
 ## Read this first: what to expect

@@ -83,6 +83,13 @@ enum Command {
         #[arg(long, value_enum)]
         device: Option<Device>,
     },
+    /// Measure how well the trained model tells true claims from false ones
+    /// (built from article first sentences in the corpus).
+    Eval {
+        /// Most claim pairs to test.
+        #[arg(long, default_value_t = 200)]
+        pairs: usize,
+    },
     /// Test the NVIDIA GPU: compile the kernels, check its results against the
     /// CPU's, measure its speed, and show which model sizes it can train.
     GpuCheck,
@@ -229,6 +236,16 @@ fn run(command: Command) -> Result<ExitCode> {
                 if r.interrupted { "Stopped" } else { "Done" }, commas(r.articles), r.corpus_bytes as f64 / 1e6, commas(r.passages));
             if r.articles > 0 {
                 println!("Next: `council train --hours <how long>` trains on it (see `council doctor` for sizes).");
+            }
+        }
+        Command::Eval { pairs } => {
+            let brain = Brain::load(&settings)?;
+            println!("Testing {} on up to {pairs} true/false claim pairs...", brain.describe());
+            let r = council::eval::negation_eval(&brain, &settings, pairs)?;
+            println!("{} pairs: the true claim should score higher than the false one (chance: 50%)", r.pairs);
+            for (k, name) in ["raw", "calibrated (used)"].into_iter().enumerate() {
+                println!("  negation test, {name:17}  without evidence {:5.1}%   with knowledge-base evidence {:5.1}%",
+                    100.0 * r.right[k][0], 100.0 * r.right[k][1]);
             }
         }
         Command::Doctor => doctor(&settings)?,

@@ -120,7 +120,9 @@ model, so the learning rate follows one schedule across all four sessions.
 To train longer than planned, give a new total: `--plan-hours 120`.
 
 **Watch it:** the `held-out` number (loss on text it never trains on) should
-keep falling. `council doctor` shows the whole history.
+keep falling. `council doctor` shows the whole history. Afterwards,
+`council eval` measures how often the model tells a true Wikipedia claim
+from a false one (50% is chance).
 
 Once trained, `council ask "..."` uses it. The knowledge base puts the most
 relevant Wikipedia paragraphs, and the paragraphs linked to them, in front
