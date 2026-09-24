@@ -128,8 +128,8 @@ of every question.
 Answering runs on the CPU (int8 weights, every core for big models). With
 an untrained 235M-parameter model, a full `ask` (with the repeat run) took 40
 seconds on **one** core of the 4-core test machine while it was also
-training; with a desktop's free cores expect several seconds. `--no-recheck`
-roughly halves it.
+training (33 seconds with `--no-recheck`); with a desktop's free cores expect
+several seconds.
 
 ### Memory
 
