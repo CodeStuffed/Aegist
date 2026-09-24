@@ -1,0 +1,17 @@
+backend:
+  prefer: cloud   # cloud | local | auto
+
+cloud:
+  judge_model: claude-opus-5-5
+  panel_model: claude-sonnet-5
+
+local:
+  tiers:
+    tiny:   {max_ram_gb: 8,    ollama_model: "<pick a ~3B-class tag>"}
+    small:  {max_ram_gb: 16,   ollama_model: "<pick a ~7-8B-class tag>"}
+    medium: {max_ram_gb: 32,   ollama_model: "<pick a ~13-14B-class tag>"}
+    large:  {max_ram_gb: 9999, ollama_model: "<pick a ~30B+-class tag>"}
+
+research:
+  max_calls_per_hour: 6
+  seed_topics: []

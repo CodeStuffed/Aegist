@@ -1,0 +1,6 @@
+anthropic
+chromadb
+psutil
+python-dotenv
+PyYAML
+requests
