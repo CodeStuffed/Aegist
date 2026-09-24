@@ -73,8 +73,9 @@ Measured on a 4-core CPU with AVX-512 (16 GB RAM):
 | This version, same 2.2M size | **9,227 tokens/s (2.3×)** | **1.527 (20% better)** |
 | This version, default 5.9M size | 3,600 tokens/s | 1.652 |
 
-A full `council ask` (panel, Judge, repeat run, 3 knowledge-base passages)
-on the 5.9M model takes about **0.3 seconds** with int8 weights.
+A full `council ask` (panel, negation test, Judge, repeat run) on the 5.9M
+model takes about **half a second** with int8 weights on 2 threads (measured
+with a training run using the other cores).
 
 Training speed per size, from `cargo run --release --example bench`:
 

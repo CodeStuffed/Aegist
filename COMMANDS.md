@@ -529,8 +529,10 @@ OVERALL CONFIDENCE: Medium                                                      
 
 ### A real run
 
-(Recorded before linked retrieval was added. Today the knowledge-base line
-also says how many passages came from following links.)
+(Recorded before linked retrieval and the negation test were added. Today
+the knowledge-base line also says how many passages came from following
+links, a NEGATION TEST section comes before the Judge, and a full ask takes
+about half a second.)
 
 The 5.9M model from the examples above (10 minutes of training on 11 MB of
 technical text), with 228 paragraphs of Newton's *Opticks* in its knowledge
