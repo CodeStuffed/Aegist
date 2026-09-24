@@ -9,6 +9,7 @@
 //! All weights live in one flat Vec<f32>; `Layout` says where each one is.
 
 use crate::kernels::{self as k, Rope};
+use crate::quant::{Precision, QMat};
 use crate::rng::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +130,16 @@ pub struct Acts {
 }
 
 impl Acts {
+    /// Bytes Acts::new would allocate, without allocating.
+    pub fn estimate_bytes(cfg: &ModelConfig, b: usize, t: usize) -> usize {
+        let (c, h, v, l, nh) = (cfg.d_model, cfg.mlp_hidden, cfg.vocab_size, cfg.n_layer, cfg.n_head);
+        let bt = b * t;
+        let drop = if cfg.dropout > 0.0 { 2 * bt * c } else { 0 };
+        let per_layer = bt * c * 5 + bt * 2 + bt * 3 * c + b * nh * t * t + bt * 2 * h + bt * h + drop;
+        let rest = (l + 1) * bt * c + bt * c + bt + bt * v + bt * c + bt * c * 2 + bt * 3 * c + bt * 2 * h + bt * h;
+        4 * (l * per_layer + rest)
+    }
+
     pub fn new(cfg: &ModelConfig, b: usize, t: usize) -> Self {
         let (c, h, v, l, nh) = (cfg.d_model, cfg.mlp_hidden, cfg.vocab_size, cfg.n_layer, cfg.n_head);
         let bt = b * t;
@@ -332,8 +343,62 @@ impl Model {
         loss
     }
 
-    /// Inference: `b` sequences of `l` new tokens, all continuing the prefix
-    /// in `cache`. Returns logits for every new token plus their keys/values.
+    /// A copy of the weights for answering questions, at the given precision.
+    pub fn to_inference(&self, precision: Precision) -> InferModel {
+        let (c, h, v) = (self.cfg.d_model, self.cfg.mlp_hidden, self.cfg.vocab_size);
+        let lay = &self.layout;
+        let mat = |off: usize, k: usize, n: usize| QMat::from_inputs_major(k, n, self.p(off, k * n), precision);
+        InferModel {
+            cfg: self.cfg.clone(),
+            precision,
+            // wte is vocab x C: rows are tokens (embedding) and outputs (logits) alike
+            wte: QMat::from_rows(v, c, self.p(lay.wte, v * c), precision),
+            layers: lay
+                .layers
+                .iter()
+                .map(|la| InferLayer {
+                    rms1: self.p(la.rms1, c).to_vec(),
+                    wqkv: mat(la.wqkv, c, 3 * c),
+                    wo: mat(la.wo, c, c),
+                    rms2: self.p(la.rms2, c).to_vec(),
+                    w13: mat(la.w13, c, 2 * h),
+                    w2: mat(la.w2, h, c),
+                })
+                .collect(),
+            rmsf: self.p(lay.rmsf, c).to_vec(),
+            rope: self.rope.clone(),
+        }
+    }
+}
+
+struct InferLayer {
+    rms1: Vec<f32>,
+    wqkv: QMat,
+    wo: QMat,
+    rms2: Vec<f32>,
+    w13: QMat,
+    w2: QMat,
+}
+
+/// The model as used to answer questions: f32, int8 or int4 weights.
+pub struct InferModel {
+    pub cfg: ModelConfig,
+    pub precision: Precision,
+    wte: QMat,
+    layers: Vec<InferLayer>,
+    rmsf: Vec<f32>,
+    rope: Rope,
+}
+
+impl InferModel {
+    /// Memory used by the weights at this precision.
+    pub fn weight_bytes(&self) -> usize {
+        let norms = 4 * self.cfg.d_model * (2 * self.cfg.n_layer + 1);
+        self.wte.bytes() + norms + self.layers.iter().map(|l| l.wqkv.bytes() + l.wo.bytes() + l.w13.bytes() + l.w2.bytes()).sum::<usize>()
+    }
+
+    /// `b` sequences of `l` new tokens, all continuing the prefix in `cache`.
+    /// Returns logits for every new token plus their keys/values.
     /// `rng`: Some switches dropout on (Monte Carlo dropout).
     pub fn infer(&self, cache: &KvCache, tokens: &[u32], b: usize, l: usize, mut rng: Option<&mut Rng>) -> Inference {
         let cfg = &self.cfg;
@@ -355,10 +420,12 @@ impl Model {
         let mut new_v = Vec::with_capacity(cfg.n_layer);
         let mut xnext = vec![0f32; n * c];
 
-        k::embed(&mut x, self.p(self.layout.wte, v * c), tokens, c);
-        for (li, la) in self.layout.layers.iter().enumerate() {
-            k::rmsnorm_fwd(&mut xn, &mut inv, &x, self.p(la.rms1, c), c);
-            k::matmul(&mut qkv, &xn, self.p(la.wqkv, c * 3 * c), n, c, 3 * c, false, false, false);
+        for (row, &t) in x.chunks_mut(c).zip(tokens) {
+            self.wte.row(t as usize, row);
+        }
+        for (li, la) in self.layers.iter().enumerate() {
+            k::rmsnorm_fwd(&mut xn, &mut inv, &x, &la.rms1, c);
+            la.wqkv.matmul(&mut qkv, &xn, n);
             self.rope.apply(&mut qkv, c, nh, |row| p0 + row % l, false);
             k::attention_infer(&mut att, &qkv, &cache.k[li], &cache.v[li], p0, b, l, c, nh);
             let (mut kk, mut vv) = (Vec::with_capacity(n * c), Vec::with_capacity(n * c));
@@ -368,22 +435,22 @@ impl Model {
             }
             new_k.push(kk);
             new_v.push(vv);
-            k::matmul(&mut tmp, &att, self.p(la.wo, c * c), n, c, c, false, false, false);
+            la.wo.matmul(&mut tmp, &att, n);
             let m = self.maybe_mask(&mut mask, rng.as_deref_mut());
             k::residual(&mut xnext, &x, &tmp, m);
             std::mem::swap(&mut x, &mut xnext);
 
-            k::rmsnorm_fwd(&mut xn, &mut inv, &x, self.p(la.rms2, c), c);
-            k::matmul(&mut ab, &xn, self.p(la.w13, c * 2 * h), n, c, 2 * h, false, false, false);
+            k::rmsnorm_fwd(&mut xn, &mut inv, &x, &la.rms2, c);
+            la.w13.matmul(&mut ab, &xn, n);
             k::swiglu_fwd(&mut hg, &ab, h);
-            k::matmul(&mut tmp, &hg, self.p(la.w2, h * c), n, h, c, false, false, false);
+            la.w2.matmul(&mut tmp, &hg, n);
             let m = self.maybe_mask(&mut mask, rng.as_deref_mut());
             k::residual(&mut xnext, &x, &tmp, m);
             std::mem::swap(&mut x, &mut xnext);
         }
-        k::rmsnorm_fwd(&mut xn, &mut inv, &x, self.p(self.layout.rmsf, c), c);
+        k::rmsnorm_fwd(&mut xn, &mut inv, &x, &self.rmsf, c);
         let mut logits = vec![0f32; n * v];
-        k::matmul(&mut logits, &xn, self.p(self.layout.wte, v * c), n, c, v, false, true, false);
+        self.wte.matmul(&mut logits, &xn, n);
         Inference { logits, new_k, new_v }
     }
 
@@ -467,11 +534,12 @@ mod tests {
 
     #[test]
     fn cached_inference_matches_training_forward() {
-        let model = Model::new(tiny(0.0), 3);
+        let trained = Model::new(tiny(0.0), 3);
+        let model = trained.to_inference(Precision::F32);
         let mut rng = Rng::new(2);
         let (toks, _) = batch(&mut rng, 1, 8);
         let mut acts = Acts::new(&model.cfg, 1, 8);
-        model.forward(&mut acts, &toks, None);
+        trained.forward(&mut acts, &toks, None);
 
         // all at once from an empty cache
         let full = model.infer(&KvCache::empty(&model.cfg), &toks, 1, 8, None);
@@ -496,5 +564,40 @@ mod tests {
         let both = model.infer(&prefix, &conts, 2, 2, None);
         assert!(both.logits[..13].iter().zip(&acts.logits[5 * 13..6 * 13]).all(|(a, b)| (a - b).abs() < 1e-4));
         assert!(both.logits[13..26].iter().zip(&acts.logits[6 * 13..7 * 13]).all(|(a, b)| (a - b).abs() < 1e-4));
+    }
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+
+    /// Quantized inference stays close to f32: next-token distributions barely move.
+    #[test]
+    fn quantized_inference_tracks_f32() {
+        let cfg = ModelConfig { vocab_size: 300, block_size: 32, n_layer: 2, n_head: 4, d_model: 64, mlp_hidden: 160, dropout: 0.0, rope_base: 10000.0 };
+        let mut model = Model::new(cfg, 9);
+        // bigger-than-init weights, so the test isn't trivially easy
+        for &(off, n) in &model.layout.matrices.clone() {
+            model.params[off..off + n].iter_mut().for_each(|w| *w *= 5.0);
+        }
+        let mut rng = Rng::new(4);
+        let toks: Vec<u32> = (0..24).map(|_| rng.below(300) as u32).collect();
+        let empty = KvCache::empty(&model.cfg);
+        let reference = model.to_inference(Precision::F32).infer(&empty, &toks, 1, 24, None).logits;
+        let f32_bytes = model.to_inference(Precision::F32).weight_bytes();
+        for (precision, max_kl) in [(Precision::Int8, 1e-3f32), (Precision::Int4, 5e-2)] {
+            let q = model.to_inference(precision);
+            assert!(q.weight_bytes() * 3 < f32_bytes);
+            let got = q.infer(&empty, &toks, 1, 24, None).logits;
+            let mut worst = 0f32;
+            for (a, b) in reference.chunks(300).zip(got.chunks(300)) {
+                let (mut p, mut q) = (a.to_vec(), b.to_vec());
+                k::log_softmax(&mut p);
+                k::log_softmax(&mut q);
+                let kl: f32 = p.iter().zip(&q).map(|(lp, lq)| lp.exp() * (lp - lq)).sum();
+                worst = worst.max(kl);
+            }
+            assert!(worst < max_kl, "{precision}: worst KL {worst}");
+        }
     }
 }

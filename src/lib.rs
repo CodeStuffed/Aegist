@@ -11,6 +11,7 @@ pub mod kernels;
 pub mod knowledge;
 pub mod model;
 pub mod optim;
+pub mod quant;
 pub mod research;
 pub mod rng;
 pub mod router;

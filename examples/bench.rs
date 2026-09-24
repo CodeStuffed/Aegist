@@ -1,6 +1,8 @@
 //! Training speed for every tier in config/settings.yaml on this machine:
 //!     cargo run --release --example bench
 use council::config::Settings;
+use council::hardware;
+use council::trainer::training_bytes;
 use council::model::{Acts, Model, ModelConfig};
 use council::rng::Rng;
 use std::time::Instant;
@@ -8,7 +10,7 @@ use std::time::Instant;
 fn main() -> anyhow::Result<()> {
     let settings = Settings::load()?;
     let mut tiers: Vec<_> = settings.model.tiers.iter().collect();
-    tiers.sort_by(|a, b| a.1.max_ram_gb.total_cmp(&b.1.max_ram_gb));
+    tiers.sort_by(|a, b| (a.1.manual, a.1.max_ram_gb).partial_cmp(&(b.1.manual, b.1.max_ram_gb)).unwrap());
     println!("{} threads", rayon::current_num_threads());
     for (name, t) in tiers {
         let cfg = ModelConfig {
@@ -16,6 +18,11 @@ fn main() -> anyhow::Result<()> {
             d_model: t.d_model, mlp_hidden: ModelConfig::default_mlp_hidden(t.d_model),
             dropout: settings.model.dropout, rope_base: settings.model.rope_base,
         };
+        let need_gb = training_bytes(&cfg, &settings) as f64 / (1u64 << 30) as f64;
+        if need_gb > 0.85 * hardware::detect().ram_gb {
+            println!("{name:7} {}x{:<4} skipped: needs ~{need_gb:.0} GB to train", t.n_layer, t.d_model);
+            continue;
+        }
         let b = (settings.training.tokens_per_step / t.block_size).max(1);
         let model = Model::new(cfg.clone(), 1);
         let mut acts = Acts::new(&cfg, b, t.block_size);

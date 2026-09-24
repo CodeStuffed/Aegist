@@ -51,16 +51,74 @@ Everything is hand-written for speed:
   every probe phrase against the cached result in one batch, and text
   generation reuses cached attention state.
 
-Training throughput on a 4-core CPU with AVX-512 (`cargo run --release --example bench`):
+Measured on a 4-core CPU with AVX-512 (16 GB RAM):
+
+| Same 11 MB of text, 10 minutes each | Speed | Held-out bits per byte (lower is better) |
+|---|---|---|
+| Old Python/NumPy version, 2.2M params | 3,990 tokens/s | 1.900 |
+| This version, same 2.2M size | **9,227 tokens/s (2.3×)** | **1.527 (20% better)** |
+| This version, default 5.9M size | 3,600 tokens/s | 1.652 |
+
+A full `council ask` (panel, Judge, repeat run, 3 knowledge-base passages)
+on the 5.9M model takes about **0.3 seconds** with int8 weights.
+
+Training speed per size, from `cargo run --release --example bench`:
 
 | Tier | Model | Tokens / second |
 |---|---|---|
-| tiny | 4 × 192, 2.2M params | ~7,900 |
-| small | 6 × 256, 5.9M params | ~3,700 |
-| medium | 8 × 384, 17M params | ~1,500 |
+| tiny | 4 × 192, 2.2M params | ~8,400 |
+| small | 6 × 256, 5.9M params | ~3,600 |
+| medium | 8 × 384, 17M params | ~1,600 |
 | large | 12 × 512, 42M params | ~680 |
+| xl | 16 × 768, 126M params | ~260 |
 
-At the same model size (2.2M parameters) that is about 2× the old NumPy version.
+## Bigger models, and quantization
+
+Two switches:
+
+- `council train --tier NAME` picks the model size. Besides the four
+  automatic sizes there are opt-in `xl` (~126M params), `xxl` (~337M) and
+  `1b` (~1.28B). `council doctor` lists every size with its training memory
+  and how long it takes to train well on your machine, and `train` refuses a
+  size that doesn't fit in memory.
+- `council ask --precision f32|int8|int4` (default `int8`, set in
+  `inference.precision`) picks the weights used to answer:
+  - `int8` is 4× smaller than f32 with practically identical answers;
+  - `int4` is about 6× smaller, at a small accuracy cost.
+
+  Both have hand-written integer kernels.
+
+**What quantization does, measured** on a trained 5.9M model
+(`cargo run --release --example quant_eval` runs this on yours):
+
+| Precision | Weights | Held-out bits per byte | Generation speed |
+|---|---|---|---|
+| f32 | 23.5 MB | 1.3573 | ~800 tokens/s |
+| int8 | 6.0 MB | 1.3574 | ~1,650 tokens/s |
+| int4 | 3.7 MB | 1.3576 | ~1,250 tokens/s |
+
+**Why there's no "trillion" setting.** Training takes about
+6 × parameters × tokens operations, and a model needs about 20 tokens of text
+per parameter to become good. These are `council doctor`'s estimates for the
+same 4-core PC:
+
+| Size | Memory to train | Time to train well |
+|---|---|---|
+| tiny, 2.2M | 0.4 GB | ~1 hour |
+| small, 5.9M | 0.8 GB | ~8 hours |
+| medium, 17M | 1.6 GB | ~3 days |
+| large, 42M | 3.4 GB | ~18 days |
+| xl, 126M | 7.4 GB | ~5 months |
+| xxl, 337M | 19 GB | ~3 years |
+| 1b, 1.28B | 40 GB | ~44 years |
+| 1 trillion | ~16,000 GB | ~27 million years |
+
+Quantization shrinks a *trained* model (the 1b tier is 800 MB at int4); it
+doesn't speed up training, and an untrained giant model is just random
+numbers. Billion-parameter models are trained on thousands of GPUs. On a
+PC, the best results come from the automatic sizes plus lots of text. For
+short sessions a *smaller* size often wins, because it reads more text in
+the same time.
 
 ## How it's built
 
@@ -135,7 +193,8 @@ All the thresholds live in `config/settings.yaml` under `council:`.
 Cargo.toml, src/            the program (council) and library
 config/settings.yaml        every tunable number
 config/personas/*.yaml      lead-ins and probe phrases
-examples/bench.rs           training-speed benchmark
+examples/bench.rs           training speed per size on this machine
+examples/quant_eval.rs      what f32 / int8 / int4 cost and buy on your trained model
 data/                       corpus, checkpoints, knowledge base (gitignored)
 .github/workflows/          CI (tests + builds on Linux/macOS/Windows) and releases
 docs/build-brief.md         the original plan (Claude/Ollama), kept for history

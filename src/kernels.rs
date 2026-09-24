@@ -8,6 +8,10 @@ use gemm::Parallelism;
 use rayon::prelude::*;
 
 pub const RMS_EPS: f32 = 1e-5;
+/// Below these sizes an operation stays on one thread: for small work
+/// (like generating one token), splitting it costs more than it saves.
+const MIN_ROWS: usize = 16;
+const MIN_ELEMS: usize = 16 * 1024;
 
 fn parallelism(work: usize) -> Parallelism {
     let threads = rayon::current_num_threads();
@@ -48,6 +52,49 @@ pub fn matmul(c: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize,
     }
 }
 
+/// a . b, with AVX2 + FMA when the CPU has it (checked at runtime).
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: the features are available (checked just above).
+        return unsafe { dot_avx2(a, b) };
+    }
+    let mut acc = [0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let k = a.len().min(b.len());
+    let (ap, bp) = (a.as_ptr(), b.as_ptr());
+    let (mut s0, mut s1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let mut i = 0;
+    while i + 16 <= k {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(i)), _mm256_loadu_ps(bp.add(i)), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(i + 8)), _mm256_loadu_ps(bp.add(i + 8)), s1);
+        i += 16;
+    }
+    let v = _mm256_add_ps(s0, s1);
+    let h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    let mut total = _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps(h, h, 1)));
+    while i < k {
+        total += *ap.add(i) * *bp.add(i);
+        i += 1;
+    }
+    total
+}
+
 // ---------------------------------------------------------------- RMSNorm
 
 /// out = x / rms(x) * g, row by row; also stores 1/rms per row.
@@ -55,6 +102,7 @@ pub fn rmsnorm_fwd(out: &mut [f32], inv: &mut [f32], x: &[f32], g: &[f32], c: us
     out.par_chunks_mut(c)
         .zip(inv.par_iter_mut())
         .zip(x.par_chunks(c))
+        .with_min_len(MIN_ROWS)
         .for_each(|((o, iv), xr)| {
             let ms = xr.iter().map(|v| v * v).sum::<f32>() / c as f32;
             let r = 1.0 / (ms + RMS_EPS).sqrt();
@@ -71,6 +119,7 @@ pub fn rmsnorm_bwd(dx: &mut [f32], dg: &mut [f32], dy: &[f32], x: &[f32], inv: &
         .zip(dy.par_chunks(c))
         .zip(x.par_chunks(c))
         .zip(inv.par_iter())
+        .with_min_len(MIN_ROWS)
         .for_each(|(((dxr, dyr), xr), &r)| {
             let dot = (0..c).map(|i| dyr[i] * g[i] * xr[i]).sum::<f32>() / c as f32;
             for i in 0..c {
@@ -81,6 +130,7 @@ pub fn rmsnorm_bwd(dx: &mut [f32], dg: &mut [f32], dy: &[f32], x: &[f32], inv: &
         .par_chunks(c)
         .zip(x.par_chunks(c))
         .zip(inv.par_iter())
+        .with_min_len(MIN_ROWS)
         .fold(
             || vec![0f32; c],
             |mut acc, ((dyr, xr), &r)| {
@@ -129,7 +179,7 @@ impl Rope {
     pub fn apply(&self, qkv: &mut [f32], c: usize, n_head: usize, position: impl Fn(usize) -> usize + Sync, inverse: bool) {
         let hd = c / n_head;
         let half = self.half;
-        qkv.par_chunks_mut(3 * c).enumerate().for_each(|(row, r)| {
+        qkv.par_chunks_mut(3 * c).enumerate().with_min_len(MIN_ROWS).for_each(|(row, r)| {
             let pos = position(row);
             let cs = &self.cos[pos * half..(pos + 1) * half];
             let sn = &self.sin[pos * half..(pos + 1) * half];
@@ -273,6 +323,55 @@ pub fn attention_infer(out: &mut [f32], qkv: &[f32], prefix_k: &[f32], prefix_v:
     let scale = 1.0 / (hd as f32).sqrt();
     let n = p + l; // score columns: prefix, then this sequence's own tokens
     let (o, q, pk, pv) = (Ptr(out.as_mut_ptr()), ConstPtr(qkv.as_ptr()), ConstPtr(prefix_k.as_ptr()), ConstPtr(prefix_v.as_ptr()));
+    if l <= 4 {
+        // A few new tokens (generation): plain dot products beat setting up
+        // matrix multiplies for such small shapes.
+        let work = b * nh * l * n * hd;
+        (0..b * nh).into_par_iter().with_min_len(if work < MIN_ELEMS * 8 { b * nh } else { 1 }).for_each(|bh| {
+            let (bb, h) = (bh / nh, bh % nh);
+            let (o, q, pk, pv) = (o, q, pk, pv);
+            let mut scores = vec![0f32; n];
+            for i in 0..l {
+                // SAFETY: offsets stay inside the asserted buffers, and this task
+                // writes only its own (sequence, head) slice of `out`.
+                unsafe {
+                    let qrow = std::slice::from_raw_parts(q.0.add((bb * l + i) * 3 * c + h * hd), hd);
+                    let key = |j: usize| -> &[f32] {
+                        if j < p {
+                            std::slice::from_raw_parts(pk.0.add(j * c + h * hd), hd)
+                        } else {
+                            std::slice::from_raw_parts(q.0.add((bb * l + j - p) * 3 * c + c + h * hd), hd)
+                        }
+                    };
+                    let value = |j: usize| -> &[f32] {
+                        if j < p {
+                            std::slice::from_raw_parts(pv.0.add(j * c + h * hd), hd)
+                        } else {
+                            std::slice::from_raw_parts(q.0.add((bb * l + j - p) * 3 * c + 2 * c + h * hd), hd)
+                        }
+                    };
+                    let len = p + i + 1;
+                    let mut max = f32::NEG_INFINITY;
+                    for (j, sj) in scores[..len].iter_mut().enumerate() {
+                        *sj = dot(qrow, key(j)) * scale;
+                        max = max.max(*sj);
+                    }
+                    let mut sum = 0.0;
+                    for sj in scores[..len].iter_mut() {
+                        *sj = (*sj - max).exp();
+                        sum += *sj;
+                    }
+                    let out = std::slice::from_raw_parts_mut(o.0.add((bb * l + i) * c + h * hd), hd);
+                    out.fill(0.0);
+                    for (j, &sj) in scores[..len].iter().enumerate() {
+                        let w = sj / sum;
+                        out.iter_mut().zip(value(j)).for_each(|(a, v)| *a += w * v);
+                    }
+                }
+            }
+        });
+        return;
+    }
     (0..b * nh).into_par_iter().for_each(|bh| {
         let (bb, h) = (bh / nh, bh % nh);
         let (o, q, pk, pv) = (o, q, pk, pv);
@@ -304,7 +403,7 @@ fn sigmoid(x: f32) -> f32 {
 
 /// h = silu(a) * b, where each row of `ab` is [a (H) | b (H)].
 pub fn swiglu_fwd(h: &mut [f32], ab: &[f32], hidden: usize) {
-    h.par_chunks_mut(hidden).zip(ab.par_chunks(2 * hidden)).for_each(|(hr, abr)| {
+    h.par_chunks_mut(hidden).zip(ab.par_chunks(2 * hidden)).with_min_len(MIN_ROWS).for_each(|(hr, abr)| {
         let (a, bb) = abr.split_at(hidden);
         for i in 0..hidden {
             hr[i] = a[i] * sigmoid(a[i]) * bb[i];
@@ -316,6 +415,7 @@ pub fn swiglu_bwd(dab: &mut [f32], dh: &[f32], ab: &[f32], hidden: usize) {
     dab.par_chunks_mut(2 * hidden)
         .zip(dh.par_chunks(hidden))
         .zip(ab.par_chunks(2 * hidden))
+        .with_min_len(MIN_ROWS)
         .for_each(|((d, dhr), abr)| {
             let (a, bb) = abr.split_at(hidden);
             let (da, db) = d.split_at_mut(hidden);
@@ -388,13 +488,13 @@ pub fn dropout_mask(mask: &mut [f32], p: f32, seed: u64) {
 /// out = x + y (* mask)
 pub fn residual(out: &mut [f32], x: &[f32], y: &[f32], mask: Option<&[f32]>) {
     match mask {
-        Some(m) => out.par_iter_mut().zip(x).zip(y).zip(m).for_each(|(((o, a), b), k)| *o = a + b * k),
-        None => out.par_iter_mut().zip(x).zip(y).for_each(|((o, a), b)| *o = a + b),
+        Some(m) => out.par_iter_mut().zip(x).zip(y).zip(m).with_min_len(MIN_ELEMS).for_each(|(((o, a), b), k)| *o = a + b * k),
+        None => out.par_iter_mut().zip(x).zip(y).with_min_len(MIN_ELEMS).for_each(|((o, a), b)| *o = a + b),
     }
 }
 
 pub fn embed(out: &mut [f32], wte: &[f32], tokens: &[u32], c: usize) {
-    out.par_chunks_mut(c).zip(tokens.par_iter()).for_each(|(o, &t)| {
+    out.par_chunks_mut(c).zip(tokens.par_iter()).with_min_len(MIN_ROWS).for_each(|(o, &t)| {
         o.copy_from_slice(&wte[t as usize * c..(t as usize + 1) * c]);
     });
 }

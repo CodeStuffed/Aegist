@@ -19,8 +19,9 @@ council <command> [options]
   command's options.
 - `council --version` prints the version.
 - The global option `--threads N` sets how many CPU threads to use. The
-  default is every core for `train`/`research`, and up to 4 for `ask`, so
-  asking stays quick while a training run is going. You can also set it
+  default is every core for `train`/`research`, and up to 2 for `ask`:
+  generating one token at a time is fastest on 1–2 threads, and it leaves
+  cores free for a training run. You can also set it
   with the `COUNCIL_THREADS` environment variable.
 
 ---
@@ -34,7 +35,7 @@ whenever you're curious.**
 council doctor
 ```
 
-### Example output (illustrative numbers)
+### Example output (a real run on a 4-core laptop-class CPU)
 
 ```
 Files
@@ -44,14 +45,24 @@ Hardware
   RAM        15.7 GB
   CPU        4 cores, 4 threads, AVX-512
   Tier       small -> a new model would be 6 layers x 256 wide, 256-token context (~5.9M params)
+Sizes (council train --tier NAME; * = picked automatically; time assumes 140 GFLOP/s)
+   tiny       2.2M params |    0.4 GB to train | ~  1.1 hours to train well | int4 file    1 MB
+  *small      5.9M params |    0.8 GB to train | ~  8.2 hours to train well | int4 file    4 MB
+   medium    17.3M params |    1.6 GB to train | ~     3 days to train well | int4 file   11 MB
+   large     42.2M params |    3.4 GB to train | ~    18 days to train well | int4 file   26 MB
+   xl       125.9M params |    7.4 GB to train | ~   158 days to train well | int4 file   79 MB
+   xxl      337.2M params |   18.9 GB to train | ~    3 years to train well | int4 file  211 MB  (too big for this machine)
+   1b        1.28B params |   40.3 GB to train | ~   44 years to train well | int4 file  798 MB  (too big for this machine)
 Corpus
-  152 file(s), 11.2 MB in /home/you/Aegist/data/corpus
+  152 file(s), 10.5 MB in /home/you/Aegist/data/corpus
 Model
   6x256 transformer, 5.87M params, vocabulary 4096
-  4,500 steps, 18.4M tokens seen, 1.2 h trained, held-out loss 3.412 (1.231 bits per byte)
+  Answers with int8 weights (inference.precision): f32 23 MB | int8 ~6 MB | int4 ~4 MB
+  544 steps, 2.2M tokens seen, 0.2 h trained, held-out loss 3.563 (1.652 bits per byte)
+  Trained on 2% of the ~117M tokens (20 per parameter) a model this size should see
 Memory
   228 passage(s) in the knowledge base
-  3 past council session(s)
+  9 past council session(s)
 ```
 
 ### Reading it
@@ -59,10 +70,13 @@ Memory
 | Line | Meaning |
 |---|---|
 | **Settings / Data** | Where your settings file and everything it has learned are stored. |
+| **Sizes** | Every model size in settings.yaml: parameters, memory needed to train it, and how long it takes on this machine to read ~20 tokens per parameter (a rough rule for "trained well"). `*` marks the size picked automatically for a new model; others need `council train --tier NAME`. |
 | **CPU** | Cores, threads, and the fastest vector instructions detected (AVX-512 > AVX2 + FMA > SSE; NEON on Apple Silicon). All are used automatically. |
 | **Tier** | The model size your RAM supports. It only applies when a **new** model is created; an existing model keeps its size. |
 | **Corpus** | All the text the model trains on: your imported files plus Wikipedia articles from `research`. |
 | **params** | Number of learned numbers ("weights") in the model. |
+| **Answers with** | The precision `ask` uses by default, and the model's size at each precision. |
+| **Trained on N%** | How far along it is toward ~20 tokens per parameter. |
 | **steps / tokens seen** | How many learning updates it has made, and how much text it has read in total, counting re-reads. A token is roughly ¾ of a word. |
 | **held-out loss** | How well the model predicts text it has *never trained on*, in its own units. Lower is better. |
 | **bits per byte** | **The number to watch.** The same measure per byte of text, so it compares fairly across tokenizers and model sizes. Plain compression (like zip) manages about 2–3; lower means the model has learned the language better. |
@@ -87,6 +101,7 @@ council train [--data PATH] [--hours N | --steps N]
 | `--data PATH` | none | A folder (searched recursively) or a single file. Every `.txt` and `.md` file is **copied** into `data/corpus/imported/`, then training starts. You only need to import a folder once; re-importing just refreshes the copies. Other file types (PDF, Word…) are skipped, so save them as `.txt` first. |
 | `--hours N` | `1` | Train for N hours. Decimals work: `0.25` is 15 minutes. |
 | `--steps N` | none | Train for exactly N learning steps instead of a set time. Can't be combined with `--hours`. |
+| `--tier NAME` | picked from RAM | Size for a **new** model: `tiny`, `small`, `medium`, `large`, or the opt-in `xl`, `xxl`, `1b`. `council doctor` lists them with memory and time. It refuses a size that won't fit in memory; to resize an existing model, delete `data/brain/` first. |
 
 ### Examples
 
@@ -112,18 +127,20 @@ quotes if there are spaces.
    every minute, and saves every 5 minutes.
 5. **Done** (or **Ctrl+C**): it saves and prints a summary.
 
-### Example output (illustrative numbers)
+### Example output (real: the start of one run and the end of a 10-minute one, same settings and text)
 
 ```
-Imported 1 file(s) into /home/you/Aegist/data/corpus.
+Imported 152 file(s) into /home/you/Aegist/data/corpus.
 Creating a new model for the 'small' tier (15.7 GB RAM).
 Learning a 4096-token vocabulary from the corpus...
 Model: 6 layers x 256 wide, 4 heads, 256-token context, 5.87M parameters.
-Corpus: 2,712,064 tokens (2,576,461 train / 135,603 held out).
-step     10 | loss 8.242 | held-out - |   3,958 tok/s | lr 8.1e-5
-step    420 | loss 4.105 | held-out 4.382 |   3,870 tok/s | lr 9.3e-4
+Corpus: 3,294,382 tokens (3,129,663 train / 164,719 held out).
+step      9 | loss 8.302 | held-out - |   3,500 tok/s | lr 7.7e-5
+At 3,500 tokens/s, this 5.9M-parameter model needs about 9.3 hours more training to read ~117M tokens (20 per parameter, roughly "trained well").
+step     19 | loss 8.114 | held-out - |   3,786 tok/s | lr 7.8e-5
 ...
-Saved: 2,289 steps total, 9.4M tokens seen, held-out loss 3.912 (1.402 bits per byte).
+step    542 | loss 3.376 | held-out 3.592 |   3,710 tok/s | lr 1.0e-4
+Saved: 544 steps total, 2.2M tokens seen, held-out loss 3.563 (1.652 bits per byte).
 ```
 
 | Column | Meaning |
@@ -136,16 +153,26 @@ Saved: 2,289 steps total, 9.4M tokens seen, held-out loss 3.912 (1.402 bits per 
 
 ### Speed
 
-On a 4-core laptop-class CPU with AVX-512 (faster with more cores):
+Measured on a 4-core CPU with AVX-512 (more cores is faster):
 
-| Tier | Model | Tokens / second | Tokens / hour |
+| Tier | Model | Tokens / second | To read 20 tokens per parameter |
 |---|---|---|---|
-| tiny (≤ 8 GB RAM) | 4 × 192, ~2.2M params | ~7,900 | ~28M |
-| small (≤ 16 GB) | 6 × 256, ~5.9M params | ~3,700 | ~13M |
-| medium (≤ 32 GB) | 8 × 384, ~17M params | ~1,500 | ~5.5M |
-| large (more) | 12 × 512, ~42M params | ~680 | ~2.5M |
+| tiny (≤ 8 GB RAM) | 4 × 192, 2.2M params | ~8,400 | ~1 hour |
+| small (≤ 16 GB) | 6 × 256, 5.9M params | ~3,600 | ~9 hours |
+| medium (≤ 32 GB) | 8 × 384, 17M params | ~1,600 | ~2.5 days |
+| large (more) | 12 × 512, 42M params | ~680 | ~2.5 weeks |
+| xl (opt-in) | 16 × 768, 126M params | ~260 | ~4 months |
 
-`cargo run --release --example bench` measures your own machine.
+`cargo run --release --example bench` measures your own machine, and
+`council doctor` estimates every size.
+
+**Short on time? Pick a smaller size.** In a 10-minute test on the same
+text, the tiny size scored better than the small one, because it read 2.5×
+more text in that time. Bigger sizes only pull ahead after hours of training.
+
+The first progress line is followed by one estimate, based on the speed it
+just measured: how much longer this model needs to have read about 20 tokens
+per parameter (a rough rule for "trained well").
 
 ### Is it working?
 
@@ -158,11 +185,11 @@ On a 4-core laptop-class CPU with AVX-512 (faster with more cores):
 
 ### How much text and time?
 
-| Text | Good training time (small tier) |
-|---|---|
-| 200 KB (minimum) | ~15 minutes, then it starts memorizing |
-| 5 MB (a few dozen books) | 2–4 hours |
-| 50 MB+ | overnight or longer; it keeps improving |
+- **Text:** at least 200 KB to start a model, several MB to do well, and
+  more is better. If held-out stops improving while training loss keeps
+  falling, it needs more text, not more time.
+- **Time:** see the table above. A few hours on `tiny` or `small` gives
+  real progress; `research` overnight keeps it going on its own.
 
 ### Stopping and resuming
 
@@ -275,6 +302,7 @@ council ask "<your claim>" [--no-recheck] [--json]
 | `"<claim>"` | The statement to judge. **Use quotes.** A full sentence works best. |
 | `--no-recheck` | Skip the repeat run. About twice as fast, but it can't catch the council disagreeing with itself. |
 | `--json` | Print the complete result as JSON instead of the readable report, for other programs or for inspecting every number. |
+| `--precision P` | Weights used to answer: `f32` (exact), `int8` (default: 4× smaller, practically identical, fastest) or `int4` (~6× smaller, practically identical). The default is set by `inference.precision` in settings. Training always uses full precision. |
 
 It takes a second or two, and works fine while `train` or `research` runs in
 another terminal. Progress lines (`... Council deliberating`) go to stderr,
@@ -346,6 +374,45 @@ OVERALL CONFIDENCE: Medium                                                      
 13. **Overall confidence:** the final word. **High** is only possible when
     the signals are strong, the claim is familiar, the model is well
     trained, and both runs agree.
+
+### A real run
+
+The 5.9M model from the examples above (10 minutes of training on 11 MB of
+technical text), with 228 paragraphs of Newton's *Opticks* in its knowledge
+base. It answers "Undecided" with Low confidence, which is correct for a
+model that has barely trained and has read little like this claim. Took
+0.3 seconds:
+
+```
+CLAIM: White light is a mixture of rays of different colours
+Model: 6x256 transformer, 5.87M params, int8 weights (6.0 MB), 2.2M tokens trained, held-out loss 3.56
+Router: no Investor - No money-related words, so no Investor.
+Familiarity: claim loss 6.38 vs. typical 3.56 -> confidence ceiling Low
+Knowledge base: 3 relevant passage(s)
+
+BELIEVER  [Low]  signal -1.14
+  "This is true because of the Lens, that they are so that the Rays of the Rays, and
+  that these Prism, and this distance of that those were used, that be, and the
+  Refractions at _FC_ I, a FE, and that"
+
+SKEPTIC  [Low]  signal -1.16
+  "This is false because the Prism in the Refraction was the violet, as the blue, the
+  Glass is so in the Paper, and to that the Angle of the same as in the Air, and the
+  violet, so in the Eye, a red, and the"
+
+JUDGE  [Low]  relied on: believer, skeptic
+  Verdict: Undecided - the model finds the claim about as compatible with 'true' as with
+  'false'.
+  Why: Believer signal -1.14 vs. Skeptic -1.16 nats/token (margin +0.02).
+  In its own words: "In conclusion, and therefore the Glass being made by the red and
+  the Paper which part must be in those of the Object-line of the Sines, that the Rings
+  made about the other Colours of those Colours are the Light, or very many as by the"
+  Unresolved: neither side's signal clearly beats the other; the claim is unlike most of
+  what the model has read (loss 6.38 vs. a typical 3.56)
+
+Repeat run (dropout on) agreed with the first.
+OVERALL CONFIDENCE: Low
+```
 
 ### Getting better answers
 

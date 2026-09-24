@@ -10,6 +10,7 @@ use council::corpus;
 use council::hardware;
 use council::knowledge::KnowledgeStore;
 use council::model::{Layout, ModelConfig};
+use council::quant::Precision;
 use council::research::{self, SystemClock};
 use council::session_log;
 use council::trainer::{self, commas, Budget, NotEnoughText};
@@ -27,7 +28,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Worker threads (default: every core for train/research, up to 4 for ask).
+    /// Worker threads (default: every core for train/research, up to 2 for ask).
     #[arg(long, global = true)]
     threads: Option<usize>,
 }
@@ -44,6 +45,10 @@ enum Command {
         /// Print the full result as JSON.
         #[arg(long)]
         json: bool,
+        /// Weights to answer with: f32 (exact), int8 or int4 (smaller, faster).
+        /// Default: inference.precision in settings.yaml.
+        #[arg(long, value_enum)]
+        precision: Option<Precision>,
     },
     /// Train (or keep training) the model on the corpus.
     Train {
@@ -56,6 +61,10 @@ enum Command {
         /// Train for this many steps instead of by time.
         #[arg(long)]
         steps: Option<u64>,
+        /// Size for a NEW model, by tier name in settings.yaml (see `council doctor`).
+        /// Default: picked from this machine's RAM.
+        #[arg(long)]
+        tier: Option<String>,
     },
     /// Read Wikipedia on its own and keep training on what it finds.
     Research {
@@ -82,12 +91,19 @@ fn main() -> ExitCode {
         .or_else(|| std::env::var("COUNCIL_THREADS").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(match cli.command {
             // Answering one question is small work; leave cores for a training run.
-            Command::Ask { .. } | Command::Doctor => default_threads.min(4),
+            Command::Ask { .. } | Command::Doctor => default_threads.min(2),
             _ => default_threads,
         });
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build_global();
-
-    match run(cli.command) {
+    let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build() {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("error: couldn't start worker threads: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // Everything runs inside the pool: parallel work started from a pool
+    // thread is cheap, which matters for the many small steps of generation.
+    match pool.install(|| run(cli.command)) {
         Ok(code) => code,
         Err(e) => {
             if e.downcast_ref::<NoBrain>().is_some() || e.downcast_ref::<NotEnoughText>().is_some() {
@@ -112,7 +128,11 @@ fn install_ctrl_c() {
 fn run(command: Command) -> Result<ExitCode> {
     let settings = Settings::load()?;
     match command {
-        Command::Ask { claim, no_recheck, json } => {
+        Command::Ask { claim, no_recheck, json, precision } => {
+            let mut settings = settings;
+            if let Some(p) = precision {
+                settings.inference.precision = p;
+            }
             let brain = Brain::load(&settings)?;
             let opts = Options { recheck: no_recheck.then_some(false), ..Default::default() };
             let result = evaluate(&brain, &claim, &settings, &opts, &mut |m| eprintln!("  ... {m}"))?;
@@ -122,14 +142,14 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("{}", render(&result));
             }
         }
-        Command::Train { data, hours, steps } => {
+        Command::Train { data, hours, steps, tier } => {
             if let Some(src) = data {
                 let n = corpus::import_texts(&src, &settings)?;
                 println!("Imported {n} file(s) into {}.", corpus::corpus_dir(&settings).display());
             }
             install_ctrl_c();
             let budget = steps.map(Budget::Steps).unwrap_or(Budget::Minutes(hours * 60.0));
-            let report = trainer::train(&settings, budget, &mut |m| println!("{m}"), None, &STOP)?;
+            let report = trainer::train(&settings, budget, tier.as_deref(), &mut |m| println!("{m}"), None, &STOP)?;
             if report.interrupted {
                 println!("Stopped; the checkpoint was saved.");
             }
@@ -144,7 +164,7 @@ fn run(command: Command) -> Result<ExitCode> {
                 &mut |m| println!("{m}"),
                 &SystemClock,
                 &mut |topic| research::fetch_wikipedia(topic, s),
-                &mut |minutes, log| Ok(trainer::train(s, Budget::Minutes(minutes), log, None, &STOP)?.interrupted),
+                &mut |minutes, log| Ok(trainer::train(s, Budget::Minutes(minutes), None, log, None, &STOP)?.interrupted),
                 &STOP,
             )?;
             if summary.interrupted {
@@ -175,6 +195,38 @@ fn doctor(settings: &Settings) -> Result<()> {
     println!("  Tier       {tier_name} -> a new model would be {} layers x {} wide, {}-token context (~{:.1}M params)",
         t.n_layer, t.d_model, t.block_size, Layout::new(&est).total as f64 / 1e6);
 
+    // Rough training speed: time a matrix multiply on every core (as
+    // training uses), and assume ~60% of that rate end to end - about what
+    // the real training loop reaches.
+    let measure = || {
+        let n = 768;
+        let (a, b) = (vec![0.5f32; n * n], vec![0.25f32; n * n]);
+        let mut c = vec![0f32; n * n];
+        council::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
+        let start = std::time::Instant::now();
+        for _ in 0..8 {
+            council::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
+        }
+        0.6 * 8.0 * 2.0 * (n * n * n) as f64 / start.elapsed().as_secs_f64()
+    };
+    let flops_per_s = rayon::ThreadPoolBuilder::new().build().map(|p| p.install(measure)).unwrap_or_else(|_| measure());
+    println!("Sizes (council train --tier NAME; * = picked automatically; time assumes {:.0} GFLOP/s)", flops_per_s / 1e9);
+    let mut tiers: Vec<_> = settings.model.tiers.iter().collect();
+    tiers.sort_by(|a, b| (a.1.manual, a.1.max_ram_gb).partial_cmp(&(b.1.manual, b.1.max_ram_gb)).unwrap());
+    for (name, t) in tiers {
+        let cfg = ModelConfig {
+            vocab_size: t.vocab_size, block_size: t.block_size, n_layer: t.n_layer, n_head: t.n_head, d_model: t.d_model,
+            mlp_hidden: ModelConfig::default_mlp_hidden(t.d_model), dropout: settings.model.dropout, rope_base: settings.model.rope_base,
+        };
+        let params = Layout::new(&cfg).total as f64;
+        let mem = trainer::training_bytes(&cfg, settings) as f64 / (1u64 << 30) as f64;
+        let fits = if mem > 0.85 * hw.ram_gb { "  (too big for this machine)" } else { "" };
+        let well = 6.0 * params * trainer::TOKENS_PER_PARAM * params / flops_per_s;
+        println!("  {}{name:7} {:>7} params | {:>6.1} GB to train | ~{:>11} to train well | int4 file {:>7}{fits}",
+            if *name == tier_name { "*" } else { " " }, human_count(params), mem, trainer::human_duration(well),
+            human_bytes(0.5 * params + params / 8.0));
+    }
+
     let files = corpus::corpus_files(settings);
     let mb: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
     println!("Corpus");
@@ -186,9 +238,15 @@ fn doctor(settings: &Settings) -> Result<()> {
             let st = &meta.stats;
             let c = &model.cfg;
             println!("  {}x{} transformer, {:.2}M params, vocabulary {}", c.n_layer, c.d_model, model.num_params() as f64 / 1e6, tok.vocab_size());
+            let n = model.num_params() as f64;
+            println!("  Answers with {} weights (inference.precision): f32 {} | int8 ~{} | int4 ~{}",
+                settings.inference.precision, human_bytes(4.0 * n), human_bytes(n + 4.0 * n / c.d_model as f64), human_bytes(0.5 * n + n / 8.0));
             println!("  {} steps, {:.1}M tokens seen, {:.1} h trained, held-out loss {} ({} bits per byte)",
                 commas(st.steps), st.tokens_seen as f64 / 1e6, st.train_seconds / 3600.0,
                 st.val_loss.map_or("-".into(), |v| format!("{v:.3}")), st.val_bpb.map_or("-".into(), |v| format!("{v:.3}")));
+            let target = trainer::TOKENS_PER_PARAM * n;
+            println!("  Trained on {:.0}% of the ~{:.0}M tokens (20 per parameter) a model this size should see",
+                100.0 * st.tokens_seen as f64 / target, target / 1e6);
         }
         Ok(None) => println!("  none yet - run `council train --data <folder> --hours 1`"),
         Err(e) => println!("  {e}"),
@@ -198,6 +256,22 @@ fn doctor(settings: &Settings) -> Result<()> {
     println!("  {} passage(s) in the knowledge base", KnowledgeStore::open(settings)?.count());
     println!("  {} past council session(s)", session_log::sessions(settings).len());
     Ok(())
+}
+
+fn human_count(n: f64) -> String {
+    match n {
+        n if n >= 1e12 => format!("{:.1}T", n / 1e12),
+        n if n >= 1e9 => format!("{:.2}B", n / 1e9),
+        n if n >= 1e6 => format!("{:.1}M", n / 1e6),
+        n => format!("{:.0}K", n / 1e3),
+    }
+}
+
+fn human_bytes(b: f64) -> String {
+    match b {
+        b if b >= 1e9 => format!("{:.1} GB", b / 1e9),
+        b => format!("{:.0} MB", b / 1e6),
+    }
 }
 
 fn conf_label(conf: impl std::fmt::Display, before: Option<impl std::fmt::Display>) -> String {

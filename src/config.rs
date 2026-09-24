@@ -22,6 +22,9 @@ pub struct Tier {
     pub d_model: usize,
     pub block_size: usize,
     pub vocab_size: usize,
+    /// Only used when asked for by name (`council train --tier NAME`).
+    #[serde(default)]
+    pub manual: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,6 +92,23 @@ pub struct MemorySettings {
     pub min_relevance: f64,
 }
 
+fn default_precision() -> crate::quant::Precision {
+    crate::quant::Precision::Int8
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct InferenceSettings {
+    /// Weights used to answer questions: f32 (exact), int8 or int4 (smaller, faster).
+    #[serde(default = "default_precision")]
+    pub precision: crate::quant::Precision,
+}
+
+impl Default for InferenceSettings {
+    fn default() -> Self {
+        InferenceSettings { precision: default_precision() }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct UncertaintySettings {
     pub enabled: bool,
@@ -117,6 +137,8 @@ pub struct Settings {
     pub council: CouncilSettings,
     pub router: RouterSettings,
     pub memory: MemorySettings,
+    #[serde(default)]
+    pub inference: InferenceSettings,
     pub uncertainty: UncertaintySettings,
     pub research: ResearchSettings,
     pub paths: PathSettings,
@@ -272,7 +294,7 @@ pub mod testing {
         s.data_dir = data_dir.to_path_buf();
         s.model.tiers = BTreeMap::from([(
             "test".to_string(),
-            Tier { max_ram_gb: 1e9, n_layer: 1, n_head: 2, d_model: 32, block_size: 48, vocab_size: 320 },
+            Tier { max_ram_gb: 1e9, n_layer: 1, n_head: 2, d_model: 32, block_size: 48, vocab_size: 320, manual: false },
         )]);
         let t = &mut s.training;
         t.tokens_per_step = 8 * 48;

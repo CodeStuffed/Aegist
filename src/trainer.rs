@@ -53,7 +53,51 @@ pub fn commas(n: u64) -> String {
     out
 }
 
-fn new_model(settings: &Settings, seed: u64, log: &mut dyn FnMut(String)) -> Result<(Model, Tokenizer, Meta)> {
+/// Tokens of training for a model this size to be trained well (~20 per parameter).
+pub const TOKENS_PER_PARAM: f64 = 20.0;
+
+pub fn human_duration(seconds: f64) -> String {
+    let (m, h, d, y) = (60.0, 3600.0, 86_400.0, 365.25 * 86_400.0);
+    match seconds {
+        s if s < h => format!("{:.0} minutes", (s / m).max(1.0)),
+        s if s < 2.0 * d => format!("{:.1} hours", s / h),
+        s if s < 2.0 * y => format!("{:.0} days", s / d),
+        s => format!("{} years", commas((s / y).round() as u64)),
+    }
+}
+
+fn config_for(settings: &Settings, tier: &crate::config::Tier, vocab_size: usize) -> ModelConfig {
+    ModelConfig {
+        vocab_size,
+        block_size: tier.block_size,
+        n_layer: tier.n_layer,
+        n_head: tier.n_head,
+        d_model: tier.d_model,
+        mlp_hidden: ModelConfig::default_mlp_hidden(tier.d_model),
+        dropout: settings.model.dropout,
+        rope_base: settings.model.rope_base,
+    }
+}
+
+/// Weights + gradients + two AdamW moments, plus activations for one step.
+pub fn training_bytes(cfg: &ModelConfig, settings: &Settings) -> usize {
+    let b = (settings.training.tokens_per_step / cfg.block_size).max(1);
+    16 * crate::model::Layout::new(cfg).total + Acts::estimate_bytes(cfg, b, cfg.block_size)
+}
+
+fn check_memory(cfg: &ModelConfig, settings: &Settings) -> Result<()> {
+    let need = training_bytes(cfg, settings) as f64 / (1u64 << 30) as f64;
+    let have = hardware::detect().ram_gb;
+    if need > 0.85 * have {
+        anyhow::bail!(
+            "Training this {}x{} model needs about {need:.1} GB of memory, but this machine has {have:.1} GB. \
+             Pick a smaller size (`council train --tier small`) or lower training.tokens_per_step.",
+            cfg.n_layer, cfg.d_model);
+    }
+    Ok(())
+}
+
+fn new_model(settings: &Settings, seed: u64, tier: Option<&str>, log: &mut dyn FnMut(String)) -> Result<(Model, Tokenizer, Meta)> {
     let text = corpus::read_corpus(settings, settings.training.tokenizer_train_chars);
     let needed = settings.training.min_new_model_chars;
     if text.len() < needed {
@@ -62,22 +106,22 @@ fn new_model(settings: &Settings, seed: u64, log: &mut dyn FnMut(String)) -> Res
             text.len() / 1000, needed / 1000)).into());
     }
     let hw = hardware::detect();
-    let tier_name = hardware::pick_tier(hw.ram_gb, &settings.model.tiers);
-    let tier = &settings.model.tiers[&tier_name];
+    let tier_name = match tier {
+        Some(name) => name.to_string(),
+        None => hardware::pick_tier(hw.ram_gb, &settings.model.tiers),
+    };
+    let tier = settings.model.tiers.get(&tier_name).ok_or_else(|| {
+        anyhow::anyhow!("No tier named {tier_name:?}; settings.yaml has: {}",
+            settings.model.tiers.keys().cloned().collect::<Vec<_>>().join(", "))
+    })?;
+    // check with the full vocabulary before spending time learning it
+    let planned = config_for(settings, tier, tier.vocab_size);
+    planned.validate()?;
+    check_memory(&planned, settings)?;
     log(format!("Creating a new model for the '{tier_name}' tier ({:.1} GB RAM).", hw.ram_gb));
     log(format!("Learning a {}-token vocabulary from the corpus...", tier.vocab_size));
     let tokenizer = Tokenizer::train(&text, tier.vocab_size);
-    let cfg = ModelConfig {
-        vocab_size: tokenizer.vocab_size(),
-        block_size: tier.block_size,
-        n_layer: tier.n_layer,
-        n_head: tier.n_head,
-        d_model: tier.d_model,
-        mlp_hidden: ModelConfig::default_mlp_hidden(tier.d_model),
-        dropout: settings.model.dropout,
-        rope_base: settings.model.rope_base,
-    };
-    cfg.validate()?;
+    let cfg = config_for(settings, tier, tokenizer.vocab_size());
     let model = Model::new(cfg.clone(), seed);
     log(format!(
         "Model: {} layers x {} wide, {} heads, {}-token context, {:.2}M parameters.",
@@ -95,7 +139,9 @@ fn new_model(settings: &Settings, seed: u64, log: &mut dyn FnMut(String)) -> Res
 
 /// Train, or keep training, for the given budget. Saves as it goes; on a
 /// stop request it saves and returns with `interrupted` set.
-pub fn train(settings: &Settings, budget: Budget, log: &mut dyn FnMut(String), seed: Option<u64>, stop: &AtomicBool) -> Result<Report> {
+/// `tier`: size for a NEW model by name (default: picked from RAM). An
+/// existing model keeps its size.
+pub fn train(settings: &Settings, budget: Budget, tier: Option<&str>, log: &mut dyn FnMut(String), seed: Option<u64>, stop: &AtomicBool) -> Result<Report> {
     let tcfg = &settings.training;
     if corpus::corpus_files(settings).is_empty() {
         return Err(NotEnoughText("The corpus is empty. Add text with `council train --data <folder>`, \
@@ -103,8 +149,19 @@ pub fn train(settings: &Settings, budget: Budget, log: &mut dyn FnMut(String), s
     }
     let seed = seed.unwrap_or_else(|| Rng::from_time().next_u64());
     let (mut model, tokenizer, mut meta) = match checkpoint::load(settings)? {
-        Some(loaded) => loaded,
-        None => new_model(settings, seed, log)?,
+        Some(loaded) => {
+            if let Some(name) = tier {
+                let want = settings.model.tiers.get(name);
+                let c = &loaded.0.cfg;
+                if want.map_or(true, |t| (t.n_layer, t.d_model, t.block_size) != (c.n_layer, c.d_model, c.block_size)) {
+                    anyhow::bail!("A {}x{} model already exists in {}. Delete that folder to start a new one at the {name:?} size \
+                                   (your text and knowledge base are kept).", c.n_layer, c.d_model, checkpoint::brain_dir(settings).display());
+                }
+            }
+            check_memory(&loaded.0.cfg, settings)?;
+            loaded
+        }
+        None => new_model(settings, seed, tier, log)?,
     };
     let cfg = model.cfg.clone();
     let tokens = corpus::corpus_tokens(&tokenizer, settings)?;
@@ -194,6 +251,18 @@ pub fn train(settings: &Settings, budget: Budget, log: &mut dyn FnMut(String), s
             let held = meta.stats.val_loss.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into());
             log(format!("step {:>6} | loss {:.3} | held-out {held} | {:>7} tok/s | lr {lr:.1e}",
                 meta.stats.steps, meta.stats.train_loss.unwrap_or(f32::NAN), commas(rate as u64)));
+            if last_log == 0.0 {
+                // once per session: how long this model needs, at this machine's real speed
+                let target = TOKENS_PER_PARAM * model.num_params() as f64;
+                let left = target - meta.stats.tokens_seen as f64;
+                log(if left > 0.0 {
+                    format!("At {} tokens/s, this {:.1}M-parameter model needs about {} more training to read ~{:.0}M tokens \
+                             (20 per parameter, roughly \"trained well\").",
+                        commas(rate as u64), model.num_params() as f64 / 1e6, human_duration(left / rate.max(1.0)), target / 1e6)
+                } else {
+                    "This model has already read ~20 tokens per parameter; more new text now helps more than more time.".to_string()
+                });
+            }
             last_log = now;
         }
         if now - last_save >= tcfg.checkpoint_every_s {
@@ -245,7 +314,7 @@ gravity accelerates every body at the same rate.\n\n";
         let src = tmp.path().join("notes.txt");
         std::fs::write(&src, CORPUS.repeat(20)).unwrap();
         corpus::import_texts(&src, &s).unwrap();
-        train(&s, Budget::Steps(steps), &mut |_| {}, Some(0), &AtomicBool::new(false)).unwrap();
+        train(&s, Budget::Steps(steps), None, &mut |_| {}, Some(0), &AtomicBool::new(false)).unwrap();
         (tmp, s)
     }
 
@@ -254,14 +323,14 @@ gravity accelerates every body at the same rate.\n\n";
         let tmp = tempfile::tempdir().unwrap();
         let mut s = testing::settings(&tmp.path().join("data"));
         let stop = AtomicBool::new(false);
-        let err = train(&s, Budget::Steps(1), &mut |_| {}, None, &stop).unwrap_err();
+        let err = train(&s, Budget::Steps(1), None, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.downcast_ref::<NotEnoughText>().unwrap().0.contains("corpus is empty"));
         std::fs::write(tmp.path().join("t.txt"), "too short").unwrap();
         corpus::import_texts(&tmp.path().join("t.txt"), &s).unwrap();
-        let err = train(&s, Budget::Steps(1), &mut |_| {}, None, &stop).unwrap_err();
+        let err = train(&s, Budget::Steps(1), None, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.to_string().contains("KB of text so far"));
         s.training.min_new_model_chars = 1;
-        let err = train(&s, Budget::Steps(1), &mut |_| {}, None, &stop).unwrap_err();
+        let err = train(&s, Budget::Steps(1), None, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.to_string().contains("only"));
     }
 
@@ -272,10 +341,10 @@ gravity accelerates every body at the same rate.\n\n";
         let vocab = meta.config.vocab_size as f32;
         assert!(meta.stats.val_loss.unwrap() < vocab.ln() - 1.0, "held-out loss {:?}", meta.stats.val_loss);
         assert!(meta.stats.val_bpb.unwrap() > 0.0);
-        let again = train(&s, Budget::Steps(10), &mut |_| {}, Some(1), &AtomicBool::new(false)).unwrap();
+        let again = train(&s, Budget::Steps(10), None, &mut |_| {}, Some(1), &AtomicBool::new(false)).unwrap();
         assert_eq!((again.stats.steps, again.steps_this_session), (50, 10));
         assert!(checkpoint::brain_dir(&s).join("optim.bin").is_file());
-        let stopped = train(&s, Budget::Steps(1000), &mut |_| {}, Some(2), &AtomicBool::new(true)).unwrap();
+        let stopped = train(&s, Budget::Steps(1000), None, &mut |_| {}, Some(2), &AtomicBool::new(true)).unwrap();
         assert!(stopped.interrupted && stopped.steps_this_session == 0 && stopped.stats.steps == 50);
     }
 
@@ -286,6 +355,23 @@ gravity accelerates every body at the same rate.\n\n";
         std::fs::write(checkpoint::brain_dir(&s).join("brain.json"), r#"{"config": {}, "merges": [], "stats": {}}"#).unwrap();
         let err = checkpoint::load(&s).err().unwrap().to_string();
         assert!(err.contains("older version") && err.contains("Delete"));
+    }
+
+    #[test]
+    fn tier_choice_memory_check_and_durations() {
+        let (_tmp, mut s) = trained(5);
+        // an existing model keeps its size
+        s.model.tiers.insert("big".into(), crate::config::Tier { max_ram_gb: 1e9, n_layer: 2, n_head: 2, d_model: 64, block_size: 48, vocab_size: 320, manual: true });
+        let err = train(&s, Budget::Steps(1), Some("big"), &mut |_| {}, None, &AtomicBool::new(false)).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // a model that can't fit in memory is refused before anything is allocated
+        let huge = crate::config::Tier { max_ram_gb: 1e9, n_layer: 96, n_head: 96, d_model: 12288, block_size: 2048, vocab_size: 50000, manual: true };
+        let cfg = config_for(&s, &huge, 50000);
+        assert!(training_bytes(&cfg, &s) > 1 << 40); // a GPT-3-sized model needs terabytes
+        assert!(check_memory(&cfg, &s).unwrap_err().to_string().contains("needs about"));
+        assert_eq!(human_duration(90.0), "2 minutes");
+        assert_eq!(human_duration(3.0 * 3600.0), "3.0 hours");
+        assert_eq!(human_duration(6e8), "19 years");
     }
 
     #[test]

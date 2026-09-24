@@ -13,7 +13,7 @@
 use crate::checkpoint::{self, Meta};
 use crate::config::Settings;
 use crate::kernels::log_softmax;
-use crate::model::{KvCache, Model};
+use crate::model::{InferModel, KvCache, Layout};
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
 use anyhow::Result;
@@ -29,18 +29,23 @@ impl std::fmt::Display for NoBrain {
 impl std::error::Error for NoBrain {}
 
 pub struct Brain {
-    pub model: Model,
+    pub model: InferModel,
     pub tokenizer: Tokenizer,
     pub meta: Meta,
+    pub num_params: usize,
     lead: Vec<u32>,
 }
 
 impl Brain {
+    /// Load the trained model at the precision in settings (inference.precision).
     pub fn load(settings: &Settings) -> Result<Brain> {
         match checkpoint::load(settings)? {
             Some((model, tokenizer, meta)) => {
                 let lead = tokenizer.encode("\n");
-                Ok(Brain { model, tokenizer, meta, lead })
+                let num_params = Layout::new(&model.cfg).total;
+                // the full-precision copy is dropped once converted
+                let model = model.to_inference(settings.inference.precision);
+                Ok(Brain { model, tokenizer, meta, num_params, lead })
             }
             None => Err(NoBrain(format!(
                 "No trained model in {}. Train one first: `council train --data <folder of .txt/.md files> --hours 1`, \
@@ -53,7 +58,8 @@ impl Brain {
 
     pub fn describe(&self) -> String {
         let c = &self.model.cfg;
-        format!("{}x{} transformer, {:.2}M params", c.n_layer, c.d_model, self.model.num_params() as f64 / 1e6)
+        format!("{}x{} transformer, {:.2}M params, {} weights ({:.1} MB)", c.n_layer, c.d_model,
+                self.num_params as f64 / 1e6, self.model.precision, self.model.weight_bytes() as f64 / 1e6)
     }
 
     fn block(&self) -> usize {
