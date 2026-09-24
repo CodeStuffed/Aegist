@@ -102,6 +102,23 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Load a library by full path. On Windows its own folder is searched for
+/// the libraries it loads in turn (NVRTC loads nvrtc-builtins from there),
+/// even when that folder isn't on PATH.
+fn load_path(path: &std::path::Path) -> Result<Library, libloading::Error> {
+    #[cfg(windows)]
+    {
+        use libloading::os::windows::{Library as WinLibrary, LOAD_WITH_ALTERED_SEARCH_PATH};
+        // Safety: as Library::new.
+        unsafe { WinLibrary::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }.map(Library::from)
+    }
+    #[cfg(not(windows))]
+    {
+        // Safety: loading a library runs its initializers; these are NVIDIA's CUDA libraries.
+        unsafe { Library::new(path) }
+    }
+}
+
 fn open_library(what: &str, names: &[&str]) -> Result<Library> {
     let mut tried = Vec::new();
     for name in names {
@@ -113,7 +130,7 @@ fn open_library(what: &str, names: &[&str]) -> Result<Library> {
         for dir in search_dirs() {
             let path = dir.join(name);
             if path.is_file() {
-                if let Ok(lib) = unsafe { Library::new(&path) } {
+                if let Ok(lib) = load_path(&path) {
                     return Ok(lib);
                 }
             }

@@ -248,6 +248,7 @@ On a GPU, `gpu:` in settings takes over the batch and learning rate:
 | Setting | Default | Effect |
 |---|---|---|
 | `gpu.device` | auto | `auto`, `cpu` or `gpu` (the `--device` default). |
+| `gpu.precision` | auto | Matrix multiplies in `bf16` (about twice as fast, on RTX 30xx and newer) or `tf32`. `auto` picks bf16 where the card supports it. |
 | `gpu.tokens_per_step` | 131072 | Text per learning step on the GPU, split into micro-batches that fit its memory. |
 | `gpu.learning_rate` | 0.0006 | Peak learning rate for the bigger models a GPU trains. |
 | `gpu.warmup_steps` | 500 | Steps to ramp the learning rate up. |
@@ -550,6 +551,7 @@ OVERALL CONFIDENCE: Low
 | `council.mixed_margin` | 0.1 | How close the sides must be to count as Undecided. |
 | `council.familiarity` | 1.25 / 1.5 | How unfamiliar a claim can be before confidence is capped. |
 | `council.min_tokens_trained` | 2,000,000 | Below this, everything is Low. |
+| `council.negation_weight` | 0.5 | Share of the verdict that comes from the negation test (0 turns it off). |
 | `council.generate.temperature` | 0.8 | Randomness of the written positions. Lower is more repetitive, higher is wilder. |
 | `memory.top_k` | 3 | How many best-matching passages to start from. |
 | `memory.min_relevance` | 0.35 | How well a passage must match to be used. |

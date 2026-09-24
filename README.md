@@ -207,19 +207,27 @@ million parameters for a few days of training. See
    is pointwise mutual information, in nats per token. Believer probes
    are "true / correct / right"; Skeptic probes are their negations; the
    Investor compares "will make money" against "will lose money".
-2. **Stance.** `margin = Believer − Skeptic`, averaged with the Investor's
-   signal when it runs. Above `+mixed_margin` means *yes*, below
-   `−mixed_margin` means *no*, and anything between is *undecided*. A flat
-   "no" is as available as "yes".
-3. **Confidence** starts from the size of the margin, then can only go down:
-   - it's capped at the weakest confidence among the personas the verdict
-     relied on;
+2. **Negation test.** The claim's verb is flipped ("prices will rise" →
+   "prices will not rise"). With the knowledge-base evidence in front, the
+   model scores how likely the rest of the claim is after each version. The
+   cost of the word "not" itself is left out, so this measures which version
+   fits what the model has read. It's the strongest signal a model trained
+   on real text like Wikipedia has, and it's skipped for claims without a
+   verb it can flip ("is", "will", "can", "has"...).
+3. **Stance.** `margin = Believer − Skeptic`, averaged with the Investor's
+   signal when it runs, then blended with the negation test
+   (`council.negation_weight`, default half). Above `+mixed_margin` means
+   *yes*, below `−mixed_margin` means *no*, and anything between is
+   *undecided*. A flat "no" is as available as "yes".
+4. **Confidence** starts from the size of the margin, then can only go down:
+   - it's capped at the weakest confidence among the personas (and the
+     negation test) the verdict relied on;
    - it's capped by **familiarity**, the model's loss on the claim compared
      with its typical held-out loss. A claim unlike anything it has read
      can't be rated confident;
    - it's capped at Low until the model has trained on
      `council.min_tokens_trained` tokens.
-4. **Repeat run.** The council runs a second time with dropout switched on
+5. **Repeat run.** The council runs a second time with dropout switched on
    (Monte Carlo dropout), which samples a slightly different network. If
    the stance flips or the confidence tier changes, the result becomes
    "Low confidence: the council didn't agree with itself on a repeat run",

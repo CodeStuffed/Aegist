@@ -41,7 +41,8 @@ council gpu-check
 ```
 
 It compiles the GPU code for your card, runs a small model through **both
-the GPU and the CPU**, and checks that every gradient matches. Then it
+the GPU and the CPU**, and checks that every gradient matches: exactly in
+fp32, and within bf16's rounding for the bf16 path. Then it
 measures the card's speed and lists which model sizes fit. You should see
 `Check passed`. If not, the message says what's missing (driver, CUDA
 Toolkit, or a result that doesn't match).
@@ -139,11 +140,13 @@ of every question.
 
 **Speed.** `council gpu-check` measures your card. As a rough guide, an RTX
 5080 does on the order of 50 trillion TF32 operations per second on matrix
-multiplies. Training reaches a good share of that, which puts a ~200-350M
-parameter model at roughly **8,000–15,000 tokens per second**. In 4 days
-that's about 3 to 5 billion tokens: roughly one read through English
-Wikipedia. These are estimates, not measurements (this code hasn't run on a
-5080 yet); the real numbers print when training starts.
+multiplies, and about twice that in bf16. Training uses bf16 (with fp32
+accumulation and fp32 weights) wherever the card supports it
+(`gpu.precision`). Training reaches a good share of that speed, which puts a
+~200-350M parameter model at roughly **10,000–20,000 tokens per second**.
+In 4 days that's about 3 to 7 billion tokens: one to two reads through
+English Wikipedia. These are estimates, not measurements (this code hasn't
+run on a 5080 yet); the real numbers print when training starts.
 
 **How smart.** A model this size trained on Wikipedia is in the same class
 as GPT-2 (2019):
