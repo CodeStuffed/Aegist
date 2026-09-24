@@ -65,6 +65,12 @@ pub fn save(settings: &Settings, model: &Model, meta: &mut Meta, optim: Option<&
     write_atomic(&dir.join("brain.json"), &serde_json::to_vec(meta)?)
 }
 
+/// The saved model's size, without reading its weights (None if there's no model).
+pub fn saved_config(settings: &Settings) -> Option<crate::model::ModelConfig> {
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(brain_dir(settings).join("brain.json")).ok()?).ok()?;
+    serde_json::from_value(raw.get("config")?.clone()).ok()
+}
+
 /// The saved model, or None if there isn't one yet.
 pub fn load(settings: &Settings) -> Result<Option<(Model, Tokenizer, Meta)>> {
     let dir = brain_dir(settings);

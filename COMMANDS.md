@@ -21,9 +21,10 @@ council <command> [options]
   command's options.
 - `council --version` prints the version.
 - The global option `--threads N` sets how many CPU threads to use. The
-  default is every core for `train`/`research`, and up to 2 for `ask`:
-  generating one token at a time is fastest on 1–2 threads, and it leaves
-  cores free for a training run. You can also set it
+  default is every core for `train`/`research`, and up to 2 for `ask` with a
+  model under 20M parameters: generating one token at a time is fastest on
+  1–2 threads, and it leaves cores free for a training run. Bigger models
+  answer with every core. You can also set it
   with the `COUNCIL_THREADS` environment variable.
 
 ---

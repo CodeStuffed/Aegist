@@ -111,11 +111,16 @@ fn main() -> ExitCode {
     }
     let cli = Cli::parse();
     let default_threads = hardware::detect().threads;
+    // Answering with a small model is small work: leave cores for a training
+    // run. A big model's answers need every core.
+    let big_model = || {
+        Settings::load().ok().and_then(|s| checkpoint::saved_config(&s)).is_some_and(|c| Layout::new(&c).total > 20_000_000)
+    };
     let threads = cli
         .threads
         .or_else(|| std::env::var("COUNCIL_THREADS").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(match cli.command {
-            // Answering one question is small work; leave cores for a training run.
+            Command::Ask { .. } if big_model() => default_threads,
             Command::Ask { .. } | Command::Doctor => default_threads.min(2),
             _ => default_threads,
         });

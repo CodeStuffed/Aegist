@@ -36,7 +36,10 @@ const TAIL_COMMIT: usize = 5_000;
 /// Postings held in memory while building a segment before spilling a sorted
 /// run to disk (~8 bytes each, plus the words): bounds RAM at any size.
 const CHUNK_POSTINGS: usize = 30_000_000;
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
+/// A title word counts as this many occurrences in each of the article's
+/// passages: paragraphs rarely repeat their article's name.
+const TITLE_WEIGHT: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Passage {
@@ -71,6 +74,15 @@ pub struct Hit {
 
 fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a passage is indexed under: its words, plus its title's.
+fn index_terms(p: &Passage) -> HashMap<String, u32> {
+    let mut counts = term_counts(&p.text);
+    for w in content_words(p.meta("title")) {
+        *counts.entry(w).or_default() += TITLE_WEIGHT;
+    }
+    counts
 }
 
 /// Word -> how often it occurs, for one passage.
@@ -337,7 +349,7 @@ struct Parsed {
 
 fn parse_line(line: &[u8], off: u64) -> Option<Parsed> {
     let p: Passage = serde_json::from_slice(line).ok()?;
-    let counts: Vec<(String, u32)> = term_counts(&p.text).into_iter().collect();
+    let counts: Vec<(String, u32)> = index_terms(&p).into_iter().collect();
     Some(Parsed {
         off,
         line_len: line.len() as u32,
@@ -588,7 +600,7 @@ impl Tail {
     fn index(&mut self, p: Passage) {
         let doc = self.base + self.docs.len() as u32;
         self.hashes.insert(fnv1a(normalize(&p.text).as_bytes()));
-        let counts = term_counts(&p.text);
+        let counts = index_terms(&p);
         let len: u32 = counts.values().sum();
         self.lengths.push(len);
         self.total_len += len as u64;
@@ -1057,6 +1069,19 @@ mod tests {
 
         let reopened = KnowledgeStore::open(&s).unwrap();
         assert_eq!(reopened.count(), 3);
+    }
+
+    #[test]
+    fn a_passage_is_found_by_its_article_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = testing::settings(tmp.path());
+        let mut kb = KnowledgeStore::open(&s).unwrap();
+        kb.add("Its capital and largest city is the seat of government.", meta("France")).unwrap();
+        kb.add("France has many rivers; the capital is not on the coast.", meta("Rivers of Europe")).unwrap();
+        kb.add("Bees gather nectar.", meta("Bees")).unwrap();
+        let hits = kb.search("France capital", 2, 0.0);
+        assert_eq!(hits.len(), 2);
+        assert!(kb.search("france", 3, 0.3).iter().any(|h| h.passage.meta("title") == "France"));
     }
 
     #[test]
