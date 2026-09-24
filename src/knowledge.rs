@@ -428,7 +428,12 @@ fn spill(dir: &Path, n: usize, chunk: &mut HashMap<String, Vec<(u32, u32)>>) -> 
     Ok(path)
 }
 
-fn read_run_record(r: &mut BufReader<File>) -> Result<Option<(Vec<u8>, Vec<(u32, u32)>)>> {
+/// One word's (doc, count) pairs in a run file.
+type RunRecord = (Vec<u8>, Vec<(u32, u32)>);
+/// A word's postings from every segment and memory, in doc order.
+type PostingStream<'a> = std::iter::Peekable<Box<dyn Iterator<Item = (u32, u32)> + 'a>>;
+
+fn read_run_record(r: &mut BufReader<File>) -> Result<Option<RunRecord>> {
     let mut n4 = [0u8; 4];
     match r.read_exact(&mut n4) {
         Ok(()) => {}
@@ -537,7 +542,7 @@ fn build_segment(jsonl: &Path, index_dir: &Path, start_doc: u32, start_byte: u64
         // k-way merge of the sorted runs; runs hold increasing doc ranges, so
         // a word's postings are the concatenation in run order
         let mut readers: Vec<BufReader<File>> = runs.iter().map(|p| Ok(BufReader::with_capacity(1 << 20, File::open(p)?))).collect::<Result<_>>()?;
-        let mut current: Vec<Option<(Vec<u8>, Vec<(u32, u32)>)>> = readers.iter_mut().map(read_run_record).collect::<Result<_>>()?;
+        let mut current: Vec<Option<RunRecord>> = readers.iter_mut().map(read_run_record).collect::<Result<_>>()?;
         let mut heap: BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> = current
             .iter()
             .enumerate()
@@ -839,15 +844,14 @@ impl KnowledgeStore {
 
         // Document at a time: walk every word's postings in doc order together,
         // keeping only the k best - no per-passage score table, whatever the size.
-        let mut lists: Vec<(f64, std::iter::Peekable<Box<dyn Iterator<Item = (u32, u32)> + '_>>)> = terms
+        let mut lists: Vec<(f64, PostingStream<'_>)> = terms
             .iter()
             .zip(&dfs)
             .filter(|(_, &df)| df > 0)
             .map(|(t, &df)| (self.idf_of(df), (Box::new(self.postings(t)) as Box<dyn Iterator<Item = (u32, u32)>>).peekable()))
             .collect();
         let mut top: Vec<(f64, u32)> = Vec::with_capacity(k + 1);
-        loop {
-            let Some(doc) = lists.iter_mut().filter_map(|(_, it)| it.peek().map(|p| p.0)).min() else { break };
+        while let Some(doc) = lists.iter_mut().filter_map(|(_, it)| it.peek().map(|p| p.0)).min() {
             let len = match self.locate(doc) {
                 Loc::Tail(i) => self.tail.lengths[i],
                 Loc::Seg(s) => s.doc(doc).length,

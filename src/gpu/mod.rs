@@ -718,7 +718,7 @@ impl<B: Backend> GpuTrainer<B> {
 
     fn micro_batches<'a>(&self, tokens: &'a [u32], targets: &'a [u32]) -> Result<impl Iterator<Item = (&'a [u32], &'a [u32])>> {
         let n = self.rows();
-        if tokens.len() != targets.len() || tokens.is_empty() || tokens.len() % n != 0 {
+        if tokens.len() != targets.len() || tokens.is_empty() || !tokens.len().is_multiple_of(n) {
             bail!("a GPU batch must be a whole number of micro-batches ({n} tokens)");
         }
         Ok(tokens.chunks(n).zip(targets.chunks(n)))

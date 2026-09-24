@@ -396,7 +396,7 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
     let (mut engine, b, eval_rows, lr_max, warmup, save_every) = match compute {
         Compute::Cpu { .. } => {
             let b = (tcfg.tokens_per_step / t).max(1);
-            let engine = Engine::Cpu { acts: Acts::new(&cfg, b, t), grads: vec![0f32; model.num_params()] };
+            let engine = Engine::Cpu { acts: Box::new(Acts::new(&cfg, b, t)), grads: vec![0f32; model.num_params()] };
             (engine, b, b, tcfg.learning_rate, tcfg.warmup_steps, tcfg.checkpoint_every_s)
         }
         Compute::Gpu { backend, bf16, .. } => {
@@ -529,7 +529,7 @@ fn fill(src: &[u16], rng: &mut Rng, t: usize, x: &mut [u32], y: &mut [u32]) {
 
 /// The training step itself, on the CPU or the GPU.
 enum Engine<'a> {
-    Cpu { acts: Acts, grads: Vec<f32> },
+    Cpu { acts: Box<Acts>, grads: Vec<f32> },
     Gpu(Box<GpuTrainer<&'a dyn Backend>>),
 }
 
