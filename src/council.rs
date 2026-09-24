@@ -148,6 +148,14 @@ pub fn build_prompt(claim: &str, passages: &[&Hit]) -> String {
     parts.join("\n\n")
 }
 
+/// How much knowledge-base text fits in front of the claim: the model's
+/// context minus room for the claim and the generated position, at roughly
+/// 3.5 characters per token.
+pub fn context_budget_chars(brain: &Brain, settings: &Settings) -> usize {
+    let reserve = settings.council.generate.max_new_tokens + 32;
+    (brain.model.cfg.block_size.saturating_sub(reserve) as f64 * 3.5) as usize
+}
+
 pub fn assess_familiarity(brain: &Brain, claim: &str, settings: &Settings) -> Familiarity {
     let cfg = &settings.council;
     let typical = brain.meta.stats.val_loss.unwrap_or(f32::NAN);
@@ -373,8 +381,14 @@ impl Default for Options {
 pub fn evaluate(brain: &Brain, claim: &str, settings: &Settings, opts: &Options, log: &mut dyn FnMut(&str)) -> Result<Evaluation> {
     let routing = route(claim, settings);
     let kb = KnowledgeStore::open(settings)?;
-    let memory = kb.search(claim, settings.memory.top_k, settings.memory.min_relevance);
-    log(&format!("Found {} relevant passage(s) in the knowledge base", memory.len()));
+    let mem = &settings.memory;
+    let memory = if mem.follow_links {
+        kb.search_linked(claim, mem.top_k, mem.min_relevance, context_budget_chars(brain, settings))
+    } else {
+        kb.search(claim, mem.top_k, mem.min_relevance)
+    };
+    let linked = memory.iter().filter(|h| h.via != "match").count();
+    log(&format!("Found {} relevant passage(s) in the knowledge base ({linked} by following links)", memory.len()));
     let familiarity = assess_familiarity(brain, claim, settings);
     let seed = opts.seed.unwrap_or_else(|| Rng::from_time().next_u64());
 

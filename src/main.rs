@@ -324,7 +324,8 @@ fn render(r: &Evaluation) -> String {
             m.val_loss.map_or("-".into(), |v| format!("{v:.2}"))),
         wrap(&format!("Router: {investor} - {}", r.routing.reason), WIDTH, "", ""),
         format!("Familiarity: claim loss {:.2} vs. typical {:.2} -> confidence ceiling {}", f.claim_loss, f.typical_loss, f.cap),
-        format!("Knowledge base: {} relevant passage(s)", r.memory.len()),
+        format!("Knowledge base: {} relevant passage(s), {} of them by following links",
+            r.memory.len(), r.memory.iter().filter(|h| h.via != "match").count()),
         String::new(),
     ];
     for p in &r.panel {

@@ -152,9 +152,12 @@ the same time.
   so each persona is a *lead-in* the model continues ("This is true
   because…") plus *probe phrases* it's scored on.
 - `knowledge.rs`: a BM25 search index, written from scratch, over passages in
-  `data/knowledge_base/`. The top hits go in front of the claim, so they
-  change what the model scores and writes. Each persona lists the passages
-  that moved the model toward its side.
+  `data/knowledge_base/`. Passages are linked like Obsidian notes (to their
+  neighbors in the same article, and to passages sharing their rarest
+  words). The best matches plus their strongest links go in front of the
+  claim, filling the model's context window with only what's relevant, so
+  they change what the model scores and writes. Each persona lists the
+  passages that moved the model toward its side.
 - `research.rs`: uses the plain Wikipedia search API. Topics are
   `research.seed_topics` plus words that keep coming up in your past
   questions. Fetches are capped per hour, and training fills the time in between.

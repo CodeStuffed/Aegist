@@ -57,8 +57,12 @@ router:
                    saas, invest, investment, investors, funding, cost, costs, "$"]
 
 memory:
-  top_k: 3                   # knowledge-base passages given to the council
+  top_k: 3                   # best-matching knowledge-base passages to start from
   min_relevance: 0.35        # share of the claim's (rarity-weighted) words a passage must match
+  # Like following links between notes in Obsidian: also bring in passages
+  # next to a match in the same article, or sharing its rarest words - as
+  # much as fits in the model's context window, strongest links first.
+  follow_links: true
 
 inference:
   # Weights used to answer questions (training always uses full precision):

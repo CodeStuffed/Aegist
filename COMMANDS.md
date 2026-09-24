@@ -315,7 +315,7 @@ CLAIM: Light is not refracted when it passes into glass
 Model: 6x256 transformer, 5.87M params, 18.4M tokens trained, held-out loss 3.41   <- (1)
 Router: no Investor - No money-related words, so no Investor.                      <- (2)
 Familiarity: claim loss 4.71 vs. typical 3.41 -> confidence ceiling Medium        <- (3)
-Knowledge base: 3 relevant passage(s)                                              <- (4)
+Knowledge base: 5 relevant passage(s), 2 of them by following links             <- (4)
 
 BELIEVER  [Low]  signal -0.57                                                      <- (5)
   "This is true because in the two Prisms ... refracted in the first Prism ..."    <- (6)
@@ -345,9 +345,17 @@ OVERALL CONFIDENCE: Medium                                                      
    - more than 1.5× typical: Low.
 
    Also, until the model has read 2M tokens, everything is capped at Low.
-4. **Knowledge base:** how many stored passages matched the claim well
-   enough to be used. They're placed in front of the claim when the model
-   reads it.
+4. **Knowledge base:** how many stored passages were put in front of the
+   claim when the model reads it. It works like following links between notes
+   in Obsidian:
+   - first the best matches for the claim (up to `memory.top_k`);
+   - then the passages they link to: the paragraphs just before and after a
+     match in the same article, and passages that share its rarest words;
+   - strongest links first, and only as much as fits in the model's context
+     window. Nothing unrelated gets in, so no space is wasted.
+
+   With `--json`, every passage has a `via` field: `match`, or the link that
+   brought it in (`linked: next to it in Opticks`, `linked: shares prism, light`).
 5. **Signal:** how much the claim makes the model expect "This is true."
    (Believer) or "This is false." (Skeptic), measured in nats per token.
    Positive means the claim pushes toward that side; **around 0.5 or more is
@@ -376,6 +384,9 @@ OVERALL CONFIDENCE: Medium                                                      
     trained, and both runs agree.
 
 ### A real run
+
+(Recorded before linked retrieval was added. Today the knowledge-base line
+also says how many passages came from following links.)
 
 The 5.9M model from the examples above (10 minutes of training on 11 MB of
 technical text), with 228 paragraphs of Newton's *Opticks* in its knowledge
@@ -433,8 +444,9 @@ OVERALL CONFIDENCE: Low
 | `council.familiarity` | 1.25 / 1.5 | How unfamiliar a claim can be before confidence is capped. |
 | `council.min_tokens_trained` | 2,000,000 | Below this, everything is Low. |
 | `council.generate.temperature` | 0.8 | Randomness of the written positions. Lower is more repetitive, higher is wilder. |
-| `memory.top_k` | 3 | Maximum passages used per question. |
+| `memory.top_k` | 3 | How many best-matching passages to start from. |
 | `memory.min_relevance` | 0.35 | How well a passage must match to be used. |
+| `memory.follow_links` | true | Also bring in linked passages (same article, shared rare words) until the model's context window is full. `false` = best matches only. |
 | `uncertainty.enabled` | true | Whether the repeat run happens by default. |
 
 ---

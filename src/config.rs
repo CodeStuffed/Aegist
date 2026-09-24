@@ -86,10 +86,18 @@ pub struct RouterSettings {
     pub money_keywords: Vec<String>,
 }
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct MemorySettings {
     pub top_k: usize,
     pub min_relevance: f64,
+    /// Also pull in passages linked to the best matches (same article,
+    /// shared rare words), within the model's context budget.
+    #[serde(default = "yes")]
+    pub follow_links: bool,
 }
 
 fn default_precision() -> crate::quant::Precision {
