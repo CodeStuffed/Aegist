@@ -212,7 +212,7 @@ def load_checkpoint(settings: dict | None = None) -> tuple[TransformerLM, Tokeni
     return model, Tokenizer(meta["merges"]), meta
 
 
-def _new_model(settings: dict, log) -> tuple[TransformerLM, Tokenizer, dict]:
+def _new_model(settings: dict, log, seed: int | None) -> tuple[TransformerLM, Tokenizer, dict]:
     hw = detect_hardware(settings)
     size = hw["model_size"]
     text = read_corpus(settings)[: settings["training"]["tokenizer_train_chars"]]
@@ -227,7 +227,7 @@ def _new_model(settings: dict, log) -> tuple[TransformerLM, Tokenizer, dict]:
     config = ModelConfig(vocab_size=tokenizer.vocab_size, block_size=size["block_size"],
                          n_layer=size["n_layer"], n_head=size["n_head"], d_model=size["d_model"],
                          dropout=settings["model"]["dropout"])
-    model = TransformerLM(config, seed=int(time.time()) % 2**31)
+    model = TransformerLM(config, seed=seed if seed is not None else int(time.time()) % 2**31)
     now = _now()
     meta = {"config": config.to_dict(), "merges": tokenizer.merges,
             "stats": {"steps": 0, "tokens_seen": 0, "train_seconds": 0.0, "train_loss": None,
@@ -251,7 +251,7 @@ def train(*, minutes: float | None = None, steps: int | None = None,
                             "or let `python cli.py research` collect some.")
 
     loaded = load_checkpoint(settings)
-    model, tokenizer, meta = loaded if loaded else _new_model(settings, log)
+    model, tokenizer, meta = loaded if loaded else _new_model(settings, log, seed)
     stats, cfg = meta["stats"], model.config
     optimizer = AdamW(model.params, weight_decay=tcfg["weight_decay"])
     optim_path = brain_dir(settings) / "optim.npz"

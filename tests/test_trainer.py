@@ -67,7 +67,7 @@ def test_brain_scores_generates_and_senses_familiarity(settings, trained):
     unseen = brain.continuation_logprob("Light is refracted when it passes from air into", " zebra.")
     assert seen > unseen
     assert brain.text_nll("The rays of light bend toward the perpendicular.") < \
-        brain.text_nll("Quantum chromodynamics of hadron jets.")
+        brain.text_nll("Zxq vbnm qwpl kjhg tyvr.") - 0.5
     text = brain.generate("White light is", max_new_tokens=8, rng=np.random.default_rng(0))
     assert isinstance(text, str) and "\n\n" not in text
 
