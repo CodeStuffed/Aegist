@@ -3,6 +3,10 @@
 
 use rayon::prelude::*;
 
+pub const BETA1: f32 = 0.9;
+pub const BETA2: f32 = 0.95;
+pub const EPS: f32 = 1e-8;
+
 pub struct AdamW {
     pub m: Vec<f32>,
     pub v: Vec<f32>,
@@ -31,7 +35,16 @@ impl AdamW {
         if at < n {
             segments.push((at, n - at, false));
         }
-        AdamW { m: vec![0.0; n], v: vec![0.0; n], t: 0, beta1: 0.9, beta2: 0.95, eps: 1e-8, weight_decay, segments }
+        AdamW { m: vec![0.0; n], v: vec![0.0; n], t: 0, beta1: BETA1, beta2: BETA2, eps: EPS, weight_decay, segments }
+    }
+
+    /// (offset, len, decayed?) runs covering every parameter.
+    pub fn segments(&self) -> &[(usize, usize, bool)] {
+        &self.segments
+    }
+
+    pub fn weight_decay(&self) -> f32 {
+        self.weight_decay
     }
 
     pub fn step(&mut self, params: &mut [f32], grads: &[f32], lr: f32) {

@@ -174,6 +174,11 @@ impl Rope {
         Rope { half, cos, sin }
     }
 
+    /// (cos, sin), each max_pos x head_dim/2.
+    pub fn tables(&self) -> (&[f32], &[f32]) {
+        (&self.cos, &self.sin)
+    }
+
     /// Rotate the q and k blocks of `qkv` rows (row stride 3c) in place.
     /// `inverse` undoes the rotation (used on gradients).
     pub fn apply(&self, qkv: &mut [f32], c: usize, n_head: usize, position: impl Fn(usize) -> usize + Sync, inverse: bool) {

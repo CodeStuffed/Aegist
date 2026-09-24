@@ -12,6 +12,7 @@ bzip2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 gemm = "0.18"            # matrix multiply (the BLAS role NumPy played): plain math, no AI
+libloading = "0.8"       # opens NVIDIA's CUDA libraries at run time, if the machine has them
 memmap2 = "0.9"
 rayon = "1"              # multithreading
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +26,13 @@ libc = "0.2"               # only to exit quietly when output is piped into e.g.
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[features]
+# Test the GPU kernels on a CPU (needs a C++20 compiler): cargo test --features gpu-emulator
+gpu-emulator = ["dep:cc"]
 
 [profile.release]
 opt-level = 3
