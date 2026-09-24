@@ -65,6 +65,23 @@ def scripted_reply(system: str, prompt: str) -> str:
     return json.dumps({"echo": prompt[:80]})
 
 
+class ScriptedBackend:
+    """Returns the queued replies in order; records every prompt."""
+
+    NAME = "fake"
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def generate(self, system, prompt, *, role="panel", temperature=None, json_mode=True):
+        self.calls.append({"system": system, "prompt": prompt, "role": role, "temperature": temperature})
+        return {"text": self.replies.pop(0), "backend": self.NAME, "model": "fake-1"}
+
+    def model_for(self, role="panel"):
+        return "fake-1"
+
+
 class _Handler(BaseHTTPRequestHandler):
     server: "_FakeServer"
 
