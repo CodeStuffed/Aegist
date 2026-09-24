@@ -355,6 +355,10 @@ fn doctor(settings: &Settings) -> Result<()> {
             let target = trainer::TOKENS_PER_PARAM * n;
             println!("  Trained on {:.0}% of the ~{:.0}M tokens (20 per parameter) a model this size should see",
                 100.0 * st.tokens_seen as f64 / target, target / 1e6);
+            if let Some(plan) = st.planned_seconds {
+                println!("  Planned training time {:.1} h, {:.0}% done (the learning rate follows the plan; --plan-hours changes it)",
+                    plan / 3600.0, (100.0 * st.train_seconds / plan).min(100.0));
+            }
         }
         Ok(None) => println!("  none yet - run `council train --data <folder> --hours 1`"),
         Err(e) => println!("  {e}"),
