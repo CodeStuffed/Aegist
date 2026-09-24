@@ -28,6 +28,9 @@ and learns only from text you give it, or text its research loop collects.
 
 ## Quick start
 
+It's a terminal program. **New to terminals, or using VS Code?** See
+[HOW_TO_RUN.md](HOW_TO_RUN.md) for step-by-step setup on Windows, macOS and Linux.
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt

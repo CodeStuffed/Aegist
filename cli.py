@@ -167,11 +167,13 @@ def main() -> int:
     train = subparsers.add_parser("train", help="Train (or keep training) the model on the corpus.")
     train.add_argument("--data", help="Folder (or file) of .txt/.md text to add to the corpus first.")
     budget = train.add_mutually_exclusive_group()
-    budget.add_argument("--hours", type=float, default=1.0)
+    budget.add_argument("--hours", type=float, default=1.0,
+                        help="How long to train, in hours (default 1; decimals work).")
     budget.add_argument("--steps", type=int, help="Train for this many steps instead of by time.")
 
     research = subparsers.add_parser("research", help="Research on Wikipedia and self-train.")
-    research.add_argument("--hours", type=float, default=1.0)
+    research.add_argument("--hours", type=float, default=1.0,
+                          help="How long to research and train, in hours (default 1).")
 
     subparsers.add_parser("doctor", help="Show hardware, model, and memory status.")
 
