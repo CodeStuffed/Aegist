@@ -125,6 +125,12 @@ Once trained, `council ask "..."` uses it. The knowledge base puts the most
 relevant Wikipedia paragraphs, and the paragraphs linked to them, in front
 of every question.
 
+Answering runs on the CPU (int8 weights, every core for big models). With
+an untrained 235M-parameter model, a full `ask` (with the repeat run) took 40
+seconds on **one** core of the 4-core test machine while it was also
+training; with a desktop's free cores expect several seconds. `--no-recheck`
+roughly halves it.
+
 ### Memory
 
 - **GPU (16 GB on a 5080):** only one layer's working values are kept at a
