@@ -30,6 +30,7 @@ and learns only from text you give it, or text its research loop collects.
 
 It's a terminal program. **New to terminals, or using VS Code?** See
 [HOW_TO_RUN.md](HOW_TO_RUN.md) for step-by-step setup on Windows, macOS and Linux.
+[COMMANDS.md](COMMANDS.md) is the full command reference.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate

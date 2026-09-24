@@ -95,6 +95,9 @@ machine, and that there's no trained model yet. That's expected.
 
 ## The commands
 
+> For every option, annotated example output, and the settings behind each
+> command, see **[COMMANDS.md](COMMANDS.md)**.
+
 All commands start with `python cli.py`. Add `--help` to any of them to see its
 options, for example `python cli.py train --help`.
 
