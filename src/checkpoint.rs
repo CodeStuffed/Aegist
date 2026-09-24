@@ -34,6 +34,10 @@ pub struct Stats {
     pub created_at: String,
     pub updated_at: String,
     pub history: Vec<HistoryPoint>,
+    /// Total training time planned for this model (--plan-hours): the
+    /// learning rate follows one schedule across all its sessions.
+    #[serde(default)]
+    pub planned_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +67,14 @@ pub fn save(settings: &Settings, model: &Model, meta: &mut Meta, optim: Option<&
     }
     meta.stats.updated_at = iso_now();
     write_atomic(&dir.join("brain.json"), &serde_json::to_vec(meta)?)
+}
+
+/// Change the saved model's planned training time (brain.json only).
+pub fn set_planned_seconds(settings: &Settings, seconds: f64) -> Result<()> {
+    let path = brain_dir(settings).join("brain.json");
+    let mut meta: Meta = serde_json::from_slice(&std::fs::read(&path)?).context("reading brain.json")?;
+    meta.stats.planned_seconds = Some(seconds);
+    write_atomic(&path, &serde_json::to_vec(&meta)?)
 }
 
 /// The saved model's size, without reading its weights (None if there's no model).

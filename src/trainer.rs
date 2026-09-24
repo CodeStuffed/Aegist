@@ -332,7 +332,15 @@ fn new_model(settings: &Settings, seed: u64, size: Size, compute: &Compute, log:
         format: checkpoint::FORMAT.to_string(),
         config: cfg,
         merges: tokenizer.merges.clone(),
-        stats: Stats { created_at: now.clone(), updated_at: now, ..Default::default() },
+        stats: Stats {
+            created_at: now.clone(),
+            updated_at: now,
+            planned_seconds: match size {
+                Size::ForHours(h) => Some(h * 3600.0),
+                _ => None,
+            },
+            ..Default::default()
+        },
     };
     Ok((model, tokenizer, meta))
 }
@@ -431,12 +439,9 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
         }
         fill(train_tok, &mut rng, t, &mut x, &mut y);
         let warm = ((meta.stats.steps + 1) as f32 / warmup.max(1) as f32).min(1.0);
-        let frac = match budget {
-            Budget::Minutes(m) => (elapsed / (m * 60.0)).min(1.0) as f32,
-            Budget::Steps(n) => step_i as f32 / n.max(1) as f32,
-        };
-        let floor = tcfg.min_lr_fraction;
-        let lr = lr_max * warm * (floor + (1.0 - floor) * 0.5 * (1.0 + (std::f32::consts::PI * frac).cos()));
+        let trained_before = meta.stats.train_seconds + (elapsed - last_save);
+        let frac = schedule_fraction(budget, elapsed, step_i, meta.stats.planned_seconds, trained_before);
+        let lr = learning_rate(lr_max, tcfg.min_lr_fraction, warm, frac);
         let loss = engine.step(&mut model, &mut opt, &x, &y, rng.next_u64(), tcfg.grad_clip, lr)?;
 
         step_i += 1;
@@ -485,6 +490,22 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
     log(format!("Saved: {} steps total, {:.1}M tokens seen, held-out loss {:.3} ({:.3} bits per byte).",
         commas(st.steps), st.tokens_seen as f64 / 1e6, st.val_loss.unwrap_or(f32::NAN), st.val_bpb.unwrap_or(f32::NAN)));
     Ok(Report { steps_this_session: step_i, tokens_this_session: step_i * (b * t) as u64, interrupted, stats: meta.stats })
+}
+
+/// How far through its learning-rate schedule training is (0..1): through
+/// the model's planned total time if it has one (so several sessions share
+/// one schedule), else through this session.
+fn schedule_fraction(budget: Budget, elapsed: f64, step_i: u64, planned: Option<f64>, trained_total: f64) -> f32 {
+    match (budget, planned) {
+        (Budget::Minutes(_), Some(p)) if p > 0.0 => (trained_total / p).clamp(0.0, 1.0) as f32,
+        (Budget::Minutes(m), _) => (elapsed / (m * 60.0)).min(1.0) as f32,
+        (Budget::Steps(n), _) => step_i as f32 / n.max(1) as f32,
+    }
+}
+
+/// Warmup, then cosine decay from lr_max down to floor * lr_max.
+fn learning_rate(lr_max: f32, floor: f32, warm: f32, frac: f32) -> f32 {
+    lr_max * warm * (floor + (1.0 - floor) * 0.5 * (1.0 + (std::f32::consts::PI * frac).cos()))
 }
 
 fn check_corpus(settings: &Settings) -> Result<()> {
@@ -666,6 +687,21 @@ gravity accelerates every body at the same rate.\n\n";
         let fits = |name: &str| training_bytes(&config_for(&s, &s.model.tiers[name], s.model.tiers[name].vocab_size), &s) as f64 <= 0.85 * 2.0 * (1u64 << 30) as f64;
         assert!(fits(&small_ram) && small_ram != "1b");
         assert!(s.model.tiers.keys().filter(|n| fits(n)).all(|n| s.model.tiers[n].d_model <= s.model.tiers[&small_ram].d_model));
+    }
+
+    #[test]
+    fn a_planned_run_follows_one_schedule_across_sessions() {
+        let plan = Some(96.0 * 3600.0);
+        // session 2 of 4 (24 h each) starts where session 1 ended
+        let start2 = schedule_fraction(Budget::Minutes(24.0 * 60.0), 0.0, 0, plan, 24.0 * 3600.0);
+        assert!((start2 - 0.25).abs() < 1e-6);
+        let end4 = schedule_fraction(Budget::Minutes(24.0 * 60.0), 24.0 * 3600.0, 99, plan, 96.0 * 3600.0);
+        assert_eq!(end4, 1.0);
+        assert_eq!(schedule_fraction(Budget::Minutes(60.0), 1800.0, 5, None, 1e9), 0.5); // no plan: this session
+        assert_eq!(schedule_fraction(Budget::Steps(10), 1e9, 5, plan, 0.0), 0.5); // steps: this session
+        assert!((learning_rate(1e-3, 0.1, 1.0, 0.0) - 1e-3).abs() < 1e-9);
+        assert!((learning_rate(1e-3, 0.1, 1.0, 1.0) - 1e-4).abs() < 1e-9);
+        assert!((learning_rate(1e-3, 0.1, 0.5, 0.5) - 0.5 * 5.5e-4).abs() < 1e-9);
     }
 
     #[test]

@@ -115,8 +115,9 @@ What `train` does with a new model:
 
 **Training in several sessions?** Give the total up front so the size fits
 it: `council train --plan-hours 96 --hours 24` today, then
-`council train --hours 24` three more times. Only the first session of a
-new model uses `--plan-hours`.
+`council train --hours 24` three more times. The plan is saved with the
+model, so the learning rate follows one schedule across all four sessions.
+To train longer than planned, give a new total: `--plan-hours 120`.
 
 **Watch it:** the `held-out` number (loss on text it never trains on) should
 keep falling. `council doctor` shows the whole history.

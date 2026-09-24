@@ -114,7 +114,7 @@ council train [--data PATH] [--hours N | --steps N] [--plan-hours N] [--tier NAM
 | `--data PATH` | none | A folder (searched recursively) or a single file. Every `.txt` and `.md` file is **copied** into `data/corpus/imported/`, then training starts. You only need to import a folder once; re-importing just refreshes the copies. Other file types (PDF, Word…) are skipped, so save them as `.txt` first. |
 | `--hours N` | `1` | Train for N hours. Decimals work: `0.25` is 15 minutes. |
 | `--steps N` | none | Train for exactly N learning steps instead of a set time. Can't be combined with `--hours`. |
-| `--plan-hours N` | `--hours` | For a **new** model: the total time you plan to train it, across all sessions. It picks the model's size (see below). |
+| `--plan-hours N` | `--hours` | The total time you plan to train the model, across all sessions. For a new model it picks the size (see below). It's saved with the model, and the learning rate follows one schedule over all of it (high early, lower toward the end) instead of starting over each session. For an existing model it sets a new plan. |
 | `--tier NAME` | sized for the time | Size for a **new** model, chosen yourself: `tiny`, `small`, `medium`, `large`, `xl`, the GPU sizes `110m`, `235m`, `xxl`, `730m`, or `1b`. `council doctor` and `council gpu-check` list them with memory and time. It refuses a size that won't fit in memory; to resize an existing model, delete `data/brain/` first. |
 | `--device D` | `auto` | Where to train. `auto`: an NVIDIA GPU if one passes its self-check, else the CPU. `cpu` or `gpu` to choose. The default is `gpu.device` in settings. See [GPU_TRAINING.md](GPU_TRAINING.md). |
 

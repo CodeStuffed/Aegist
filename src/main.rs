@@ -183,6 +183,10 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             install_ctrl_c();
             let budget = steps.map(Budget::Steps).unwrap_or(Budget::Minutes(hours * 60.0));
+            if let (Some(h), true) = (plan_hours, checkpoint::exists(&settings)) {
+                checkpoint::set_planned_seconds(&settings, h * 3600.0)?;
+                println!("This model's training is now planned at {h} hours in total; the learning rate follows that.");
+            }
             let size = match (&tier, steps) {
                 (Some(t), _) => Size::Tier(t),
                 (None, Some(_)) if plan_hours.is_none() => Size::FromRam,
