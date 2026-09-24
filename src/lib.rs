@@ -20,3 +20,4 @@ pub mod text;
 pub mod tokenizer;
 pub mod trainer;
 pub mod util;
+pub mod wikipedia;

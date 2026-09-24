@@ -15,6 +15,7 @@ use council::research::{self, SystemClock};
 use council::session_log;
 use council::trainer::{self, commas, Budget, NotEnoughText};
 use council::util::wrap;
+use council::wikipedia;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +72,17 @@ enum Command {
         /// How long to run, in hours.
         #[arg(long, default_value_t = 1.0)]
         hours: f64,
+    },
+    /// Import a Wikipedia dump (.xml.bz2 or .xml) into the corpus and the knowledge base.
+    ImportWikipedia {
+        /// The dump file, e.g. enwiki-latest-pages-articles-multistream.xml.bz2.
+        dump: PathBuf,
+        /// Stop after this many articles (running again continues from there).
+        #[arg(long)]
+        max_articles: Option<u64>,
+        /// Only add text to the training corpus, not to the knowledge base.
+        #[arg(long)]
+        no_knowledge: bool,
     },
     /// Show hardware, model, and memory status.
     Doctor,
@@ -172,6 +184,17 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             println!("Done: {} topic(s), {} new passages, {:.0} min of training.",
                 summary.topics.len(), summary.passages_stored, summary.training_minutes);
+        }
+        Command::ImportWikipedia { dump, max_articles, no_knowledge } => {
+            install_ctrl_c();
+            println!("Importing {} (Ctrl-C stops it; everything imported so far is kept).", dump.display());
+            let opts = wikipedia::ImportOptions { max_articles, knowledge: !no_knowledge };
+            let r = wikipedia::import(&dump, &settings, &opts, &mut |m| println!("{m}"), &STOP)?;
+            println!("{}: {} articles, {:.1} MB of text for training, {} passages for the knowledge base.",
+                if r.interrupted { "Stopped" } else { "Done" }, commas(r.articles), r.corpus_bytes as f64 / 1e6, commas(r.passages));
+            if r.articles > 0 {
+                println!("Next: `council train --hours <how long>` trains on it (see `council doctor` for sizes).");
+            }
         }
         Command::Doctor => doctor(&settings)?,
     }

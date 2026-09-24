@@ -59,7 +59,8 @@ pub const TOKENS_PER_PARAM: f64 = 20.0;
 pub fn human_duration(seconds: f64) -> String {
     let (m, h, d, y) = (60.0, 3600.0, 86_400.0, 365.25 * 86_400.0);
     match seconds {
-        s if s < h => format!("{:.0} minutes", (s / m).max(1.0)),
+        s if s < 90.0 => "1 minute".to_string(),
+        s if s < h => format!("{:.0} minutes", s / m),
         s if s < 2.0 * d => format!("{:.1} hours", s / h),
         s if s < 2.0 * y => format!("{:.0} days", s / d),
         s => format!("{} years", commas((s / y).round() as u64)),
