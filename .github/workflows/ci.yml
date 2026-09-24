@@ -19,6 +19,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
 
+  gpu-emulated:
+    # The GPU kernels and the GPU training step, run on a CPU emulator and
+    # checked against the CPU model (no GPU needed).
+    name: GPU kernels (CPU emulation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features gpu-emulator --lib gpu
+
   build:
     name: build (${{ matrix.name }})
     needs: test

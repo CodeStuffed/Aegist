@@ -139,72 +139,22 @@ pub struct CudaBackend {
 impl CudaBackend {
     /// Load the CUDA libraries, pick GPU 0 and compile the kernels.
     pub fn open() -> Result<Self> {
-        let (cuda_names, cublas_names): (&[&str], &[&str]) = if cfg!(windows) {
-            (&["nvcuda.dll"], &["cublas64_13.dll", "cublas64_12.dll", "cublas64_11.dll"])
+        let cublas_names: &[&str] = if cfg!(windows) {
+            &["cublas64_13.dll", "cublas64_12.dll", "cublas64_11.dll"]
         } else {
-            (&["libcuda.so.1", "libcuda.so"], &["libcublas.so.13", "libcublas.so.12", "libcublas.so.11", "libcublas.so"])
+            &["libcublas.so.13", "libcublas.so.12", "libcublas.so.11", "libcublas.so"]
         };
-        let cuda_lib = open_library("the NVIDIA driver", cuda_names).context("no NVIDIA driver found")?;
-        let driver = Driver {
-            init: sym!(cuda_lib, "cuInit"),
-            device_get_count: sym!(cuda_lib, "cuDeviceGetCount"),
-            device_get: sym!(cuda_lib, "cuDeviceGet"),
-            device_get_name: sym!(cuda_lib, "cuDeviceGetName"),
-            device_get_attribute: sym!(cuda_lib, "cuDeviceGetAttribute"),
-            device_total_mem: sym!(cuda_lib, "cuDeviceTotalMem_v2"),
-            primary_ctx_retain: sym!(cuda_lib, "cuDevicePrimaryCtxRetain"),
-            primary_ctx_release: sym!(cuda_lib, "cuDevicePrimaryCtxRelease_v2"),
-            ctx_set_current: sym!(cuda_lib, "cuCtxSetCurrent"),
-            ctx_synchronize: sym!(cuda_lib, "cuCtxSynchronize"),
-            mem_get_info: sym!(cuda_lib, "cuMemGetInfo_v2"),
-            mem_alloc: sym!(cuda_lib, "cuMemAlloc_v2"),
-            mem_free: sym!(cuda_lib, "cuMemFree_v2"),
-            memcpy_htod: sym!(cuda_lib, "cuMemcpyHtoD_v2"),
-            memcpy_dtoh: sym!(cuda_lib, "cuMemcpyDtoH_v2"),
-            memset_d8: sym!(cuda_lib, "cuMemsetD8_v2"),
-            module_load_data: sym!(cuda_lib, "cuModuleLoadData"),
-            module_get_function: sym!(cuda_lib, "cuModuleGetFunction"),
-            launch_kernel: sym!(cuda_lib, "cuLaunchKernel"),
-            get_error_string: sym!(cuda_lib, "cuGetErrorString"),
-            driver_get_version: sym!(cuda_lib, "cuDriverGetVersion"),
-        };
-        let check = |what: &str, r: CuResult| -> Result<()> {
-            if r == 0 {
-                return Ok(());
-            }
-            let mut s: *const c_char = std::ptr::null();
-            // Safety: cuGetErrorString only writes a pointer to a static string.
-            let msg = unsafe {
-                (driver.get_error_string)(r, &mut s);
-                if s.is_null() { format!("error {r}") } else { CStr::from_ptr(s).to_string_lossy().into_owned() }
-            };
-            bail!("{what} failed: {msg}")
-        };
-        // Safety (this block): plain C calls with valid out-pointers.
-        let (device, ctx, name, cc, total, driver_version) = unsafe {
-            check("cuInit", (driver.init)(0))?;
-            let mut count = 0;
-            check("cuDeviceGetCount", (driver.device_get_count)(&mut count))?;
-            if count == 0 {
-                bail!("the NVIDIA driver sees no GPU");
-            }
-            let mut device = 0;
-            check("cuDeviceGet", (driver.device_get)(&mut device, 0))?;
-            let mut buf = [0 as c_char; 256];
-            check("cuDeviceGetName", (driver.device_get_name)(buf.as_mut_ptr(), 255, device))?;
-            let name = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
-            let (mut major, mut minor) = (0, 0);
-            check("cuDeviceGetAttribute", (driver.device_get_attribute)(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device))?;
-            check("cuDeviceGetAttribute", (driver.device_get_attribute)(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device))?;
-            let mut total = 0usize;
-            check("cuDeviceTotalMem", (driver.device_total_mem)(&mut total, device))?;
-            let mut ctx: CuContext = std::ptr::null_mut();
+        let (cuda_lib, driver) = load_driver()?;
+        let info = device_info(&driver)?;
+        let check = |what: &str, r: CuResult| driver_check(&driver, what, r);
+        let device = info.device;
+        let (name, cc, total, driver_version) = (info.name, info.compute_capability, info.total_memory, info.driver_version);
+        let mut ctx: CuContext = std::ptr::null_mut();
+        // Safety: out-pointer; device is valid.
+        unsafe {
             check("cuDevicePrimaryCtxRetain", (driver.primary_ctx_retain)(&mut ctx, device))?;
             check("cuCtxSetCurrent", (driver.ctx_set_current)(ctx))?;
-            let mut v = 0;
-            check("cuDriverGetVersion", (driver.driver_get_version)(&mut v))?;
-            (device, ctx, name, (major, minor), total as u64, v)
-        };
+        }
 
         let (nvrtc_lib, nvrtc) = load_nvrtc()?;
         let mut nvrtc_version = (0, 0);
@@ -270,16 +220,7 @@ impl CudaBackend {
     }
 
     fn check(&self, what: &str, r: CuResult) -> Result<()> {
-        if r == 0 {
-            return Ok(());
-        }
-        let mut s: *const c_char = std::ptr::null();
-        // Safety: writes a pointer to a static string.
-        let msg = unsafe {
-            (self.driver.get_error_string)(r, &mut s);
-            if s.is_null() { format!("error {r}") } else { CStr::from_ptr(s).to_string_lossy().into_owned() }
-        };
-        bail!("{what} failed: {msg}")
+        driver_check(&self.driver, what, r)
     }
 
     /// Work may be issued from another thread than the one that opened the GPU.
@@ -287,6 +228,91 @@ impl CudaBackend {
         // Safety: the context is alive for as long as self.
         self.check("cuCtxSetCurrent", unsafe { (self.driver.ctx_set_current)(self.ctx) })
     }
+}
+
+fn driver_check(driver: &Driver, what: &str, r: CuResult) -> Result<()> {
+    if r == 0 {
+        return Ok(());
+    }
+    let mut s: *const c_char = std::ptr::null();
+    // Safety: cuGetErrorString only writes a pointer to a static string.
+    let msg = unsafe {
+        (driver.get_error_string)(r, &mut s);
+        if s.is_null() { format!("error {r}") } else { CStr::from_ptr(s).to_string_lossy().into_owned() }
+    };
+    bail!("{what} failed: {msg}")
+}
+
+fn load_driver() -> Result<(Library, Driver)> {
+    let names: &[&str] = if cfg!(windows) { &["nvcuda.dll"] } else { &["libcuda.so.1", "libcuda.so"] };
+    let cuda_lib = open_library("the NVIDIA driver", names).context("no NVIDIA driver found")?;
+    let driver = Driver {
+        init: sym!(cuda_lib, "cuInit"),
+        device_get_count: sym!(cuda_lib, "cuDeviceGetCount"),
+        device_get: sym!(cuda_lib, "cuDeviceGet"),
+        device_get_name: sym!(cuda_lib, "cuDeviceGetName"),
+        device_get_attribute: sym!(cuda_lib, "cuDeviceGetAttribute"),
+        device_total_mem: sym!(cuda_lib, "cuDeviceTotalMem_v2"),
+        primary_ctx_retain: sym!(cuda_lib, "cuDevicePrimaryCtxRetain"),
+        primary_ctx_release: sym!(cuda_lib, "cuDevicePrimaryCtxRelease_v2"),
+        ctx_set_current: sym!(cuda_lib, "cuCtxSetCurrent"),
+        ctx_synchronize: sym!(cuda_lib, "cuCtxSynchronize"),
+        mem_get_info: sym!(cuda_lib, "cuMemGetInfo_v2"),
+        mem_alloc: sym!(cuda_lib, "cuMemAlloc_v2"),
+        mem_free: sym!(cuda_lib, "cuMemFree_v2"),
+        memcpy_htod: sym!(cuda_lib, "cuMemcpyHtoD_v2"),
+        memcpy_dtoh: sym!(cuda_lib, "cuMemcpyDtoH_v2"),
+        memset_d8: sym!(cuda_lib, "cuMemsetD8_v2"),
+        module_load_data: sym!(cuda_lib, "cuModuleLoadData"),
+        module_get_function: sym!(cuda_lib, "cuModuleGetFunction"),
+        launch_kernel: sym!(cuda_lib, "cuLaunchKernel"),
+        get_error_string: sym!(cuda_lib, "cuGetErrorString"),
+        driver_get_version: sym!(cuda_lib, "cuDriverGetVersion"),
+    };
+    Ok((cuda_lib, driver))
+}
+
+/// What the driver says about GPU 0.
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    device: CuDevice,
+    pub name: String,
+    pub compute_capability: (i32, i32),
+    pub total_memory: u64,
+    /// e.g. 12080 for CUDA 12.8
+    pub driver_version: i32,
+}
+
+fn device_info(driver: &Driver) -> Result<GpuInfo> {
+    let check = |what: &str, r: CuResult| driver_check(driver, what, r);
+    // Safety (this block): plain C calls with valid out-pointers.
+    unsafe {
+        check("cuInit", (driver.init)(0))?;
+        let mut count = 0;
+        check("cuDeviceGetCount", (driver.device_get_count)(&mut count))?;
+        if count == 0 {
+            bail!("the NVIDIA driver sees no GPU");
+        }
+        let mut device = 0;
+        check("cuDeviceGet", (driver.device_get)(&mut device, 0))?;
+        let mut buf = [0 as c_char; 256];
+        check("cuDeviceGetName", (driver.device_get_name)(buf.as_mut_ptr(), 255, device))?;
+        let name = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+        let (mut major, mut minor) = (0, 0);
+        check("cuDeviceGetAttribute", (driver.device_get_attribute)(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device))?;
+        check("cuDeviceGetAttribute", (driver.device_get_attribute)(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device))?;
+        let mut total = 0usize;
+        check("cuDeviceTotalMem", (driver.device_total_mem)(&mut total, device))?;
+        let mut v = 0;
+        check("cuDriverGetVersion", (driver.driver_get_version)(&mut v))?;
+        Ok(GpuInfo { device, name, compute_capability: (major, minor), total_memory: total as u64, driver_version: v })
+    }
+}
+
+/// Look for an NVIDIA GPU without setting anything up (fast: for `doctor`).
+pub fn probe() -> Result<GpuInfo> {
+    let (_lib, driver) = load_driver()?;
+    device_info(&driver)
 }
 
 fn load_nvrtc() -> Result<(Library, Nvrtc)> {

@@ -117,6 +117,46 @@ impl Default for InferenceSettings {
     }
 }
 
+/// Where training runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Device {
+    /// An NVIDIA GPU if one works (after a self-check), else the CPU.
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+fn default_gpu_tokens() -> usize {
+    131_072
+}
+fn default_gpu_lr() -> f32 {
+    6e-4
+}
+fn default_gpu_warmup() -> u64 {
+    500
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GpuSettings {
+    #[serde(default)]
+    pub device: Device,
+    /// Tokens per optimizer step on the GPU (split into micro-batches that fit its memory).
+    #[serde(default = "default_gpu_tokens")]
+    pub tokens_per_step: usize,
+    #[serde(default = "default_gpu_lr")]
+    pub learning_rate: f32,
+    #[serde(default = "default_gpu_warmup")]
+    pub warmup_steps: u64,
+}
+
+impl Default for GpuSettings {
+    fn default() -> Self {
+        GpuSettings { device: Device::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(), warmup_steps: default_gpu_warmup() }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct UncertaintySettings {
     pub enabled: bool,
@@ -147,6 +187,8 @@ pub struct Settings {
     pub memory: MemorySettings,
     #[serde(default)]
     pub inference: InferenceSettings,
+    #[serde(default)]
+    pub gpu: GpuSettings,
     pub uncertainty: UncertaintySettings,
     pub research: ResearchSettings,
     pub paths: PathSettings,
@@ -315,6 +357,7 @@ pub mod testing {
         t.checkpoint_every_s = 3600.0;
         s.council.generate.max_new_tokens = 12;
         s.council.min_tokens_trained = 0;
+        s.gpu.device = Device::Cpu; // tests are the same on machines with and without a GPU
         s
     }
 }

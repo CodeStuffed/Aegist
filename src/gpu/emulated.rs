@@ -90,6 +90,10 @@ impl Backend for EmulatedBackend {
         EMU_BLOCK
     }
 
+    fn max_grid(&self) -> u32 {
+        4 // grid-stride loops cover the rest; each emulated block costs barriers
+    }
+
     fn launch(&self, k: Kernel, grid: (u32, u32), args: &[Arg]) -> Result<()> {
         let mut slots: Vec<u64> = args.iter().map(|a| a.slot()).collect();
         let mut ptrs: Vec<*mut c_void> = slots.iter_mut().map(|s| s as *mut u64 as *mut c_void).collect();
@@ -132,6 +136,39 @@ mod tests {
         let r = self_check(EmulatedBackend::new()).unwrap();
         assert!(r.passed, "{r:?}");
         assert!(r.worst_grad.1 < 1e-4, "{r:?}");
+    }
+
+    #[test]
+    fn train_on_the_gpu_then_resume_on_the_cpu() {
+        use crate::trainer::{self, Budget, Compute, Size};
+        use std::sync::atomic::AtomicBool;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = crate::config::testing::settings(&tmp.path().join("data"));
+        s.gpu.tokens_per_step = 4 * 48;
+        s.gpu.learning_rate = 3e-3;
+        s.gpu.warmup_steps = 5;
+        let src = tmp.path().join("notes.txt");
+        std::fs::write(&src, trainer::tests::CORPUS.repeat(20)).unwrap();
+        crate::corpus::import_texts(&src, &s).unwrap();
+        let gpu = Compute::Gpu { backend: Box::new(EmulatedBackend::new()), flops: 1e12 };
+        let mut lines = Vec::new();
+        let r = trainer::train_on(&s, Budget::Steps(40), Size::FromRam, &gpu, &mut |l| lines.push(l), Some(0), &AtomicBool::new(false)).unwrap();
+        assert!(lines.iter().any(|l| l.contains("Training on the GPU: 192 tokens per step")), "{lines:?}");
+        let vocab = r.stats.val_loss.map(|_| crate::checkpoint::load(&s).unwrap().unwrap().0.cfg.vocab_size).unwrap() as f32;
+        let after_gpu = r.stats.val_loss.unwrap();
+        assert!(after_gpu < vocab.ln() - 1.0, "held-out loss {after_gpu} after training on the GPU");
+        // the checkpoint (weights and AdamW state from the device) carries on on the CPU
+        let (_, _, _) = crate::checkpoint::load(&s).unwrap().unwrap();
+        let cpu = Compute::Cpu { flops: 1e9, ram_gb: 64.0 };
+        let r2 = trainer::train_on(&s, Budget::Steps(10), Size::FromRam, &cpu, &mut |_| {}, Some(1), &AtomicBool::new(false)).unwrap();
+        assert_eq!(r2.stats.steps, 50);
+        assert!(r2.stats.val_loss.unwrap() < after_gpu + 0.3, "{} then {}", after_gpu, r2.stats.val_loss.unwrap());
+        let mut opt = AdamW::new(1, &[], 0.0);
+        let model = crate::checkpoint::load(&s).unwrap().unwrap().0;
+        opt.m = vec![0.0; model.num_params()];
+        opt.v = vec![0.0; model.num_params()];
+        crate::checkpoint::load_optimizer(&s, &mut opt);
+        assert_eq!(opt.t, 50);
     }
 
     #[test]

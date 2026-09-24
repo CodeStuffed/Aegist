@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use council::brain::{Brain, NoBrain};
 use council::checkpoint;
-use council::config::Settings;
+use council::config::{Device, Settings};
 use council::council::{evaluate, Evaluation, Judgement, Options, PersonaResult};
 use council::corpus;
 use council::hardware;
@@ -70,13 +70,22 @@ enum Command {
         /// (default: --hours). Picks its size.
         #[arg(long)]
         plan_hours: Option<f64>,
+        /// Where to train: auto (an NVIDIA GPU if one passes its self-check, else the CPU), cpu or gpu.
+        #[arg(long, value_enum)]
+        device: Option<Device>,
     },
     /// Read Wikipedia on its own and keep training on what it finds.
     Research {
         /// How long to run, in hours.
         #[arg(long, default_value_t = 1.0)]
         hours: f64,
+        /// Where to train: auto, cpu or gpu (as for train).
+        #[arg(long, value_enum)]
+        device: Option<Device>,
     },
+    /// Test the NVIDIA GPU: compile the kernels, check its results against the
+    /// CPU's, measure its speed, and show which model sizes it can train.
+    GpuCheck,
     /// Import a Wikipedia dump (.xml.bz2 or .xml) into the corpus and the knowledge base.
     ImportWikipedia {
         /// The dump file, e.g. enwiki-latest-pages-articles-multistream.xml.bz2.
@@ -158,7 +167,11 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("{}", render(&result));
             }
         }
-        Command::Train { data, hours, steps, tier, plan_hours } => {
+        Command::Train { data, hours, steps, tier, plan_hours, device } => {
+            let mut settings = settings;
+            if let Some(d) = device {
+                settings.gpu.device = d;
+            }
             if let Some(src) = data {
                 let n = corpus::import_texts(&src, &settings)?;
                 println!("Imported {n} file(s) into {}.", corpus::corpus_dir(&settings).display());
@@ -175,7 +188,11 @@ fn run(command: Command) -> Result<ExitCode> {
                 println!("Stopped; the checkpoint was saved.");
             }
         }
-        Command::Research { hours } => {
+        Command::Research { hours, device } => {
+            let mut settings = settings;
+            if let Some(d) = device {
+                settings.gpu.device = d;
+            }
             install_ctrl_c();
             println!("Researching and self-training for {hours} hour(s). Ctrl-C stops it; progress is saved as it goes.");
             let s = &settings;
@@ -206,7 +223,57 @@ fn run(command: Command) -> Result<ExitCode> {
             }
         }
         Command::Doctor => doctor(&settings)?,
+        Command::GpuCheck => return gpu_check(&settings),
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn gpu_check(settings: &Settings) -> Result<ExitCode> {
+    use council::gpu::{self, Backend};
+    println!("Opening the GPU and compiling the kernels...");
+    let be = match gpu::cuda::CudaBackend::open() {
+        Ok(be) => be,
+        Err(e) => {
+            println!("No usable GPU: {e:#}");
+            println!("Training uses the CPU. For an NVIDIA GPU, install its driver and the CUDA Toolkit 12.8+ (see HOW_TO_RUN.md).");
+            return Ok(ExitCode::from(1));
+        }
+    };
+    println!("GPU       {}", be.describe());
+    let r = gpu::self_check(&be)?;
+    println!("Check     {} - loss {:.5} (CPU {:.5}); worst gradient error {:.1e} ({}); weights after one step {:.1e}",
+        if r.passed { "passed" } else { "FAILED" }, r.loss_gpu, r.loss_cpu, r.worst_grad.1, r.worst_grad.0, r.step_error);
+    if !r.passed {
+        println!("The GPU's results don't match the CPU's, so training won't use it. Update the NVIDIA driver and CUDA Toolkit and try again.");
+        return Ok(ExitCode::from(1));
+    }
+    let flops = gpu::gemm_flops(&be)?;
+    let (free, total) = be.memory()?;
+    println!("Speed     {:.1} TFLOP/s on TF32 matrix multiplies", flops / 1e12);
+    println!("Memory    {:.1} GB free of {:.1} GB", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
+    let compute = trainer::Compute::Gpu { backend: Box::new(be), flops: flops * trainer::GPU_EFFICIENCY };
+    let mut tiers: Vec<_> = settings.model.tiers.iter().collect();
+    tiers.sort_by_key(|(_, t)| (t.n_layer * t.d_model * t.d_model, t.vocab_size));
+    println!("Sizes on this GPU (times are rough: the real speed shows once training runs)");
+    for (name, t) in tiers {
+        let cfg = ModelConfig {
+            vocab_size: t.vocab_size, block_size: t.block_size, n_layer: t.n_layer, n_head: t.n_head, d_model: t.d_model,
+            mlp_hidden: ModelConfig::default_mlp_hidden(t.d_model), dropout: settings.model.dropout, rope_base: settings.model.rope_base,
+        };
+        let params = Layout::new(&cfg).total as f64;
+        let well = compute.flops_per_token(&cfg) * trainer::TOKENS_PER_PARAM * params / compute.training_flops();
+        let micro = gpu::micro_batch_for(&cfg, free, 64);
+        println!("  {name:7} {:>7} params | {} | ~{:>11} to train well",
+            human_count(params), micro.map_or("too big for this GPU".to_string(), |s| format!("{s:>2} sequences per micro-batch")),
+            trainer::human_duration(well));
+    }
+    let mb: u64 = corpus::corpus_files(settings).iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+    let picks: Vec<String> = [8.0, 24.0, 96.0]
+        .iter()
+        .map(|&h| format!("{h} h -> {}", trainer::pick_for_hours(settings, h, &compute, mb as f64 / 4.0).0))
+        .collect();
+    println!("A new model sized for its training time on this GPU{}: {}",
+        if mb == 0 { " (no text yet, so the smallest)" } else { ", with this corpus" }, picks.join(", "));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -218,9 +285,15 @@ fn doctor(settings: &Settings) -> Result<()> {
     println!("Hardware");
     println!("  RAM        {:.1} GB", hw.ram_gb);
     println!("  CPU        {} cores, {} threads, {}", hw.cpu_cores, hw.threads, hw.simd);
+    match council::gpu::cuda::probe() {
+        Ok(g) => println!("  GPU        {} ({:.1} GB, CUDA driver {}.{}) - `council gpu-check` tests it and shows its sizes",
+            g.name, g.total_memory as f64 / (1u64 << 30) as f64, g.driver_version / 1000, g.driver_version % 1000 / 10),
+        Err(e) => println!("  GPU        none usable ({e}); training uses the CPU"),
+    }
 
     // Rough training speed: a matrix multiply timed on every core
-    let flops_per_s = trainer::measure_cpu_flops();
+    let cpu = trainer::Compute::cpu();
+    let flops_per_s = cpu.training_flops();
     println!("Sizes (to choose one: council train --tier NAME; times assume {:.0} GFLOP/s)", flops_per_s / 1e9);
     let mut tiers: Vec<_> = settings.model.tiers.iter().collect();
     tiers.sort_by(|a, b| (a.1.manual, a.1.max_ram_gb).partial_cmp(&(b.1.manual, b.1.max_ram_gb)).unwrap());
@@ -242,7 +315,7 @@ fn doctor(settings: &Settings) -> Result<()> {
     let mb: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
     let picks: Vec<String> = [1.0, 8.0, 24.0, 96.0]
         .iter()
-        .map(|&h| format!("{h} h -> {}", trainer::pick_for_hours(settings, h, flops_per_s, mb as f64 / 4.0, hw.ram_gb).0))
+        .map(|&h| format!("{h} h -> {}", trainer::pick_for_hours(settings, h, &cpu, mb as f64 / 4.0).0))
         .collect();
     println!("  Otherwise a new model gets the size that will be smartest after its training time");
     println!("  (--hours, or --plan-hours for several sessions){}: {}",

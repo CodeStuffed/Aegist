@@ -189,6 +189,10 @@ pub trait Backend {
     fn block(&self) -> u32 {
         BLOCK
     }
+    /// Most blocks for a grid-stride loop.
+    fn max_grid(&self) -> u32 {
+        8192
+    }
     /// Launch with `grid` blocks of `block()` threads.
     fn launch(&self, k: Kernel, grid: (u32, u32), args: &[Arg]) -> Result<()>;
     fn gemm(&self, g: &Gemm) -> Result<()>;
@@ -197,6 +201,49 @@ pub trait Backend {
     fn memory(&self) -> Result<(u64, u64)>;
     /// TF32 tensor-core matrix multiplies (fast) or strict fp32 (for checking).
     fn set_tf32(&self, on: bool) -> Result<()>;
+}
+
+/// A borrowed backend works too (the trainer keeps the GPU open across runs).
+impl<T: Backend + ?Sized> Backend for &T {
+    fn describe(&self) -> String {
+        (**self).describe()
+    }
+    fn alloc(&self, bytes: usize) -> Result<DevPtr> {
+        (**self).alloc(bytes)
+    }
+    fn free(&self, p: DevPtr) {
+        (**self).free(p)
+    }
+    fn upload(&self, dst: DevPtr, src: &[u8]) -> Result<()> {
+        (**self).upload(dst, src)
+    }
+    fn download(&self, src: DevPtr, dst: &mut [u8]) -> Result<()> {
+        (**self).download(src, dst)
+    }
+    fn zero(&self, dst: DevPtr, bytes: usize) -> Result<()> {
+        (**self).zero(dst, bytes)
+    }
+    fn block(&self) -> u32 {
+        (**self).block()
+    }
+    fn max_grid(&self) -> u32 {
+        (**self).max_grid()
+    }
+    fn launch(&self, k: Kernel, grid: (u32, u32), args: &[Arg]) -> Result<()> {
+        (**self).launch(k, grid, args)
+    }
+    fn gemm(&self, g: &Gemm) -> Result<()> {
+        (**self).gemm(g)
+    }
+    fn sync(&self) -> Result<()> {
+        (**self).sync()
+    }
+    fn memory(&self) -> Result<(u64, u64)> {
+        (**self).memory()
+    }
+    fn set_tf32(&self, on: bool) -> Result<()> {
+        (**self).set_tf32(on)
+    }
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -427,7 +474,7 @@ impl<B: Backend> GpuTrainer<B> {
 
     /// Blocks for a loop over `n` items (grid-stride kernels).
     fn grid_for(&self, n: usize) -> (u32, u32) {
-        ((n.div_ceil(self.be.block() as usize)).clamp(1, 8192) as u32, 1)
+        ((n.div_ceil(self.be.block() as usize)).clamp(1, self.be.max_grid() as usize) as u32, 1)
     }
 
     fn rows(&self) -> usize {

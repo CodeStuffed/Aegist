@@ -4,7 +4,8 @@
 //! every later run continues from the checkpoint.
 
 use crate::checkpoint::{self, HistoryPoint, Meta, Stats};
-use crate::config::Settings;
+use crate::config::{Device, Settings};
+use crate::gpu::{self, cuda::CudaBackend, Backend, GpuTrainer};
 use crate::corpus;
 use crate::hardware;
 use crate::model::{Acts, Model, ModelConfig};
@@ -12,7 +13,7 @@ use crate::optim::{clip_grad_norm, AdamW};
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
 use crate::util::iso_now;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -114,6 +115,105 @@ pub fn measure_cpu_flops() -> f64 {
     rayon::ThreadPoolBuilder::new().build().map(|p| p.install(measure)).unwrap_or_else(|_| measure())
 }
 
+/// Where training runs.
+pub enum Compute {
+    Cpu { flops: f64, ram_gb: f64 },
+    Gpu { backend: Box<dyn Backend>, flops: f64 },
+}
+
+/// The share of a GPU's measured TF32 matrix-multiply speed that training
+/// reaches end to end (attention's small matrices, the other kernels,
+/// memory traffic). A rough figure: the real rate is shown once training runs.
+pub const GPU_EFFICIENCY: f64 = 0.5;
+
+impl Compute {
+    pub fn cpu() -> Compute {
+        Compute::Cpu { flops: measure_cpu_flops(), ram_gb: hardware::detect().ram_gb }
+    }
+
+    /// Useful training FLOP/s.
+    pub fn training_flops(&self) -> f64 {
+        match self {
+            Compute::Cpu { flops, .. } => *flops,
+            Compute::Gpu { flops, .. } => *flops,
+        }
+    }
+
+    /// Operations per token trained (the GPU recomputes each layer's
+    /// forward pass during the backward pass: a third more).
+    pub fn flops_per_token(&self, cfg: &ModelConfig) -> f64 {
+        match self {
+            Compute::Cpu { .. } => flops_per_token(cfg),
+            Compute::Gpu { .. } => flops_per_token(cfg) * 4.0 / 3.0,
+        }
+    }
+
+    /// Whether a model this size can train here.
+    pub fn fits(&self, cfg: &ModelConfig, settings: &Settings) -> bool {
+        self.check_fits(cfg, settings).is_ok()
+    }
+
+    fn check_fits(&self, cfg: &ModelConfig, settings: &Settings) -> Result<()> {
+        match self {
+            Compute::Cpu { ram_gb, .. } => check_memory_in(cfg, settings, *ram_gb),
+            Compute::Gpu { backend, .. } => {
+                // the CPU keeps a copy of the weights and optimizer state for checkpoints
+                let host = 12.0 * crate::model::Layout::new(cfg).total as f64 / (1u64 << 30) as f64;
+                let ram = hardware::detect().ram_gb;
+                if host > 0.85 * ram {
+                    anyhow::bail!("Training this {}x{} model on the GPU needs about {host:.1} GB of RAM for its checkpoints, \
+                                   but this machine has {ram:.1} GB. Pick a smaller size with --tier.", cfg.n_layer, cfg.d_model);
+                }
+                let (free, _) = backend.memory()?;
+                if gpu::micro_batch_for(cfg, free, 1).is_none() {
+                    anyhow::bail!("This {}x{} model needs about {:.1} GB of GPU memory to train, but {:.1} GB is free. \
+                                   Pick a smaller size with --tier, or train on the CPU with --device cpu.",
+                        cfg.n_layer, cfg.d_model, (gpu::training_bytes(cfg, 1) + gpu::OVERHEAD_BYTES) as f64 / (1u64 << 30) as f64,
+                        free as f64 / (1u64 << 30) as f64);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Compute::Cpu { .. } => "the CPU".into(),
+            Compute::Gpu { backend, .. } => backend.describe(),
+        }
+    }
+}
+
+/// Open the NVIDIA GPU, compile the kernels, and check its results against
+/// the CPU's before trusting it with training.
+pub fn open_checked_gpu(log: &mut dyn FnMut(String)) -> Result<Compute> {
+    let backend = CudaBackend::open()?;
+    let r = gpu::self_check(&backend)?;
+    if !r.passed {
+        anyhow::bail!("the GPU's results don't match the CPU's (loss {} vs {}, worst gradient error {:.1e} in {}, weights after a step {:.1e}). \
+                       Update the NVIDIA driver and CUDA Toolkit, then run `council gpu-check`.",
+            r.loss_gpu, r.loss_cpu, r.worst_grad.1, r.worst_grad.0, r.step_error);
+    }
+    let flops = gpu::gemm_flops(&backend)? * GPU_EFFICIENCY;
+    log(format!("GPU: {} - self-check passed (every gradient matches the CPU's to {:.0e}).", backend.describe(), r.worst_grad.1.max(1e-9)));
+    Ok(Compute::Gpu { backend: Box::new(backend), flops })
+}
+
+/// Where to train, from settings.gpu.device (auto: the GPU if one works).
+pub fn choose_compute(settings: &Settings, log: &mut dyn FnMut(String)) -> Result<Compute> {
+    match settings.gpu.device {
+        Device::Cpu => Ok(Compute::cpu()),
+        Device::Gpu => open_checked_gpu(log).context("training on the GPU was asked for (--device gpu)"),
+        Device::Auto => match open_checked_gpu(log) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                log(format!("Training on the CPU ({e}).", e = e.to_string().trim_end_matches('.')));
+                Ok(Compute::cpu())
+            }
+        },
+    }
+}
+
 /// Repeating text more than about this many times stops helping.
 pub const MAX_EPOCHS: f64 = 4.0;
 
@@ -122,21 +222,22 @@ pub const MAX_EPOCHS: f64 = 4.0;
 /// parameter in that time (bigger would be cut off half-trained; smaller
 /// would stop improving early) without repeating the corpus more than
 /// MAX_EPOCHS times. Returns the tier's name and why.
-pub fn pick_for_hours(settings: &Settings, hours: f64, flops_per_s: f64, corpus_tokens: f64, ram_gb: f64) -> (String, String) {
+pub fn pick_for_hours(settings: &Settings, hours: f64, compute: &Compute, corpus_tokens: f64) -> (String, String) {
+    let flops_per_s = compute.training_flops();
     let mut sized: Vec<(&String, f64, f64)> = settings
         .model
         .tiers
         .iter()
         .map(|(name, t)| {
             let cfg = config_for(settings, t, t.vocab_size);
-            let fits = (training_bytes(&cfg, settings) as f64) <= 0.85 * ram_gb * (1u64 << 30) as f64;
-            (name, crate::model::Layout::new(&cfg).total as f64, if fits { flops_per_s / flops_per_token(&cfg) } else { 0.0 })
+            let tps = if compute.fits(&cfg, settings) { flops_per_s / compute.flops_per_token(&cfg) } else { 0.0 };
+            (name, crate::model::Layout::new(&cfg).total as f64, tps)
         })
         .filter(|&(_, _, tps)| tps > 0.0)
         .collect();
     sized.sort_by(|a, b| a.1.total_cmp(&b.1));
     let Some(&smallest) = sized.first() else {
-        return (hardware::pick_tier(ram_gb, &settings.model.tiers), "nothing fits in memory; using the smallest automatic size".into());
+        return (hardware::pick_tier(hardware::detect().ram_gb, &settings.model.tiers), "nothing fits in memory; using the smallest automatic size".into());
     };
     let readable = |tps: f64| (tps * hours * 3600.0).min(MAX_EPOCHS * corpus_tokens);
     let ok = |&(_, params, tps): &(&String, f64, f64)| readable(tps) >= TOKENS_PER_PARAM * params;
@@ -164,9 +265,8 @@ pub fn training_bytes(cfg: &ModelConfig, settings: &Settings) -> usize {
     16 * crate::model::Layout::new(cfg).total + Acts::estimate_bytes(cfg, b, cfg.block_size)
 }
 
-fn check_memory(cfg: &ModelConfig, settings: &Settings) -> Result<()> {
+fn check_memory_in(cfg: &ModelConfig, settings: &Settings, have: f64) -> Result<()> {
     let need = training_bytes(cfg, settings) as f64 / (1u64 << 30) as f64;
-    let have = hardware::detect().ram_gb;
     if need > 0.85 * have {
         anyhow::bail!(
             "Training this {}x{} model needs about {need:.1} GB of memory, but this machine has {have:.1} GB. \
@@ -176,7 +276,7 @@ fn check_memory(cfg: &ModelConfig, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-fn new_model(settings: &Settings, seed: u64, size: Size, log: &mut dyn FnMut(String)) -> Result<(Model, Tokenizer, Meta)> {
+fn new_model(settings: &Settings, seed: u64, size: Size, compute: &Compute, log: &mut dyn FnMut(String)) -> Result<(Model, Tokenizer, Meta)> {
     let text = corpus::read_corpus(settings, settings.training.tokenizer_train_chars);
     let needed = settings.training.min_new_model_chars;
     if text.len() < needed {
@@ -190,9 +290,9 @@ fn new_model(settings: &Settings, seed: u64, size: Size, log: &mut dyn FnMut(Str
         Size::FromRam => hardware::pick_tier(hw.ram_gb, &settings.model.tiers),
         Size::ForHours(hours) => {
             let bytes: u64 = corpus::corpus_files(settings).iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
-            let (name, why) = pick_for_hours(settings, hours, measure_cpu_flops(), bytes as f64 / 4.0, hw.ram_gb);
-            log(format!("Size for {hours} hour(s) of training: {why}. (Training longer in later sessions? \
-                         Start with --plan-hours <total>, or pick one with --tier.)"));
+            let (name, why) = pick_for_hours(settings, hours, compute, bytes as f64 / 4.0);
+            log(format!("Size for {hours} hour(s) of training on {}: {why}. (Training longer in later sessions? \
+                         Start with --plan-hours <total>, or pick one with --tier.)", compute.describe()));
             name
         }
     };
@@ -203,7 +303,7 @@ fn new_model(settings: &Settings, seed: u64, size: Size, log: &mut dyn FnMut(Str
     // check with the full vocabulary before spending time learning it
     let planned = config_for(settings, tier, tier.vocab_size);
     planned.validate()?;
-    check_memory(&planned, settings)?;
+    compute.check_fits(&planned, settings)?;
     log(format!("Creating a new model at the '{tier_name}' size."));
     log(format!("Learning a {}-token vocabulary from the corpus...", tier.vocab_size));
     let tokenizer = Tokenizer::train(&text, tier.vocab_size);
@@ -227,11 +327,16 @@ fn new_model(settings: &Settings, seed: u64, size: Size, log: &mut dyn FnMut(Str
 /// stop request it saves and returns with `interrupted` set.
 /// `size`: how to size a NEW model; an existing model keeps its size.
 pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMut(String), seed: Option<u64>, stop: &AtomicBool) -> Result<Report> {
+    check_corpus(settings)?; // before spending time on the GPU's self-check
+    let compute = choose_compute(settings, log)?;
+    train_on(settings, budget, size, &compute, log, seed, stop)
+}
+
+/// `train`, on the given CPU or GPU.
+pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compute, log: &mut dyn FnMut(String), seed: Option<u64>,
+                stop: &AtomicBool) -> Result<Report> {
     let tcfg = &settings.training;
-    if corpus::corpus_files(settings).is_empty() {
-        return Err(NotEnoughText("The corpus is empty. Add text with `council train --data <folder>`, \
-                                  or let `council research` collect some.".into()).into());
-    }
+    check_corpus(settings)?;
     let seed = seed.unwrap_or_else(|| Rng::from_time().next_u64());
     let (mut model, tokenizer, mut meta) = match checkpoint::load(settings)? {
         Some(loaded) => {
@@ -243,15 +348,14 @@ pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMu
                                    (your text and knowledge base are kept).", c.n_layer, c.d_model, checkpoint::brain_dir(settings).display());
                 }
             }
-            check_memory(&loaded.0.cfg, settings)?;
+            compute.check_fits(&loaded.0.cfg, settings)?;
             loaded
         }
-        None => new_model(settings, seed, size, log)?,
+        None => new_model(settings, seed, size, compute, log)?,
     };
     let cfg = model.cfg.clone();
     let tokens = corpus::corpus_tokens(&tokenizer, settings)?;
     let t = cfg.block_size;
-    let b = (tcfg.tokens_per_step / t).max(1);
     if tokens.len() < tcfg.min_corpus_tokens.max(4 * (t + 2)) {
         return Err(NotEnoughText(format!(
             "The corpus is only {} tokens; add more text first (need at least {}).",
@@ -264,36 +368,42 @@ pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMu
     log(format!("Corpus: {} tokens ({} train / {} held out).",
         commas(tokens.len() as u64), commas(train_tok.len() as u64), commas(val_tok.len() as u64)));
 
-    let mut acts = Acts::new(&cfg, b, t);
-    let mut grads = vec![0f32; model.num_params()];
     let mut opt = AdamW::new(model.num_params(), &model.layout.matrices, tcfg.weight_decay);
     checkpoint::load_optimizer(settings, &mut opt);
-    let mut rng = Rng::new(seed ^ 0x5eed);
-    let (mut x, mut y) = (vec![0u32; b * t], vec![0u32; b * t]);
-
-    let fill = |src: &[u16], rng: &mut Rng, x: &mut [u32], y: &mut [u32]| {
-        for row in 0..b {
-            let s = rng.below(src.len() - t - 1);
-            for i in 0..t {
-                x[row * t + i] = src[s + i] as u32;
-                y[row * t + i] = src[s + i + 1] as u32;
-            }
+    // b sequences per step; eval_rows per held-out batch
+    let (mut engine, b, eval_rows, lr_max, warmup) = match compute {
+        Compute::Cpu { .. } => {
+            let b = (tcfg.tokens_per_step / t).max(1);
+            let engine = Engine::Cpu { acts: Acts::new(&cfg, b, t), grads: vec![0f32; model.num_params()] };
+            (engine, b, b, tcfg.learning_rate, tcfg.warmup_steps)
+        }
+        Compute::Gpu { backend, .. } => {
+            let (free, _) = backend.memory()?;
+            let per_step = (settings.gpu.tokens_per_step / t).max(1);
+            let seqs = gpu::micro_batch_for(&cfg, free, per_step.min(64)).context("the model doesn't fit in the GPU's free memory")?;
+            let b = per_step.div_ceil(seqs) * seqs;
+            let engine = Engine::Gpu(Box::new(GpuTrainer::new(&**backend, &model, &opt, seqs)?));
+            log(format!("Training on the GPU: {} tokens per step, in micro-batches of {seqs} sequences.", commas((b * t) as u64)));
+            (engine, b, seqs, settings.gpu.learning_rate, settings.gpu.warmup_steps)
         }
     };
-    let evaluate = |model: &Model, acts: &mut Acts, x: &mut [u32], y: &mut [u32]| -> f32 {
+    let mut rng = Rng::new(seed ^ 0x5eed);
+    let (mut x, mut y) = (vec![0u32; b * t], vec![0u32; b * t]);
+    let (mut ex, mut ey) = (vec![0u32; eval_rows * t], vec![0u32; eval_rows * t]);
+    let evaluate = |engine: &mut Engine, model: &Model, ex: &mut [u32], ey: &mut [u32]| -> Result<f32> {
         let mut r = Rng::new(1234); // the same held-out batches every time
-        let total: f32 = (0..tcfg.eval_batches).map(|_| {
-            fill(val_tok, &mut r, x, y);
-            model.loss(acts, x, y)
-        }).sum();
-        total / tcfg.eval_batches as f32
+        let mut total = 0.0;
+        for _ in 0..tcfg.eval_batches {
+            fill(val_tok, &mut r, t, ex, ey);
+            total += engine.loss(model, ex, ey)?;
+        }
+        Ok(total / tcfg.eval_batches as f32)
     };
 
     let start = Instant::now();
     let (mut last_log, mut last_eval, mut last_save) = (0.0f64, 0.0f64, 0.0f64);
     let mut step_i = 0u64;
     let mut interrupted = false;
-    let lr_max = tcfg.learning_rate;
     loop {
         let elapsed = start.elapsed().as_secs_f64();
         match budget {
@@ -305,18 +415,15 @@ pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMu
             interrupted = true;
             break;
         }
-        fill(train_tok, &mut rng, &mut x, &mut y);
-        grads.iter_mut().for_each(|g| *g = 0.0);
-        let loss = model.forward_backward(&mut acts, &mut grads, &x, &y, Some(rng.next_u64()));
-        clip_grad_norm(&mut grads, tcfg.grad_clip);
-        let warm = ((meta.stats.steps + 1) as f32 / tcfg.warmup_steps.max(1) as f32).min(1.0);
+        fill(train_tok, &mut rng, t, &mut x, &mut y);
+        let warm = ((meta.stats.steps + 1) as f32 / warmup.max(1) as f32).min(1.0);
         let frac = match budget {
             Budget::Minutes(m) => (elapsed / (m * 60.0)).min(1.0) as f32,
             Budget::Steps(n) => step_i as f32 / n.max(1) as f32,
         };
         let floor = tcfg.min_lr_fraction;
         let lr = lr_max * warm * (floor + (1.0 - floor) * 0.5 * (1.0 + (std::f32::consts::PI * frac).cos()));
-        opt.step(&mut model.params, &grads, lr);
+        let loss = engine.step(&mut model, &mut opt, &x, &y, rng.next_u64(), tcfg.grad_clip, lr)?;
 
         step_i += 1;
         let st = &mut meta.stats;
@@ -326,7 +433,7 @@ pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMu
 
         let now = start.elapsed().as_secs_f64();
         if now - last_eval >= tcfg.eval_every_s {
-            let v = evaluate(&model, &mut acts, &mut x, &mut y);
+            let v = evaluate(&mut engine, &model, &mut ex, &mut ey)?;
             meta.stats.val_loss = Some(v);
             meta.stats.val_bpb = Some(bits_per_byte(v));
             last_eval = now;
@@ -353,27 +460,83 @@ pub fn train(settings: &Settings, budget: Budget, size: Size, log: &mut dyn FnMu
         if now - last_save >= tcfg.checkpoint_every_s {
             meta.stats.train_seconds += now - last_save;
             last_save = now;
-            save_with_eval(settings, &model, &mut meta, &opt, &mut acts, &mut x, &mut y, &evaluate, &bits_per_byte)?;
+            let v = evaluate(&mut engine, &model, &mut ex, &mut ey)?;
+            save(settings, &mut engine, &mut model, &mut opt, &mut meta, v, bits_per_byte(v))?;
         }
     }
     meta.stats.train_seconds += start.elapsed().as_secs_f64() - last_save;
-    save_with_eval(settings, &model, &mut meta, &opt, &mut acts, &mut x, &mut y, &evaluate, &bits_per_byte)?;
+    let v = evaluate(&mut engine, &model, &mut ex, &mut ey)?;
+    save(settings, &mut engine, &mut model, &mut opt, &mut meta, v, bits_per_byte(v))?;
     let st = &meta.stats;
     log(format!("Saved: {} steps total, {:.1}M tokens seen, held-out loss {:.3} ({:.3} bits per byte).",
         commas(st.steps), st.tokens_seen as f64 / 1e6, st.val_loss.unwrap_or(f32::NAN), st.val_bpb.unwrap_or(f32::NAN)));
     Ok(Report { steps_this_session: step_i, tokens_this_session: step_i * (b * t) as u64, interrupted, stats: meta.stats })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn save_with_eval(
-    settings: &Settings, model: &Model, meta: &mut Meta, opt: &AdamW, acts: &mut Acts, x: &mut [u32], y: &mut [u32],
-    evaluate: &dyn Fn(&Model, &mut Acts, &mut [u32], &mut [u32]) -> f32, bpb: &dyn Fn(f32) -> f32,
-) -> Result<()> {
-    let v = evaluate(model, acts, x, y);
+fn check_corpus(settings: &Settings) -> Result<()> {
+    if corpus::corpus_files(settings).is_empty() {
+        return Err(NotEnoughText("The corpus is empty. Add text with `council train --data <folder>`, \
+                                  or let `council research` collect some.".into()).into());
+    }
+    Ok(())
+}
+
+/// `x`/`y`: random windows of `src` (rows of t tokens) and the tokens after them.
+fn fill(src: &[u16], rng: &mut Rng, t: usize, x: &mut [u32], y: &mut [u32]) {
+    for row in 0..x.len() / t {
+        let s = rng.below(src.len() - t - 1);
+        for i in 0..t {
+            x[row * t + i] = src[s + i] as u32;
+            y[row * t + i] = src[s + i + 1] as u32;
+        }
+    }
+}
+
+/// The training step itself, on the CPU or the GPU.
+enum Engine<'a> {
+    Cpu { acts: Acts, grads: Vec<f32> },
+    Gpu(Box<GpuTrainer<&'a dyn Backend>>),
+}
+
+impl Engine<'_> {
+    /// Forward, backward, clip and AdamW on one batch; returns its loss.
+    #[allow(clippy::too_many_arguments)]
+    fn step(&mut self, model: &mut Model, opt: &mut AdamW, x: &[u32], y: &[u32], dropout_seed: u64, clip: f32, lr: f32) -> Result<f32> {
+        match self {
+            Engine::Cpu { acts, grads } => {
+                grads.iter_mut().for_each(|g| *g = 0.0);
+                let loss = model.forward_backward(acts, grads, x, y, Some(dropout_seed));
+                clip_grad_norm(grads, clip);
+                opt.step(&mut model.params, grads, lr);
+                Ok(loss)
+            }
+            Engine::Gpu(g) => {
+                let loss = g.forward_backward(x, y, Some(dropout_seed))?;
+                g.clip(clip)?;
+                g.adamw(lr)?;
+                Ok(loss)
+            }
+        }
+    }
+
+    fn loss(&mut self, model: &Model, x: &[u32], y: &[u32]) -> Result<f32> {
+        match self {
+            Engine::Cpu { acts, .. } => Ok(model.loss(acts, x, y)),
+            Engine::Gpu(g) => g.loss(x, y),
+        }
+    }
+}
+
+/// Record the held-out loss and write the checkpoint (bringing the GPU's
+/// weights and optimizer state back first).
+fn save(settings: &Settings, engine: &mut Engine, model: &mut Model, opt: &mut AdamW, meta: &mut Meta, val_loss: f32, bpb: f32) -> Result<()> {
+    if let Engine::Gpu(g) = engine {
+        g.download_into(model, opt)?;
+    }
     let st = &mut meta.stats;
-    st.val_loss = Some(v);
-    st.val_bpb = Some(bpb(v));
-    st.history.push(HistoryPoint { step: st.steps, val_loss: v, val_bpb: bpb(v), at: iso_now() });
+    st.val_loss = Some(val_loss);
+    st.val_bpb = Some(bpb);
+    st.history.push(HistoryPoint { step: st.steps, val_loss, val_bpb: bpb, at: iso_now() });
     if st.history.len() > 500 {
         st.history.remove(0);
     }
@@ -453,7 +616,7 @@ gravity accelerates every body at the same rate.\n\n";
         let huge = crate::config::Tier { max_ram_gb: 1e9, n_layer: 96, n_head: 96, d_model: 12288, block_size: 2048, vocab_size: 50000, manual: true };
         let cfg = config_for(&s, &huge, 50000);
         assert!(training_bytes(&cfg, &s) > 1 << 40); // a GPT-3-sized model needs terabytes
-        assert!(check_memory(&cfg, &s).unwrap_err().to_string().contains("needs about"));
+        assert!(check_memory_in(&cfg, &s, hardware::detect().ram_gb).unwrap_err().to_string().contains("needs about"));
         assert_eq!(human_duration(90.0), "2 minutes");
         assert_eq!(human_duration(3.0 * 3600.0), "3.0 hours");
         assert_eq!(human_duration(6e8), "19 years");
@@ -464,7 +627,8 @@ gravity accelerates every body at the same rate.\n\n";
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let s = Settings::from_file(&root.join("config/settings.yaml"), &root).unwrap();
         let (gflops, ram) = (200e9, 1024.0);
-        let pick = |hours: f64, tokens: f64| pick_for_hours(&s, hours, gflops, tokens, ram).0;
+        let cpu = |ram_gb: f64| Compute::Cpu { flops: gflops, ram_gb };
+        let pick = |hours: f64, tokens: f64| pick_for_hours(&s, hours, &cpu(ram), tokens).0;
         let lots = 1e12;
         // more time, bigger model - exactly the biggest the time can train well
         let mut needed: Vec<(f64, &String)> = s.model.tiers.iter().map(|(name, t)| {
@@ -472,7 +636,7 @@ gravity accelerates every body at the same rate.\n\n";
             (TOKENS_PER_PARAM * crate::model::Layout::new(&cfg).total as f64 * flops_per_token(&cfg) / gflops / 3600.0, name)
         }).collect();
         needed.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert_eq!(needed.iter().map(|n| n.1.as_str()).collect::<Vec<_>>(), ["tiny", "small", "medium", "large", "xl", "xxl", "1b"]);
+        assert_eq!(needed.iter().map(|n| n.1.as_str()).collect::<Vec<_>>(), ["tiny", "small", "medium", "large", "110m", "xl", "235m", "xxl", "730m", "1b"]);
         for w in needed.windows(2) {
             let ((h, name), (next_h, _)) = (w[0], w[1]);
             assert_eq!(pick(h * 1.01, lots), *name, "{name} needs {h:.1} h");
@@ -481,10 +645,10 @@ gravity accelerates every body at the same rate.\n\n";
         assert_eq!(pick(0.01, lots), "tiny");
         // plenty of time but little text: a small model (big ones would just memorise it)
         assert_eq!(pick(1e6, 3e6), "tiny");
-        let (_, why) = pick_for_hours(&s, 1e6, gflops, 3e6, ram);
+        let (_, why) = pick_for_hours(&s, 1e6, &cpu(ram), 3e6);
         assert!(why.contains("the corpus is the limit"), "{why}");
         // too little memory for the big ones: the biggest that fits
-        let small_ram = pick_for_hours(&s, 1e6, gflops, lots, 2.0).0;
+        let small_ram = pick_for_hours(&s, 1e6, &cpu(2.0), lots).0;
         let fits = |name: &str| training_bytes(&config_for(&s, &s.model.tiers[name], s.model.tiers[name].vocab_size), &s) as f64 <= 0.85 * 2.0 * (1u64 << 30) as f64;
         assert!(fits(&small_ram) && small_ram != "1b");
         assert!(s.model.tiers.keys().filter(|n| fits(n)).all(|n| s.model.tiers[n].d_model <= s.model.tiers[&small_ram].d_model));

@@ -14,7 +14,11 @@ model:
     # Bigger sizes, only when asked for: `council train --tier xl`. They need
     # far more memory and time; `council doctor` and `train` show how much.
     xl:     {max_ram_gb: 64,   n_layer: 16, n_head: 12, d_model: 768,  block_size: 512,  vocab_size: 16384, manual: true}
+    # Sizes for a GPU (a 1024-token context and a 32k vocabulary):
+    110m:   {max_ram_gb: 64,   n_layer: 12, n_head: 12, d_model: 768,  block_size: 1024, vocab_size: 32768, manual: true}
+    235m:   {max_ram_gb: 128,  n_layer: 16, n_head: 16, d_model: 1024, block_size: 1024, vocab_size: 32768, manual: true}
     xxl:    {max_ram_gb: 128,  n_layer: 24, n_head: 16, d_model: 1024, block_size: 1024, vocab_size: 32768, manual: true}
+    730m:   {max_ram_gb: 256,  n_layer: 24, n_head: 16, d_model: 1536, block_size: 1024, vocab_size: 32768, manual: true}
     1b:     {max_ram_gb: 256,  n_layer: 24, n_head: 16, d_model: 2048, block_size: 1024, vocab_size: 32768, manual: true}
   dropout: 0.1
   rope_base: 10000.0
@@ -68,6 +72,15 @@ inference:
   # Weights used to answer questions (training always uses full precision):
   #   f32  exact | int8  ~4x smaller, near-identical | int4  ~7x smaller, small accuracy cost
   precision: int8
+
+gpu:
+  # Training on an NVIDIA GPU (RTX 20xx or newer, CUDA Toolkit 12.8+; see
+  # HOW_TO_RUN.md). auto: use it if one works - a self-check against the CPU
+  # runs first - else the CPU. `council train --device cpu|gpu` overrides this.
+  device: auto
+  tokens_per_step: 131072    # batch per step on the GPU (split into micro-batches that fit its memory)
+  learning_rate: 0.0006      # peak, for the bigger models a GPU trains
+  warmup_steps: 500
 
 uncertainty:
   enabled: true              # re-run the council with dropout on and compare
