@@ -4,7 +4,7 @@
 //! every later run continues from the checkpoint.
 
 use crate::checkpoint::{self, HistoryPoint, Meta, Stats};
-use crate::config::{Device, Settings};
+use crate::config::{Device, GpuPrecision, Settings};
 use crate::gpu::{self, cuda::CudaBackend, Backend, GpuTrainer};
 use crate::corpus;
 use crate::hardware;
@@ -124,7 +124,7 @@ pub fn measure_cpu_flops() -> f64 {
 /// Where training runs.
 pub enum Compute {
     Cpu { flops: f64, ram_gb: f64 },
-    Gpu { backend: Box<dyn Backend>, flops: f64 },
+    Gpu { backend: Box<dyn Backend>, flops: f64, bf16: bool },
 }
 
 /// The share of a GPU's measured TF32 matrix-multiply speed that training
@@ -162,7 +162,7 @@ impl Compute {
     fn check_fits(&self, cfg: &ModelConfig, settings: &Settings) -> Result<()> {
         match self {
             Compute::Cpu { ram_gb, .. } => check_memory_in(cfg, settings, *ram_gb),
-            Compute::Gpu { backend, .. } => {
+            Compute::Gpu { backend, bf16, .. } => {
                 // the CPU keeps a copy of the weights and optimizer state for checkpoints
                 let host = 12.0 * crate::model::Layout::new(cfg).total as f64 / (1u64 << 30) as f64;
                 let ram = hardware::detect().ram_gb;
@@ -171,10 +171,10 @@ impl Compute {
                                    but this machine has {ram:.1} GB. Pick a smaller size with --tier.", cfg.n_layer, cfg.d_model);
                 }
                 let (free, _) = backend.memory()?;
-                if gpu::micro_batch_for(cfg, free, 1).is_none() {
+                if gpu::micro_batch_for(cfg, free, 1, *bf16).is_none() {
                     anyhow::bail!("This {}x{} model needs about {:.1} GB of GPU memory to train, but {:.1} GB is free. \
                                    Pick a smaller size with --tier, or train on the CPU with --device cpu.",
-                        cfg.n_layer, cfg.d_model, (gpu::training_bytes(cfg, 1) + gpu::OVERHEAD_BYTES) as f64 / (1u64 << 30) as f64,
+                        cfg.n_layer, cfg.d_model, (gpu::training_bytes(cfg, 1, *bf16) + gpu::OVERHEAD_BYTES) as f64 / (1u64 << 30) as f64,
                         free as f64 / (1u64 << 30) as f64);
                 }
                 Ok(())
@@ -192,25 +192,33 @@ impl Compute {
 
 /// Open the NVIDIA GPU, compile the kernels, and check its results against
 /// the CPU's before trusting it with training.
-pub fn open_checked_gpu(log: &mut dyn FnMut(String)) -> Result<Compute> {
+pub fn open_checked_gpu(settings: &Settings, log: &mut dyn FnMut(String)) -> Result<Compute> {
     let backend = CudaBackend::open()?;
+    let bf16 = match settings.gpu.precision {
+        GpuPrecision::Auto => backend.supports_bf16(),
+        GpuPrecision::Tf32 => false,
+        GpuPrecision::Bf16 if backend.supports_bf16() => true,
+        GpuPrecision::Bf16 => anyhow::bail!("gpu.precision is bf16, but this GPU has no bf16 tensor cores (RTX 30xx or newer); use tf32"),
+    };
     let r = gpu::self_check(&backend)?;
     if !r.passed {
         anyhow::bail!("the GPU's results don't match the CPU's (loss {} vs {}, worst gradient error {:.1e} in {}, weights after a step {:.1e}). \
                        Update the NVIDIA driver and CUDA Toolkit, then run `council gpu-check`.",
             r.loss_gpu, r.loss_cpu, r.worst_grad.1, r.worst_grad.0, r.step_error);
     }
-    let flops = gpu::gemm_flops(&backend)? * GPU_EFFICIENCY;
-    log(format!("GPU: {} - self-check passed (every gradient matches the CPU's to {:.0e}).", backend.describe(), r.worst_grad.1.max(1e-9)));
-    Ok(Compute::Gpu { backend: Box::new(backend), flops })
+    let flops = gpu::gemm_flops(&backend, bf16)? * GPU_EFFICIENCY;
+    let b16 = r.bf16_grad.as_ref().map_or(String::new(), |b| format!("; {:.0e} with bf16", b.1));
+    log(format!("GPU: {} - self-check passed (every gradient matches the CPU's to {:.0e}{b16}); matrix multiplies in {}.",
+        backend.describe(), r.worst_grad.1.max(1e-9), if bf16 { "bf16" } else { "tf32" }));
+    Ok(Compute::Gpu { backend: Box::new(backend), flops, bf16 })
 }
 
 /// Where to train, from settings.gpu.device (auto: the GPU if one works).
 pub fn choose_compute(settings: &Settings, log: &mut dyn FnMut(String)) -> Result<Compute> {
     match settings.gpu.device {
         Device::Cpu => Ok(Compute::cpu()),
-        Device::Gpu => open_checked_gpu(log).context("training on the GPU was asked for (--device gpu)"),
-        Device::Auto => match open_checked_gpu(log) {
+        Device::Gpu => open_checked_gpu(settings, log).context("training on the GPU was asked for (--device gpu)"),
+        Device::Auto => match open_checked_gpu(settings, log) {
             Ok(c) => Ok(c),
             Err(e) => {
                 log(format!("Training on the CPU ({e}).", e = e.to_string().trim_end_matches('.')));
@@ -383,12 +391,12 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
             let engine = Engine::Cpu { acts: Acts::new(&cfg, b, t), grads: vec![0f32; model.num_params()] };
             (engine, b, b, tcfg.learning_rate, tcfg.warmup_steps)
         }
-        Compute::Gpu { backend, .. } => {
+        Compute::Gpu { backend, bf16, .. } => {
             let (free, _) = backend.memory()?;
             let per_step = (settings.gpu.tokens_per_step / t).max(1);
-            let seqs = gpu::micro_batch_for(&cfg, free, per_step.min(64)).context("the model doesn't fit in the GPU's free memory")?;
+            let seqs = gpu::micro_batch_for(&cfg, free, per_step.min(64), *bf16).context("the model doesn't fit in the GPU's free memory")?;
             let b = per_step.div_ceil(seqs) * seqs;
-            let engine = Engine::Gpu(Box::new(GpuTrainer::new(&**backend, &model, &opt, seqs)?));
+            let engine = Engine::Gpu(Box::new(GpuTrainer::new(&**backend, &model, &opt, seqs, *bf16)?));
             log(format!("Training on the GPU: {} tokens per step, in micro-batches of {seqs} sequences.", commas((b * t) as u64)));
             (engine, b, seqs, settings.gpu.learning_rate, settings.gpu.warmup_steps)
         }

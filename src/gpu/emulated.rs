@@ -52,6 +52,31 @@ unsafe fn sgemm_ref(g: &CublasGemm) {
     }
 }
 
+/// As sgemm_ref, with A and B in bfloat16.
+///
+/// Safety: as sgemm_ref (A and B hold u16s).
+unsafe fn gemm_bf16_ref(g: &CublasGemm) {
+    let (m, n, k) = (g.m as usize, g.n as usize, g.k as usize);
+    let f = |p: *const u16, i: usize| f32::from_bits((*p.add(i) as u32) << 16);
+    for bi in 0..g.batch as usize {
+        let a = (g.a as *const u16).add(bi * g.stride_a as usize);
+        let b = (g.b as *const u16).add(bi * g.stride_b as usize);
+        let c = (g.c as *mut f32).add(bi * g.stride_c as usize);
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for p in 0..k {
+                    let av = if g.trans_a { f(a, p + i * g.lda as usize) } else { f(a, i + p * g.lda as usize) };
+                    let bv = if g.trans_b { f(b, j + p * g.ldb as usize) } else { f(b, p + j * g.ldb as usize) };
+                    acc += av * bv;
+                }
+                let out = c.add(i + j * g.ldc as usize);
+                *out = g.alpha * acc + if g.beta == 0.0 { 0.0 } else { g.beta * *out };
+            }
+        }
+    }
+}
+
 impl Backend for EmulatedBackend {
     fn describe(&self) -> String {
         "CPU emulation of the GPU kernels".into()
@@ -111,6 +136,12 @@ impl Backend for EmulatedBackend {
         Ok(())
     }
 
+    fn gemm_bf16(&self, g: &Gemm) -> Result<()> {
+        // Safety: as gemm.
+        unsafe { gemm_bf16_ref(&g.to_cublas()) };
+        Ok(())
+    }
+
     fn sync(&self) -> Result<()> {
         Ok(())
     }
@@ -136,6 +167,9 @@ mod tests {
         let r = self_check(EmulatedBackend::new()).unwrap();
         assert!(r.passed, "{r:?}");
         assert!(r.worst_grad.1 < 1e-4, "{r:?}");
+        let bf16 = r.bf16_grad.clone().unwrap().1;
+        eprintln!("{r:?}");
+        assert!(bf16 > 1e-4 && bf16 < 2e-2, "bf16 gradients {bf16}: should be close, but visibly rounded");
     }
 
     #[test]
@@ -150,7 +184,7 @@ mod tests {
         let src = tmp.path().join("notes.txt");
         std::fs::write(&src, trainer::tests::CORPUS.repeat(20)).unwrap();
         crate::corpus::import_texts(&src, &s).unwrap();
-        let gpu = Compute::Gpu { backend: Box::new(EmulatedBackend::new()), flops: 1e12 };
+        let gpu = Compute::Gpu { backend: Box::new(EmulatedBackend::new()), flops: 1e12, bf16: true };
         let mut lines = Vec::new();
         let r = trainer::train_on(&s, Budget::Steps(40), Size::FromRam, &gpu, &mut |l| lines.push(l), Some(0), &AtomicBool::new(false)).unwrap();
         assert!(lines.iter().any(|l| l.contains("Training on the GPU: 192 tokens per step")), "{lines:?}");
@@ -182,8 +216,8 @@ mod tests {
         let mut acts = Acts::new(&cfg, 4, cfg.block_size);
         let cpu = model.loss(&mut acts, &x, &y);
         let opt = AdamW::new(model.num_params(), &model.layout.matrices, 0.1);
-        let mut g = GpuTrainer::new(EmulatedBackend::new(), &model, &opt, 2).unwrap();
-        assert!((g.loss(&x, &y).unwrap() - cpu).abs() < 1e-4);
+        let mut g = GpuTrainer::new(EmulatedBackend::new(), &model, &opt, 2, true).unwrap();
+        assert!((g.loss(&x, &y).unwrap() - cpu).abs() < 2e-2); // bf16 matrix multiplies
         // training with dropout on lowers the loss on this (learnable) mapping
         let first = g.loss(&x, &y).unwrap();
         for step in 0..30 {

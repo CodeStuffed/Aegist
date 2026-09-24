@@ -241,17 +241,25 @@ fn gpu_check(settings: &Settings) -> Result<ExitCode> {
     };
     println!("GPU       {}", be.describe());
     let r = gpu::self_check(&be)?;
-    println!("Check     {} - loss {:.5} (CPU {:.5}); worst gradient error {:.1e} ({}); weights after one step {:.1e}",
-        if r.passed { "passed" } else { "FAILED" }, r.loss_gpu, r.loss_cpu, r.worst_grad.1, r.worst_grad.0, r.step_error);
+    println!("Check     {} - loss {:.5} (CPU {:.5}); worst gradient error {:.1e} ({}); weights after one step {:.1e}{}",
+        if r.passed { "passed" } else { "FAILED" }, r.loss_gpu, r.loss_cpu, r.worst_grad.1, r.worst_grad.0, r.step_error,
+        r.bf16_grad.as_ref().map_or(String::new(), |b| format!("; with bf16: {:.1e} ({})", b.1, b.0)));
     if !r.passed {
         println!("The GPU's results don't match the CPU's, so training won't use it. Update the NVIDIA driver and CUDA Toolkit and try again.");
         return Ok(ExitCode::from(1));
     }
-    let flops = gpu::gemm_flops(&be)?;
+    let tf32 = gpu::gemm_flops(&be, false)?;
+    let bf16 = match settings.gpu.precision {
+        council::config::GpuPrecision::Auto => be.supports_bf16(),
+        council::config::GpuPrecision::Bf16 => true,
+        council::config::GpuPrecision::Tf32 => false,
+    };
+    let flops = if bf16 { gpu::gemm_flops(&be, true)? } else { tf32 };
     let (free, total) = be.memory()?;
-    println!("Speed     {:.1} TFLOP/s on TF32 matrix multiplies", flops / 1e12);
+    println!("Speed     {:.1} TFLOP/s on TF32 matrix multiplies{}", tf32 / 1e12,
+        if bf16 { format!(", {:.1} on bf16 (used for training)", flops / 1e12) } else { String::new() });
     println!("Memory    {:.1} GB free of {:.1} GB", free as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
-    let compute = trainer::Compute::Gpu { backend: Box::new(be), flops: flops * trainer::GPU_EFFICIENCY };
+    let compute = trainer::Compute::Gpu { backend: Box::new(be), flops: flops * trainer::GPU_EFFICIENCY, bf16 };
     let mut tiers: Vec<_> = settings.model.tiers.iter().collect();
     tiers.sort_by_key(|(_, t)| (t.n_layer * t.d_model * t.d_model, t.vocab_size));
     println!("Sizes on this GPU (times are rough: the real speed shows once training runs)");
@@ -262,7 +270,7 @@ fn gpu_check(settings: &Settings) -> Result<ExitCode> {
         };
         let params = Layout::new(&cfg).total as f64;
         let well = compute.flops_per_token(&cfg) * trainer::TOKENS_PER_PARAM * params / compute.training_flops();
-        let micro = gpu::micro_batch_for(&cfg, free, 64);
+        let micro = gpu::micro_batch_for(&cfg, free, 64, bf16);
         println!("  {name:7} {:>7} params | {} | ~{:>11} to train well",
             human_count(params), micro.map_or("too big for this GPU".to_string(), |s| format!("{s:>2} sequences per micro-batch")),
             trainer::human_duration(well));
@@ -427,6 +435,13 @@ fn render(r: &Evaluation) -> String {
     ];
     for p in &r.panel {
         out.extend(render_persona(p));
+        out.push(String::new());
+    }
+    if let Some(n) = &r.negation_test {
+        out.push(format!("NEGATION TEST  [{}]  {:+.2}", n.confidence, n.contrast));
+        out.push(wrap(&format!("Against: \"{}\"", n.flipped), WIDTH, "  ", ""));
+        out.push(wrap(&format!("The rest of the claim is {} likely as stated ({:.2} vs. {:.2} nats/token).",
+            if n.contrast >= 0.0 { "more" } else { "less" }, n.stated_logp, n.flipped_logp), WIDTH, "  ", ""));
         out.push(String::new());
     }
     out.extend(render_judge(&r.judge, "JUDGE"));

@@ -17,7 +17,7 @@
 #define COUNCIL_KERNELS(X) \
     X(embed_fwd) X(embed_bwd) X(rmsnorm_fwd) X(rmsnorm_bwd_dx) X(rmsnorm_bwd_dg) X(rope) \
     X(causal_softmax) X(softmax_bwd) X(swiglu_fwd) X(swiglu_bwd) X(residual) X(mask_mul) \
-    X(cross_entropy) X(sumsq) X(scale) X(adamw)
+    X(cross_entropy) X(sumsq) X(scale) X(adamw) X(to_bf16)
 
 typedef unsigned long long u64;
 
@@ -247,6 +247,20 @@ extern "C" __global__ void sumsq(const float* g, long long n, double* partial) {
 
 extern "C" __global__ void scale(float* g, long long n, float s) {
     GRID_LOOP(i, n) g[i] *= s;
+}
+
+// f32 -> bfloat16 (the top 16 bits), rounding to nearest even, for the
+// bf16 matrix multiplies (tensor cores, fp32 accumulation).
+extern "C" __global__ void to_bf16(unsigned short* dst, const float* src, long long n) {
+    GRID_LOOP(i, n) {
+        unsigned int u = __float_as_uint(src[i]);
+        if ((u & 0x7fffffffu) > 0x7f800000u) {
+            dst[i] = (unsigned short)((u >> 16) | 0x40u);  // NaN stays NaN
+        } else {
+            u += 0x7fffu + ((u >> 16) & 1u);
+            dst[i] = (unsigned short)(u >> 16);
+        }
+    }
 }
 
 // AdamW (as optim.rs): wd = lr * weight_decay for matrices, 0 for gains;

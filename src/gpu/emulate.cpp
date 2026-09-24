@@ -25,6 +25,11 @@ static std::mutex emu_atomic;
 #define __shared__ static
 
 static inline void __syncthreads() { emu_barrier->arrive_and_wait(); }
+static inline unsigned int __float_as_uint(float f) {
+    unsigned int u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
 static inline float atomicAdd(float* a, float v) {
     std::lock_guard<std::mutex> g(emu_atomic);
     float old = *a;

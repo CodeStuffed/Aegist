@@ -79,6 +79,13 @@ pub struct CouncilSettings {
     pub mixed_margin: f32,
     pub familiarity: Familiarity,
     pub min_tokens_trained: u64,
+    /// Share of the verdict's margin that comes from the negation test (0..1).
+    #[serde(default = "half")]
+    pub negation_weight: f32,
+}
+
+fn half() -> f32 {
+    0.5
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -128,6 +135,17 @@ pub enum Device {
     Gpu,
 }
 
+/// Number format of the GPU's matrix multiplies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuPrecision {
+    /// bf16 on GPUs with bf16 tensor cores (RTX 30xx and newer), else tf32
+    #[default]
+    Auto,
+    Bf16,
+    Tf32,
+}
+
 fn default_gpu_tokens() -> usize {
     131_072
 }
@@ -142,6 +160,8 @@ fn default_gpu_warmup() -> u64 {
 pub struct GpuSettings {
     #[serde(default)]
     pub device: Device,
+    #[serde(default)]
+    pub precision: GpuPrecision,
     /// Tokens per optimizer step on the GPU (split into micro-batches that fit its memory).
     #[serde(default = "default_gpu_tokens")]
     pub tokens_per_step: usize,
@@ -153,7 +173,7 @@ pub struct GpuSettings {
 
 impl Default for GpuSettings {
     fn default() -> Self {
-        GpuSettings { device: Device::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(), warmup_steps: default_gpu_warmup() }
+        GpuSettings { device: Device::Auto, precision: GpuPrecision::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(), warmup_steps: default_gpu_warmup() }
     }
 }
 

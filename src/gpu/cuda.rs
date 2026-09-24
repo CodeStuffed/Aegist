@@ -21,6 +21,10 @@ type CublasHandle = *mut c_void;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 const CUBLAS_PEDANTIC_MATH: i32 = 2;
+const CUDA_R_32F: i32 = 0;
+const CUDA_R_16BF: i32 = 14;
+const CUBLAS_COMPUTE_32F: i32 = 68;
+const CUBLAS_GEMM_DEFAULT: i32 = -1;
 const CUBLAS_TF32_TENSOR_OP_MATH: i32 = 3;
 
 struct Driver {
@@ -66,6 +70,11 @@ struct Cublas {
     #[allow(clippy::type_complexity)]
     sgemm_strided_batched: unsafe extern "C" fn(
         CublasHandle, i32, i32, i32, i32, i32, *const f32, *const f32, i32, i64, *const f32, i32, i64, *const f32, *mut f32, i32, i64, i32,
+    ) -> i32,
+    #[allow(clippy::type_complexity)]
+    gemm_strided_batched_ex: unsafe extern "C" fn(
+        CublasHandle, i32, i32, i32, i32, i32, *const c_void, *const c_void, i32, i32, i64, *const c_void, i32, i32, i64,
+        *const c_void, *mut c_void, i32, i32, i64, i32, i32, i32,
     ) -> i32,
 }
 
@@ -194,6 +203,7 @@ impl CudaBackend {
             destroy: sym!(cublas_lib, "cublasDestroy_v2"),
             set_math_mode: sym!(cublas_lib, "cublasSetMathMode"),
             sgemm_strided_batched: sym!(cublas_lib, "cublasSgemmStridedBatched"),
+            gemm_strided_batched_ex: sym!(cublas_lib, "cublasGemmStridedBatchedEx"),
         };
         let mut handle: CublasHandle = std::ptr::null_mut();
         // Safety: out-pointer.
@@ -449,6 +459,28 @@ impl Backend for CudaBackend {
             bail!("cuBLAS matrix multiply failed (status {r}) for {g:?}");
         }
         Ok(())
+    }
+
+    fn gemm_bf16(&self, g: &Gemm) -> Result<()> {
+        self.current()?;
+        let c = g.to_cublas();
+        let (alpha, beta) = (c.alpha, c.beta);
+        // Safety: A and B are bf16 device buffers, C f32, sized for these shapes by the caller.
+        let r = unsafe {
+            (self.cublas.gemm_strided_batched_ex)(
+                self.handle, c.trans_a as i32, c.trans_b as i32, c.m, c.n, c.k, &alpha as *const f32 as *const c_void,
+                c.a as *const c_void, CUDA_R_16BF, c.lda, c.stride_a, c.b as *const c_void, CUDA_R_16BF, c.ldb, c.stride_b,
+                &beta as *const f32 as *const c_void, c.c as *mut c_void, CUDA_R_32F, c.ldc, c.stride_c, c.batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        if r != 0 {
+            bail!("cuBLAS bf16 matrix multiply failed (status {r}) for {g:?}");
+        }
+        Ok(())
+    }
+
+    fn supports_bf16(&self) -> bool {
+        self.compute_capability.0 >= 8
     }
 
     fn sync(&self) -> Result<()> {

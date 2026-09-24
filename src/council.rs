@@ -6,6 +6,11 @@
 //! to write its position, plus probe phrases it is scored on. Its signal is
 //! pointwise mutual information: how much more likely the model finds the
 //! probes right after the claim than after a neutral lead-in (nats/token).
+//!
+//! The negation test asks the model more directly: with the evidence in
+//! front, does the rest of the claim read as more likely after "X is" or
+//! after "X is not"? A model that has read a lot of text knows how things
+//! are usually said, and this puts that knowledge to work.
 
 use crate::brain::Brain;
 use crate::config::{load_persona, Persona, Settings};
@@ -65,6 +70,105 @@ pub struct PersonaResult {
     pub confidence_before_cap: Option<Confidence>,
 }
 
+/// The claim with its main verb's polarity flipped ("X is Y" <-> "X is not Y").
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Negation {
+    /// the claim up to and including the flipped verb, as stated and flipped
+    pub stated_prefix: String,
+    pub flipped_prefix: String,
+    /// the rest of the claim, scored after each prefix
+    pub rest: String,
+    /// the flipped claim in full
+    pub flipped: String,
+}
+
+/// How much more likely the rest of the claim is after its stated polarity
+/// than after the flipped one (mean log-probability per token, in nats).
+#[derive(Clone, Debug, Serialize)]
+pub struct NegationTest {
+    pub flipped: String,
+    pub stated_logp: f32,
+    pub flipped_logp: f32,
+    /// > 0 supports the claim as stated
+    pub contrast: f32,
+    pub confidence: Confidence,
+}
+
+const AUXILIARIES: &[&str] = &["is", "are", "was", "were", "am", "will", "would", "can", "could", "should", "must", "may", "might", "shall", "does", "do", "did"];
+const PERFECT: &[&str] = &["has", "have", "had"];
+const CONTRACTIONS: &[(&str, &str)] = &[
+    ("isn't", "is"), ("aren't", "are"), ("wasn't", "was"), ("weren't", "were"), ("won't", "will"), ("wouldn't", "would"),
+    ("can't", "can"), ("cannot", "can"), ("couldn't", "could"), ("shouldn't", "should"), ("mustn't", "must"), ("doesn't", "does"),
+    ("don't", "do"), ("didn't", "did"), ("hasn't", "has"), ("haven't", "have"), ("hadn't", "had"), ("mightn't", "might"),
+];
+
+/// "has/have/had" followed by one of these is the main verb ("has a dog",
+/// "have to go"), not an auxiliary ("has grown").
+fn starts_noun_phrase(word: &str) -> bool {
+    const STARTERS: &[&str] = &[
+        "a", "an", "the", "no", "not", "some", "any", "many", "much", "more", "less", "few", "several", "enough", "every", "each", "all",
+        "my", "your", "his", "her", "its", "our", "their", "this", "that", "these", "those", "to", "one", "two", "three", "lots", "plenty",
+    ];
+    let w = word.to_lowercase();
+    STARTERS.contains(&w.trim_end_matches(|c: char| !c.is_alphanumeric())) || w.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Flip the first auxiliary verb after the subject: "Prices will rise" ->
+/// "Prices will not rise", "X isn't Y" -> "X is Y". None when the claim has
+/// no such verb (e.g. "Light bends in water") or is a question.
+pub fn negate(claim: &str) -> Option<Negation> {
+    let sentence = as_sentence(claim).replace('’', "'");
+    let words: Vec<&str> = sentence.split_whitespace().collect();
+    let join = |ws: &[&str]| ws.join(" ");
+    for i in 1..words.len().saturating_sub(1) {
+        let w = words[i];
+        let lower = w.to_lowercase();
+        if !lower.chars().all(|c| c.is_alphabetic() || c == '\'') {
+            continue; // punctuation attached: not a verb in the middle of a clause
+        }
+        let (stated, flipped, rest_from) = if let Some(&(_, base)) = CONTRACTIONS.iter().find(|(c, _)| *c == lower) {
+            (join(&words[..=i]), format!("{} {base}", join(&words[..i])), i + 1)
+        } else if AUXILIARIES.contains(&lower.as_str())
+            || (PERFECT.contains(&lower.as_str()) && !starts_noun_phrase(words[i + 1]))
+        {
+            if words[i + 1].eq_ignore_ascii_case("not") {
+                (join(&words[..=i + 1]), join(&words[..=i]), i + 2)
+            } else {
+                (join(&words[..=i]), format!("{} not", join(&words[..=i])), i + 1)
+            }
+        } else {
+            continue;
+        };
+        let rest = join(&words[rest_from..]);
+        if !rest.chars().any(|c| c.is_alphabetic()) {
+            return None;
+        }
+        return Some(Negation { flipped: format!("{flipped} {rest}"), stated_prefix: stated, flipped_prefix: flipped, rest });
+    }
+    None
+}
+
+/// Evidence, then `text` - as build_prompt, without making `text` a sentence.
+fn evidence_then(text: &str, passages: &[&Hit]) -> String {
+    let mut parts: Vec<String> = passages.iter().rev().map(|h| h.passage.text.clone()).collect();
+    parts.push(text.to_string());
+    parts.join("\n\n")
+}
+
+pub fn negation_test(brain: &Brain, neg: &Negation, passages: &[&Hit], settings: &Settings, mut rng: Option<&mut Rng>) -> NegationTest {
+    let rest = vec![format!(" {}", neg.rest)];
+    let stated = brain.score(&evidence_then(&neg.stated_prefix, passages), &rest, rng.as_deref_mut())[0];
+    let flipped = brain.score(&evidence_then(&neg.flipped_prefix, passages), &rest, rng)[0];
+    let contrast = stated - flipped;
+    NegationTest {
+        flipped: neg.flipped.clone(),
+        stated_logp: (stated * 1000.0).round() / 1000.0,
+        flipped_logp: (flipped * 1000.0).round() / 1000.0,
+        contrast: (contrast * 1000.0).round() / 1000.0,
+        confidence: confidence_from_signal(contrast.abs(), settings),
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Judgement {
     pub verdict: String,
@@ -114,6 +218,8 @@ pub struct Evaluation {
     pub familiarity: Familiarity,
     pub panel: Vec<PersonaResult>,
     pub judge: Judgement,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negation_test: Option<NegationTest>,
     pub overall_confidence: Confidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consistency: Option<Consistency>,
@@ -226,6 +332,7 @@ impl<'a> Scorer<'a> {
 
 pub struct Pass {
     pub panel: Vec<PersonaResult>,
+    pub negation: Option<NegationTest>,
     pub judge: Judgement,
 }
 
@@ -289,19 +396,23 @@ pub fn run_council(
             confidence_before_cap: (confidence != own).then_some(own),
         });
     }
+    let negation = negate(claim).map(|n| negation_test(brain, &n, &refs, settings, rng_opt(&mut score_rng).as_mut()));
     let own_words = speak(brain, &full_prompt, &judge_persona, settings, &mut gen_rng);
-    let judge = judge(&panel, familiarity, settings, own_words);
-    Ok(Pass { panel, judge })
+    let judge = judge(&panel, negation.as_ref(), familiarity, settings, own_words);
+    Ok(Pass { panel, negation, judge })
 }
 
-/// The Judge: stance from the margin between the sides, confidence never
-/// above the weakest input relied on nor above what familiarity allows.
-pub fn judge(panel: &[PersonaResult], familiarity: &Familiarity, settings: &Settings, own_words: String) -> Judgement {
+/// The Judge: stance from the margin between the sides (blended with the
+/// negation test when the claim has one), confidence never above the
+/// weakest input relied on nor above what familiarity allows.
+pub fn judge(panel: &[PersonaResult], negation: Option<&NegationTest>, familiarity: &Familiarity, settings: &Settings, own_words: String) -> Judgement {
     let get = |n: &str| panel.iter().find(|p| p.persona == n);
     let (believer, skeptic) = (get("believer").expect("believer"), get("skeptic").expect("skeptic"));
     let investor = get("investor");
     let truth_margin = believer.signal - skeptic.signal;
-    let margin = match investor { Some(i) => (truth_margin + i.signal) / 2.0, None => truth_margin };
+    let panel_margin = match investor { Some(i) => (truth_margin + i.signal) / 2.0, None => truth_margin };
+    let w = settings.council.negation_weight.clamp(0.0, 1.0);
+    let margin = match negation { Some(n) => (1.0 - w) * panel_margin + w * n.contrast, None => panel_margin };
     let mm = settings.council.mixed_margin;
     let (stance, mut relied_on) = if margin > mm {
         (Stance::Yes, vec!["believer".to_string()])
@@ -315,10 +426,15 @@ pub fn judge(panel: &[PersonaResult], familiarity: &Familiarity, settings: &Sett
             relied_on.push("investor".into());
         }
     }
+    let negation_agrees = negation.filter(|n| stance != Stance::Mixed && w > 0.0 && (n.contrast > 0.0) == (stance == Stance::Yes));
+    if negation_agrees.is_some() {
+        relied_on.push("negation test".into());
+    }
     let own = confidence_from_signal(margin.abs(), settings);
     let confidence = relied_on
         .iter()
         .filter_map(|n| get(n).map(|p| p.confidence))
+        .chain(negation_agrees.map(|n| n.confidence))
         .fold(own.min(familiarity.cap), Confidence::min);
 
     let mut reasoning = format!(
@@ -326,7 +442,10 @@ pub fn judge(panel: &[PersonaResult], familiarity: &Familiarity, settings: &Sett
         believer.signal, skeptic.signal
     );
     if let Some(i) = investor {
-        reasoning += &format!(" Investor {:+.2}; combined margin {margin:+.2}.", i.signal);
+        reasoning += &format!(" Investor {:+.2}; panel margin {panel_margin:+.2}.", i.signal);
+    }
+    if let Some(n) = negation {
+        reasoning += &format!(" Negation test {:+.2} (the claim as stated vs. \"{}\"); combined margin {margin:+.2}.", n.contrast, n.flipped);
     }
     let mut unresolved = Vec::new();
     if stance == Stance::Mixed {
@@ -416,6 +535,7 @@ pub fn evaluate(brain: &Brain, claim: &str, settings: &Settings, opts: &Options,
         familiarity,
         panel: first.panel,
         judge: first.judge,
+        negation_test: first.negation,
         overall_confidence: overall,
         consistency,
         confidence_note: note,
@@ -452,12 +572,61 @@ mod tests {
     }
 
     #[test]
+    fn negations() {
+        let n = |c: &str| negate(c).map(|n| (n.stated_prefix, n.flipped_prefix, n.rest));
+        let t = |a: &str, b: &str, c: &str| Some((a.to_string(), b.to_string(), c.to_string()));
+        assert_eq!(n("Light is refracted in glass"), t("Light is", "Light is not", "refracted in glass."));
+        assert_eq!(n("Raising prices will reduce demand."), t("Raising prices will", "Raising prices will not", "reduce demand."));
+        assert_eq!(n("Heavy objects do not fall faster"), t("Heavy objects do not", "Heavy objects do", "fall faster."));
+        assert_eq!(n("We can't win this market"), t("We can't", "We can", "win this market."));
+        assert_eq!(n("The firm has grown quickly"), t("The firm has", "The firm has not", "grown quickly."));
+        assert_eq!(negate("It isn’t cheap").unwrap().flipped, "It is cheap.");
+        assert_eq!(n("I have a dog"), None); // "have" as a main verb
+        assert_eq!(n("They had to leave"), None);
+        assert_eq!(n("Prices have fallen"), t("Prices have", "Prices have not", "fallen."));
+        assert_eq!(n("Light bends in water"), None); // no auxiliary: no reliable flip
+        assert_eq!(n("Is light fast?"), None);
+        assert_eq!(n("Yes it is"), None);
+    }
+
+    fn negation(contrast: f32, confidence: Confidence) -> NegationTest {
+        NegationTest { flipped: "x is not y".into(), stated_logp: 0.0, flipped_logp: -contrast, contrast, confidence }
+    }
+
+    #[test]
+    fn the_negation_test_moves_and_caps_the_verdict() {
+        let (_t, s) = settings();
+        let panel = [member("believer", 0.2, Confidence::Medium), member("skeptic", 0.1, Confidence::High)];
+        // the panel alone is undecided (margin 0.1); a clear negation test decides it
+        assert_eq!(judge(&panel, None, &familiar(), &s, String::new()).stance, Stance::Mixed);
+        let yes = judge(&panel, Some(&negation(0.9, Confidence::High)), &familiar(), &s, String::new());
+        assert_eq!(yes.stance, Stance::Yes);
+        assert!(yes.relied_on.contains(&"negation test".to_string()) && yes.reasoning.contains("x is not y"));
+        assert_eq!(yes.confidence, Confidence::Medium); // capped by the believer it also relies on
+        let no = judge(&panel, Some(&negation(-0.9, Confidence::High)), &familiar(), &s, String::new());
+        assert_eq!(no.stance, Stance::No);
+        let mut off = s.clone();
+        off.council.negation_weight = 0.0;
+        assert_eq!(judge(&panel, Some(&negation(-0.9, Confidence::High)), &familiar(), &off, String::new()).stance, Stance::Mixed);
+    }
+
+    #[test]
+    fn a_trained_model_prefers_what_it_read_to_its_negation() {
+        let (_tmp, s) = trained(150);
+        let brain = Brain::load(&s).unwrap();
+        let read = negation_test(&brain, &negate("Light is refracted when it passes from air into glass").unwrap(), &[], &s, None);
+        assert!(read.contrast > 0.0, "{read:?}");
+        let flipped = negation_test(&brain, &negate("Light is not refracted when it passes from air into glass").unwrap(), &[], &s, None);
+        assert!((flipped.contrast + read.contrast).abs() < 1e-3, "{flipped:?} vs {read:?}");
+    }
+
+    #[test]
     fn judge_can_say_no_and_undecided() {
         let (_t, s) = settings();
-        let no = judge(&[member("believer", 0.1, Confidence::High), member("skeptic", 0.9, Confidence::High)], &familiar(), &s, String::new());
+        let no = judge(&[member("believer", 0.1, Confidence::High), member("skeptic", 0.9, Confidence::High)], None, &familiar(), &s, String::new());
         assert_eq!((no.stance, no.confidence, no.relied_on.clone()), (Stance::No, Confidence::High, vec!["skeptic".to_string()]));
         assert!(no.verdict.starts_with("No"));
-        let mixed = judge(&[member("believer", 0.30, Confidence::High), member("skeptic", 0.25, Confidence::High)], &familiar(), &s, String::new());
+        let mixed = judge(&[member("believer", 0.30, Confidence::High), member("skeptic", 0.25, Confidence::High)], None, &familiar(), &s, String::new());
         assert_eq!((mixed.stance, mixed.confidence), (Stance::Mixed, Confidence::Low));
         assert!(mixed.unresolved.is_some());
     }
@@ -465,10 +634,10 @@ mod tests {
     #[test]
     fn judge_is_capped_by_weakest_input_and_familiarity() {
         let (_t, s) = settings();
-        let capped = judge(&[member("believer", 0.9, Confidence::Medium), member("skeptic", 0.0, Confidence::High)], &familiar(), &s, String::new());
+        let capped = judge(&[member("believer", 0.9, Confidence::Medium), member("skeptic", 0.0, Confidence::High)], None, &familiar(), &s, String::new());
         assert_eq!((capped.stance, capped.confidence, capped.confidence_before_cap), (Stance::Yes, Confidence::Medium, Some(Confidence::High)));
         let unfamiliar = Familiarity { cap: Confidence::Low, notes: vec!["the claim is unlike most of what it read".into()], ..familiar() };
-        let low = judge(&[member("believer", 0.9, Confidence::High), member("skeptic", 0.0, Confidence::High)], &unfamiliar, &s, String::new());
+        let low = judge(&[member("believer", 0.9, Confidence::High), member("skeptic", 0.0, Confidence::High)], None, &unfamiliar, &s, String::new());
         assert!(low.confidence == Confidence::Low && low.unresolved.unwrap().contains("unlike"));
     }
 
@@ -476,15 +645,15 @@ mod tests {
     fn investor_moves_the_margin() {
         let (_t, s) = settings();
         let panel = |inv: f32| vec![member("believer", 0.5, Confidence::High), member("skeptic", 0.3, Confidence::High), member("investor", inv, Confidence::High)];
-        assert_eq!(judge(&panel(-1.0), &familiar(), &s, String::new()).stance, Stance::No);
-        let yes = judge(&panel(0.8), &familiar(), &s, String::new());
+        assert_eq!(judge(&panel(-1.0), None, &familiar(), &s, String::new()).stance, Stance::No);
+        let yes = judge(&panel(0.8), None, &familiar(), &s, String::new());
         assert_eq!((yes.stance, yes.relied_on), (Stance::Yes, vec!["believer".to_string(), "investor".to_string()]));
     }
 
     #[test]
     fn consistency_check() {
         let (_t, s) = settings();
-        let a = judge(&[member("believer", 0.9, Confidence::High), member("skeptic", 0.0, Confidence::High)], &familiar(), &s, String::new());
+        let a = judge(&[member("believer", 0.9, Confidence::High), member("skeptic", 0.0, Confidence::High)], None, &familiar(), &s, String::new());
         let mut b = a.clone();
         assert!(compare_verdicts(&a, &b).is_empty());
         b.stance = Stance::No;

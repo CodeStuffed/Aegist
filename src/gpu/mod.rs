@@ -50,13 +50,14 @@ pub enum Kernel {
     Sumsq,
     Scale,
     Adamw,
+    ToBf16,
 }
 
 impl Kernel {
-    pub const ALL: [Kernel; 16] = [
+    pub const ALL: [Kernel; 17] = [
         Kernel::EmbedFwd, Kernel::EmbedBwd, Kernel::RmsnormFwd, Kernel::RmsnormBwdDx, Kernel::RmsnormBwdDg, Kernel::Rope,
         Kernel::CausalSoftmax, Kernel::SoftmaxBwd, Kernel::SwigluFwd, Kernel::SwigluBwd, Kernel::Residual, Kernel::MaskMul,
-        Kernel::CrossEntropy, Kernel::Sumsq, Kernel::Scale, Kernel::Adamw,
+        Kernel::CrossEntropy, Kernel::Sumsq, Kernel::Scale, Kernel::Adamw, Kernel::ToBf16,
     ];
 
     pub fn name(self) -> &'static str {
@@ -77,6 +78,7 @@ impl Kernel {
             Kernel::Sumsq => "sumsq",
             Kernel::Scale => "scale",
             Kernel::Adamw => "adamw",
+            Kernel::ToBf16 => "to_bf16",
         }
     }
 }
@@ -196,6 +198,12 @@ pub trait Backend {
     /// Launch with `grid` blocks of `block()` threads.
     fn launch(&self, k: Kernel, grid: (u32, u32), args: &[Arg]) -> Result<()>;
     fn gemm(&self, g: &Gemm) -> Result<()>;
+    /// The same with A and B in bfloat16 (C stays f32; fp32 accumulation).
+    fn gemm_bf16(&self, g: &Gemm) -> Result<()>;
+    /// Whether bf16 matrix multiplies run on tensor cores here (Ampere / RTX 30xx and newer).
+    fn supports_bf16(&self) -> bool {
+        true
+    }
     fn sync(&self) -> Result<()>;
     /// (free, total) device memory in bytes.
     fn memory(&self) -> Result<(u64, u64)>;
@@ -235,6 +243,12 @@ impl<T: Backend + ?Sized> Backend for &T {
     fn gemm(&self, g: &Gemm) -> Result<()> {
         (**self).gemm(g)
     }
+    fn gemm_bf16(&self, g: &Gemm) -> Result<()> {
+        (**self).gemm_bf16(g)
+    }
+    fn supports_bf16(&self) -> bool {
+        (**self).supports_bf16()
+    }
     fn sync(&self) -> Result<()> {
         (**self).sync()
     }
@@ -261,8 +275,9 @@ fn u32_bytes(v: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-/// Device memory for training `cfg` with micro-batches of `seqs` sequences.
-pub fn training_bytes(cfg: &ModelConfig, seqs: usize) -> u64 {
+/// Device memory for training `cfg` with micro-batches of `seqs` sequences
+/// (bf16: plus the bf16 copy of the weights and conversion scratch).
+pub fn training_bytes(cfg: &ModelConfig, seqs: usize, bf16: bool) -> u64 {
     let (c, h, v, l, nh, t) = (cfg.d_model, cfg.mlp_hidden, cfg.vocab_size, cfg.n_layer, cfg.n_head, cfg.block_size);
     let n = seqs * t;
     let params = Layout::new(cfg).total;
@@ -274,15 +289,16 @@ pub fn training_bytes(cfg: &ModelConfig, seqs: usize) -> u64 {
         + n * v                                   // logits
         + t * c                                   // rotary tables
         + 2 * n + 2 * 4096;                       // tokens, targets, reduction scratch
-    4 * floats as u64
+    let halves = if bf16 { params + n * v.max(3 * c).max(2 * h) + n * (3 * c).max(2 * h) } else { 0 };
+    4 * floats as u64 + 2 * halves as u64
 }
 
 /// Memory the CUDA context, cuBLAS and fragmentation take besides our buffers.
 pub const OVERHEAD_BYTES: u64 = 700 << 20;
 
 /// Most sequences per micro-batch that fit in `free` bytes (at most `max`).
-pub fn micro_batch_for(cfg: &ModelConfig, free: u64, max: usize) -> Option<usize> {
-    (1..=max.max(1)).rev().find(|&s| training_bytes(cfg, s) + OVERHEAD_BYTES <= free)
+pub fn micro_batch_for(cfg: &ModelConfig, free: u64, max: usize, bf16: bool) -> Option<usize> {
+    (1..=max.max(1)).rev().find(|&s| training_bytes(cfg, s, bf16) + OVERHEAD_BYTES <= free)
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +321,11 @@ pub struct GpuTrainer<B: Backend> {
     n_params: usize,
     /// sequences per micro-batch
     pub seqs: usize,
+    /// matrix multiplies in bf16 (else TF32/fp32)
+    pub bf16: bool,
+    params16: DevPtr,
+    s16a: DevPtr,
+    s16b: DevPtr,
     pub adam_t: u64,
     segments: Vec<(usize, usize, bool)>,
     weight_decay: f32,
@@ -356,7 +377,7 @@ const PARTIALS: usize = 1024;
 impl<B: Backend> GpuTrainer<B> {
     /// Put `model` (and the optimizer's state) on the device, with room for
     /// micro-batches of `seqs` sequences.
-    pub fn new(be: B, model: &Model, opt: &AdamW, seqs: usize) -> Result<Self> {
+    pub fn new(be: B, model: &Model, opt: &AdamW, seqs: usize, bf16: bool) -> Result<Self> {
         let cfg = model.cfg.clone();
         let layout = Layout::new(&cfg);
         let (c, h, v, l, nh, t) = (cfg.d_model, cfg.mlp_hidden, cfg.vocab_size, cfg.n_layer, cfg.n_head, cfg.block_size);
@@ -390,12 +411,22 @@ impl<B: Backend> GpuTrainer<B> {
         let dab = buf(n * 2 * h)?;
         let dhg = buf(n * h)?;
         let partial = buf(2 * PARTIALS)?; // doubles
+        // bf16 halves: two per f32-sized slot
+        let (params16, s16a, s16b) = if bf16 {
+            (buf(np.div_ceil(2))?.ptr, buf((n * v.max(3 * c).max(2 * h)).div_ceil(2))?.ptr, buf((n * (3 * c).max(2 * h)).div_ceil(2))?.ptr)
+        } else {
+            (0, 0, 0)
+        };
         let g = GpuTrainer {
             be,
             cfg: cfg.clone(),
             layout,
             n_params: np,
             seqs,
+            bf16,
+            params16,
+            s16a,
+            s16b,
             adam_t: opt.t,
             segments: opt.segments().to_vec(),
             weight_decay: opt.weight_decay(),
@@ -439,6 +470,7 @@ impl<B: Backend> GpuTrainer<B> {
         let (cs, sn) = rope.tables();
         g.be.upload(g.cos.ptr, f32_bytes(cs))?;
         g.be.upload(g.sin.ptr, f32_bytes(sn))?;
+        g.refresh_bf16()?;
         Ok(g)
     }
 
@@ -454,10 +486,31 @@ impl<B: Backend> GpuTrainer<B> {
         self.grads.at(off)
     }
 
-    /// c (m x n) [+]= op(a) . op(b), dense row-major, as kernels::matmul.
+    /// The bf16 copy of the weights, after they change.
+    fn refresh_bf16(&self) -> Result<()> {
+        if self.bf16 {
+            let n = self.n_params;
+            self.launch(Kernel::ToBf16, self.grid_for(n), &[Arg::Ptr(self.params16), Arg::Ptr(self.params.ptr), Arg::I64(n as i64)])?;
+        }
+        Ok(())
+    }
+
+    /// A bf16 version of `count` floats at `p`: the weights' copy, or converted into `scratch`.
+    fn half(&self, p: DevPtr, count: usize, scratch: DevPtr) -> Result<DevPtr> {
+        let base = self.params.ptr;
+        if p >= base && p < base + 4 * self.n_params as u64 {
+            return Ok(self.params16 + (p - base) / 2);
+        }
+        self.launch(Kernel::ToBf16, self.grid_for(count), &[Arg::Ptr(scratch), Arg::Ptr(p), Arg::I64(count as i64)])?;
+        Ok(scratch)
+    }
+
+    /// c (m x n) [+]= op(a) . op(b), dense row-major, as kernels::matmul
+    /// (in bf16 with fp32 accumulation when enabled).
     #[allow(clippy::too_many_arguments)]
     fn mm(&self, c: DevPtr, a: DevPtr, b: DevPtr, m: usize, k: usize, n: usize, ta: bool, tb: bool, acc: bool) -> Result<()> {
-        self.be.gemm(&Gemm {
+        let (a, b) = if self.bf16 { (self.half(a, m * k, self.s16a)?, self.half(b, k * n, self.s16b)?) } else { (a, b) };
+        let g = Gemm {
             m, n, k,
             alpha: 1.0,
             a, lda: if ta { m } else { k }, stride_a: 0, ta,
@@ -465,7 +518,8 @@ impl<B: Backend> GpuTrainer<B> {
             beta: if acc { 1.0 } else { 0.0 },
             c, ldc: n, stride_c: 0,
             batch: 1,
-        })
+        };
+        if self.bf16 { self.be.gemm_bf16(&g) } else { self.be.gemm(&g) }
     }
 
     fn launch(&self, k: Kernel, grid: (u32, u32), args: &[Arg]) -> Result<()> {
@@ -721,7 +775,7 @@ impl<B: Backend> GpuTrainer<B> {
                 Arg::F32(lr), Arg::F32(b1), Arg::F32(b2), Arg::F32(c1), Arg::F32(c2), Arg::F32(eps), Arg::F32(wd),
             ])?;
         }
-        Ok(())
+        self.refresh_bf16()
     }
 
     /// Copy weights and optimizer state back (for checkpoints).
@@ -755,7 +809,27 @@ pub struct CheckReport {
     pub worst_grad: (String, f64),
     /// relative error of the weights after one AdamW step from those gradients
     pub step_error: f64,
+    /// the same gradients with bf16 matrix multiplies: worst relative error
+    /// (bf16 keeps ~3 significant digits, so this is looser), if supported
+    pub bf16_grad: Option<(String, f64)>,
     pub passed: bool,
+}
+
+/// Worst per-tensor relative error of `got` against `want` gradients.
+fn worst_part(cfg: &ModelConfig, lay: &Layout, got: &[f32], want: &[f32]) -> (String, f64) {
+    let mut parts: Vec<(String, usize, usize)> = vec![("embedding".into(), lay.wte, cfg.vocab_size * cfg.d_model)];
+    for (i, la) in lay.layers.iter().enumerate() {
+        let (c, h) = (cfg.d_model, cfg.mlp_hidden);
+        for (name, off, len) in [("norm1", la.rms1, c), ("qkv", la.wqkv, 3 * c * c), ("out", la.wo, c * c), ("norm2", la.rms2, c), ("mlp_in", la.w13, 2 * c * h), ("mlp_out", la.w2, h * c)] {
+            parts.push((format!("layer {i} {name}"), off, len));
+        }
+    }
+    parts.push(("final norm".into(), lay.rmsf, cfg.d_model));
+    parts
+        .iter()
+        .map(|(name, off, len)| (name.clone(), rel_err(&got[*off..off + len], &want[*off..off + len])))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap()
 }
 
 /// Relative L2 error of `got` against `want`.
@@ -792,24 +866,22 @@ pub fn self_check<B: Backend>(be: B) -> Result<CheckReport> {
     let loss_cpu = model.forward_backward(&mut acts, &mut grads, &tokens, &targets, None);
     let mut opt = AdamW::new(model.num_params(), &model.layout.matrices, 0.1);
 
-    // GPU: the same, as two micro-batches
-    let mut g = GpuTrainer::new(be, &model, &opt, seqs)?;
+    // bf16, if supported: on normally initialised weights (as training
+    // uses) - the enlarged ones above make attention nearly one-hot, which
+    // magnifies bf16's rounding far beyond what training sees
+    let bf16_grad = if be.supports_bf16() {
+        let plain = Model::new(cfg.clone(), 7);
+        let mut want = vec![0f32; plain.num_params()];
+        plain.forward_backward(&mut acts, &mut want, &tokens, &targets, None);
+        let g16 = GpuTrainer::new(&be, &plain, &opt, seqs, true)?;
+        g16.forward_backward(&tokens, &targets, None)?;
+        Some(worst_part(&cfg, &plain.layout, &g16.download_grads()?, &want))
+    } else {
+        None
+    };
+    let mut g = GpuTrainer::new(be, &model, &opt, seqs, false)?;
     let loss_gpu = g.forward_backward(&tokens, &targets, None)?;
-    let gpu_grads = g.download_grads()?;
-    let lay = &model.layout;
-    let mut parts: Vec<(String, usize, usize)> = vec![("embedding".into(), lay.wte, cfg.vocab_size * cfg.d_model)];
-    for (i, la) in lay.layers.iter().enumerate() {
-        let (c, h) = (cfg.d_model, cfg.mlp_hidden);
-        for (name, off, len) in [("norm1", la.rms1, c), ("qkv", la.wqkv, 3 * c * c), ("out", la.wo, c * c), ("norm2", la.rms2, c), ("mlp_in", la.w13, 2 * c * h), ("mlp_out", la.w2, h * c)] {
-            parts.push((format!("layer {i} {name}"), off, len));
-        }
-    }
-    parts.push(("final norm".into(), lay.rmsf, cfg.d_model));
-    let worst_grad = parts
-        .iter()
-        .map(|(name, off, len)| (name.clone(), rel_err(&gpu_grads[*off..off + len], &grads[*off..off + len])))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .unwrap();
+    let worst_grad = worst_part(&cfg, &model.layout, &g.download_grads()?, &grads);
 
     crate::optim::clip_grad_norm(&mut grads, 1.0);
     g.clip(1.0)?;
@@ -817,12 +889,15 @@ pub fn self_check<B: Backend>(be: B) -> Result<CheckReport> {
     g.adamw(1e-3)?;
     let step_error = rel_err(&g.download_params()?, &model.params);
     g.backend().set_tf32(true)?;
-    let passed = ((loss_gpu - loss_cpu) / loss_cpu).abs() < 1e-4 && worst_grad.1 < 1e-3 && step_error < 1e-5;
-    Ok(CheckReport { loss_cpu, loss_gpu, worst_grad, step_error, passed })
+    let passed = ((loss_gpu - loss_cpu) / loss_cpu).abs() < 1e-4
+        && worst_grad.1 < 1e-3
+        && step_error < 1e-5
+        && bf16_grad.as_ref().is_none_or(|b| b.1 < 5e-2);
+    Ok(CheckReport { loss_cpu, loss_gpu, worst_grad, step_error, bf16_grad, passed })
 }
 
-/// Sustained TF32 matrix-multiply speed, in FLOP/s.
-pub fn gemm_flops<B: Backend>(be: &B) -> Result<f64> {
+/// Sustained matrix-multiply speed (TF32, or bf16 inputs), in FLOP/s.
+pub fn gemm_flops<B: Backend>(be: &B, bf16: bool) -> Result<f64> {
     be.set_tf32(true)?;
     let n = 4096;
     let bytes = 4 * n * n;
@@ -832,12 +907,13 @@ pub fn gemm_flops<B: Backend>(be: &B) -> Result<f64> {
             be.zero(p, bytes)?;
         }
         let g = Gemm { m: n, n, k: n, alpha: 1.0, a, lda: n, stride_a: 0, ta: false, b, ldb: n, stride_b: 0, tb: false, beta: 0.0, c, ldc: n, stride_c: 0, batch: 1 };
-        be.gemm(&g)?;
+        let run = |g: &Gemm| if bf16 { be.gemm_bf16(g) } else { be.gemm(g) };
+        run(&g)?;
         be.sync()?;
         let start = std::time::Instant::now();
         let reps = 20;
         for _ in 0..reps {
-            be.gemm(&g)?;
+            run(&g)?;
         }
         be.sync()?;
         Ok(reps as f64 * 2.0 * (n * n * n) as f64 / start.elapsed().as_secs_f64())
@@ -904,9 +980,10 @@ mod tests {
     fn micro_batches_fit_the_memory() {
         let cfg = ModelConfig { vocab_size: 32768, block_size: 1024, n_layer: 24, n_head: 16, d_model: 1024, mlp_hidden: 2752, dropout: 0.1, rope_base: 1e4 };
         let gb = |x: f64| (x * (1u64 << 30) as f64) as u64;
-        let s = micro_batch_for(&cfg, gb(15.0), 64).unwrap();
+        let s = micro_batch_for(&cfg, gb(15.0), 64, false).unwrap();
         assert!((8..=24).contains(&s), "{s} sequences");
-        assert!(training_bytes(&cfg, s) + OVERHEAD_BYTES <= gb(15.0));
-        assert!(micro_batch_for(&cfg, gb(4.0), 64).is_none());
+        assert!(training_bytes(&cfg, s, false) + OVERHEAD_BYTES <= gb(15.0));
+        assert!(micro_batch_for(&cfg, gb(15.0), 64, true).unwrap() < s); // bf16 copies take room
+        assert!(micro_batch_for(&cfg, gb(4.0), 64, false).is_none());
     }
 }

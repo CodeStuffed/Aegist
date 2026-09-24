@@ -53,6 +53,10 @@ council:
   # Claims unlike anything it has read can't get high confidence.
   familiarity: {medium_above: 1.25, low_above: 1.5}
   min_tokens_trained: 2000000  # below this, everything is capped at Low
+  # The negation test: with the evidence in front, is the rest of the claim
+  # more likely after its verb as stated ("X is") or flipped ("X is not")?
+  # This is the share of the Judge's margin it provides (0 = off).
+  negation_weight: 0.5
 
 router:
   money_keywords: [price, pricing, prices, revenue, profit, profitable, margin, margins,
@@ -78,6 +82,9 @@ gpu:
   # HOW_TO_RUN.md). auto: use it if one works - a self-check against the CPU
   # runs first - else the CPU. `council train --device cpu|gpu` overrides this.
   device: auto
+  # Matrix multiplies: bf16 (tensor cores, fp32 accumulation - about twice
+  # tf32's speed), or tf32. auto = bf16 where the GPU supports it (RTX 30xx+).
+  precision: auto
   tokens_per_step: 131072    # batch per step on the GPU (split into micro-batches that fit its memory)
   learning_rate: 0.0006      # peak, for the bigger models a GPU trains
   warmup_steps: 500
