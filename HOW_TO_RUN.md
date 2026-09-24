@@ -2,206 +2,170 @@
 
 ## What kind of program is this?
 
-It's a **terminal (command-line) program**. It's not a website or an app with
-buttons: you type a command, press Enter, and it prints the answer as text.
+It's a **terminal (command-line) program** called `council`. It's not a
+website or an app with buttons: you type a command, press Enter, and it
+prints the answer as text.
 
 You can run it from any terminal:
 
 - **VS Code** (easiest if you already use it): open the project folder, then
-  **Terminal → New Terminal** from the top menu. A terminal opens at the bottom
-  of the window, already inside the project folder.
+  **Terminal → New Terminal** from the top menu. A terminal opens at the
+  bottom of the window.
 - **macOS**: the Terminal app.
 - **Windows**: PowerShell or Windows Terminal.
 - **Linux**: any terminal.
 
 Everything runs on your own computer. No internet is needed, except for
-`research`, which reads Wikipedia.
+`research`, which reads Wikipedia. It's written in Rust and uses every core
+of your processor, with SIMD (AVX2 / AVX-512 / NEON) where the CPU has it.
+
+There are two ways to get it. **Option A** needs no setup. **Option B**
+builds it from the source code.
 
 ---
 
-## One-time setup
+## Option A: download the ready-made program
 
-### 1. Install Python 3.11 or newer
+1. On the project's GitHub page, open **Releases** (right-hand side) and
+   download the file for your system:
 
-Check what you have:
+   | System | File |
+   |---|---|
+   | Windows | `council-windows-x86_64.exe` |
+   | Mac (Apple Silicon) | `council-macos-arm64` |
+   | Linux | `council-linux-x86_64` |
+
+2. Rename it to `council` (`council.exe` on Windows) and put it in a folder
+   of its own.
+3. Open a terminal in that folder and run:
+
+   ```bash
+   ./council doctor           # macOS / Linux
+   .\council.exe doctor       # Windows
+   ```
+
+   - **macOS / Linux:** first make it runnable with `chmod +x council`.
+   - **macOS:** if it says the developer can't be verified, run
+     `xattr -d com.apple.quarantine council` once. Or right-click the file
+     in Finder, choose **Open**, then confirm.
+
+Run this way, it keeps its settings in `~/.council/config/` and everything it
+learns in `~/.council/data/`. They're created on first run, and `doctor`
+shows the exact paths.
+
+> **No Releases yet?** They're published when the maintainer pushes a
+> version tag (`git tag v0.2.0 && git push origin v0.2.0`). Every push also
+> builds all three programs: GitHub → **Actions** → the latest **CI** run →
+> **Artifacts** at the bottom. Or use Option B.
+
+---
+
+## Option B: build it yourself
+
+### 1. Install Rust (one time)
+
+Go to <https://rustup.rs> and follow the one-line instructions:
+
+- **macOS / Linux:**
+
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+
+  Then close and reopen the terminal.
+- **Windows:** download and run `rustup-init.exe`. When it offers to install
+  the Visual Studio C++ build tools, say yes (Rust needs them to build
+  programs). Then close and reopen the terminal.
+
+Check it worked:
 
 ```bash
-python --version
+cargo --version
 ```
-
-If that says "not found" or shows a version below 3.11, install Python from
-<https://www.python.org/downloads/>. **On Windows, tick "Add python.exe to PATH"**
-during install.
-
-> On some Macs and Linux machines the command is `python3` instead of `python`.
-> If `python` doesn't work, use `python3` everywhere below. On Windows you can
-> also use `py`.
 
 ### 2. Get the code
 
-**Option A: with Git**
+**With Git:**
 
 ```bash
 git clone https://github.com/CodeStuffed/Aegist.git
 cd Aegist
 ```
 
-**Option B: without Git**. On the GitHub page, click the green **Code** button,
-choose **Download ZIP**, unzip it, and open that folder in VS Code (or `cd`
-into it in your terminal).
+**Without Git:** on GitHub click the green **Code** button → **Download
+ZIP**, unzip it, and open the folder in VS Code (or `cd` into it).
 
 > Until pull request #1 is merged, the new code lives on the branch
 > `claude/admiring-keller-bzw2gn`. With Git, run
 > `git checkout claude/admiring-keller-bzw2gn`. Without Git, switch to that
 > branch on GitHub before downloading the ZIP.
 
-### 3. Create a private Python environment and install the pieces it needs
+### 3. Build and install the `council` command
 
-This keeps the project's packages separate from the rest of your computer.
-
-**macOS / Linux:**
+Inside the project folder:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+cargo install --path .
 ```
 
-**Windows (PowerShell):**
+The first build downloads its libraries and compiles with full optimization,
+which takes a few minutes. After that, `council` works in any new terminal.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-> If Windows says running scripts is disabled, run this once and try again:
-> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-
-Once it's activated, your prompt starts with `(.venv)`. **Every time you open a
-new terminal** to use the program, run the activate line again (`source
-.venv/bin/activate` or `.venv\Scripts\Activate.ps1`). VS Code often does this for you.
+(Prefer not to install it? `cargo build --release` builds it in place. Then
+run it as `./target/release/council` on macOS/Linux, or
+`.\target\release\council.exe` on Windows.)
 
 ### 4. Check it works
 
 ```bash
-python cli.py doctor
+council doctor
 ```
 
-This shows your computer's RAM and CPU, the model size it picked for your
-machine, and that there's no trained model yet. That's expected.
+It shows your RAM, CPU and SIMD support, the model size it picked for your
+machine, where your settings and data live, and that there's no trained
+model yet. That's expected.
+
+**Run `council` from inside the project folder** to use the project's
+`config/` and `data/` folders. Anywhere else it uses `~/.council/`.
 
 ---
 
 ## The commands
 
-> For every option, annotated example output, and the settings behind each
-> command, see **[COMMANDS.md](COMMANDS.md)**.
+For every option, annotated example output, and the settings behind each
+command, see **[COMMANDS.md](COMMANDS.md)**.
 
-All commands start with `python cli.py`. Add `--help` to any of them to see its
-options, for example `python cli.py train --help`.
+| Command | What it does |
+|---|---|
+| `council doctor` | Status: hardware, model, how much it has learned. |
+| `council train --data <folder> --hours 2` | Teach the model from your `.txt` / `.md` files. |
+| `council research --hours 4` | Let it read Wikipedia and train itself on what it finds. |
+| `council ask "<claim>"` | Put a claim in front of the council. |
 
-### `doctor`: check status
-
-```bash
-python cli.py doctor
-```
-
-Shows your hardware and model size, how much text it has, how long the model has
-trained, and how many passages are in its knowledge base. Safe to run anytime.
-
-### `train`: teach the model from your text
-
-```bash
-python cli.py train --data "path/to/your/texts" --hours 2
-```
-
-- `--data` is a folder (or a single file) of `.txt` or `.md` files. They're
-  copied into the project, so you only need `--data` once per folder.
-- `--hours` is how long to train. Default 1. Decimals work (`--hours 0.5`).
-- `--steps 500` trains for a fixed number of steps instead of a set time.
-- Leave `--data` off to keep training on the text it already has:
-  `python cli.py train --hours 3`.
-- **Ctrl+C** stops early. Progress is saved; nothing is lost.
-
-It needs **at least 200 KB of text** to start a model, and works much better
-with several MB. Good sources: books from <https://www.gutenberg.org> (download
-the "Plain Text UTF-8" version), articles, your own notes. Or skip this and use
-`research` below.
-
-While it trains you'll see lines like:
-
-```
-step    420 | loss 4.005 | held-out 4.782 | 3,500 tok/s | lr 9.3e-04
-```
-
-**Lower numbers mean it's learning.** "held-out" is the one that matters: it's
-measured on text the model hasn't trained on. If "loss" keeps falling but
-"held-out" stops falling, the model is memorizing your text. Give it more text.
-
-### `ask`: put a claim in front of the council
-
-```bash
-python cli.py ask "We should switch to usage-based pricing"
-```
-
-Put the claim in quotes. You get:
-
-- **Believer / Skeptic** (plus **Investor** if the claim is about money): each
-  one's signal, confidence, a position written by the model, and any stored
-  passages that pushed it toward its side.
-- **Judge**: Yes / No / Undecided, why, and how confident it is.
-- **Repeat run**: it answers a second time with some randomness switched on.
-  If the two answers disagree, it says so and drops to Low confidence.
-- **OVERALL CONFIDENCE** at the bottom.
-
-Options:
-
-- `--no-recheck` skips the repeat run (faster, less careful).
-- `--json` prints the full raw result, for use by other programs.
-
-A new or lightly trained model answers **Low** to almost everything. That's
-deliberate: it won't pretend to know things it hasn't learned.
-
-### `research`: let it read Wikipedia and train itself
-
-```bash
-python cli.py research --hours 4
-```
-
-It repeats this until time runs out:
-
-1. picks a topic (from `seed_topics` in `config/settings.yaml`, plus words
-   that keep coming up in your `ask` questions),
-2. reads a couple of Wikipedia articles about it,
-3. saves them to its knowledge base and training text,
-4. trains on everything it has, until it's time for the next topic.
-
-It fetches at most 6 topics an hour, to be polite to Wikipedia. It needs internet.
-**Ctrl+C** stops it anytime; everything is saved. It's fine to leave it running
-overnight (`--hours 8`).
-
----
+**Ctrl+C** stops `train` or `research` at any time. It saves first, so nothing is lost.
 
 ## A good first session
 
 ```bash
-python cli.py doctor
-python cli.py research --hours 2        # or: python cli.py train --data my_texts --hours 2
-python cli.py doctor                    # see how much it learned
-python cli.py ask "Raising prices will reduce the number of customers"
+council doctor
+council research --hours 2        # or: council train --data my_texts --hours 2
+council doctor                    # see how much it learned
+council ask "Raising prices will reduce the number of customers"
 ```
 
-Then keep feeding it: more `research` or `train` time makes it better.
-
----
+Then keep feeding it: more `research` or `train` time makes it better. It
+needs **at least 200 KB of text** to start a model, and works much better
+with several MB. Good sources: books from <https://www.gutenberg.org> (the
+"Plain Text UTF-8" version), articles, your own notes.
 
 ## Where things are stored
 
-Everything it learns lives in the `data/` folder inside the project:
+`council doctor` prints both locations under **Files**.
 
 | Folder / file | What it is |
 |---|---|
+| `config/settings.yaml` | every setting: model sizes, thresholds, research topics |
+| `config/personas/*.yaml` | what each persona writes and listens for |
 | `data/corpus/` | all the text it trains on (yours plus Wikipedia) |
 | `data/brain/` | the trained model itself |
 | `data/knowledge_base/` | passages it can look up when answering |
@@ -210,36 +174,27 @@ Everything it learns lives in the `data/` folder inside the project:
 - **Start the model over** (for example after changing its size): delete `data/brain/`.
 - **Start everything over**: delete the whole `data/` folder.
 
-Settings (model size, thresholds, research topics) are in
-`config/settings.yaml`. It's a plain text file you can edit in VS Code.
-
----
-
 ## If something goes wrong
 
 | You see | What to do |
 |---|---|
-| `python: command not found` | Use `python3` (Mac/Linux) or `py` (Windows), or install Python (step 1). |
-| `No module named numpy` (or another module) | Activate the environment (step 3), then `pip install -r requirements.txt`. |
-| `No trained model ...` | Train first: `python cli.py train --data <folder> --hours 1` or `python cli.py research --hours 1`. |
+| `council: command not found` | Open a new terminal after installing. Or run it as `./target/release/council` (Option B) or `./council` (Option A). |
+| Windows: `linker 'link.exe' not found` | Install the Visual Studio C++ build tools (rerun `rustup-init.exe` and accept them). |
+| macOS: "cannot be opened because the developer cannot be verified" | `xattr -d com.apple.quarantine council`, or right-click → Open. |
+| `No trained model ...` | Train first: `council train --data <folder> --hours 1` or `council research --hours 1`. |
 | `Only 12 KB of text so far ...` | Give it more text (at least 200 KB), or run `research` longer. |
+| `... made by an older version ...` | Your model came from the old Python version. Delete `data/brain/` and train again; your text and knowledge base are kept. |
 | `Couldn't fetch '...' from Wikipedia` | Check your internet connection. It keeps training and retries later. |
-| Training is slow | Normal: it runs on your CPU. Close heavy programs, or pick a smaller tier in `config/settings.yaml`. |
+| Training is slower than expected | It runs on your CPU. Close heavy programs, or choose a smaller tier in `config/settings.yaml`. |
 | The written positions are nonsense | Normal for a small model early on. Judge it by the signals and confidence, and give it more text and training time. |
 
 ## For developers
 
-Run the tests (takes about 30 seconds, no internet needed):
-
 ```bash
-python -m pytest
+cargo test                                  # the whole test suite, no internet needed
+cargo run --release --example bench         # training speed on this machine
+council ask --json "..."                    # machine-readable output for other programs
 ```
 
-Use it from other Python code instead of the terminal:
-
-```python
-from engine.orchestrator import evaluate
-
-result = evaluate("We should switch to usage-based pricing")
-print(result["judge"]["verdict"], result["overall_confidence"])
-```
+The council is also a Rust library: `council::council::evaluate(&brain, claim,
+&settings, &options, &mut log)` is the same function `council ask` uses.

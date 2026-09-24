@@ -1,14 +1,11 @@
 # Command reference
 
 The full guide to every command: what it does, every option, what the output
-means, and the settings that change it. For first-time setup (installing
-Python, VS Code, the virtual environment), see [HOW_TO_RUN.md](HOW_TO_RUN.md).
-
-Every command is typed in a terminal, inside the project folder, with the
-environment activated:
+means, and the settings that change it. For setup (downloading or building
+`council`, using VS Code's terminal), see [HOW_TO_RUN.md](HOW_TO_RUN.md).
 
 ```bash
-python cli.py <command> [options]
+council <command> [options]
 ```
 
 | Command | In one line | Needs a trained model? | Needs internet? |
@@ -18,8 +15,13 @@ python cli.py <command> [options]
 | [`research`](#research) | Read Wikipedia and train itself | No (creates one) | Yes |
 | [`ask`](#ask) | Put a claim in front of the council | **Yes** | No |
 
-`python cli.py --help` lists the commands; `python cli.py <command> --help`
-lists one command's options.
+- `council --help` lists the commands; `council <command> --help` lists one
+  command's options.
+- `council --version` prints the version.
+- The global option `--threads N` sets how many CPU threads to use. The
+  default is every core for `train`/`research`, and up to 4 for `ask`, so
+  asking stays quick while a training run is going. You can also set it
+  with the `COUNCIL_THREADS` environment variable.
 
 ---
 
@@ -29,23 +31,24 @@ lists one command's options.
 whenever you're curious.**
 
 ```bash
-python cli.py doctor
+council doctor
 ```
 
-No options.
-
-### Example output
+### Example output (illustrative numbers)
 
 ```
+Files
+  Settings   /home/you/Aegist/config/settings.yaml
+  Data       /home/you/Aegist/data
 Hardware
   RAM        15.7 GB
-  CPU cores  4
-  Tier       small -> a new model would be 4 layers x 192 wide, 128-token context
+  CPU        4 cores, 4 threads, AVX-512
+  Tier       small -> a new model would be 6 layers x 256 wide, 256-token context (~5.9M params)
 Corpus
-  1 file(s), 0.6 MB in /home/you/Aegist/data/corpus
+  152 file(s), 11.2 MB in /home/you/Aegist/data/corpus
 Model
-  4x192 transformer, 2.20M params, vocabulary 2048
-  2,289 steps, 4.7M tokens seen, 0.5 h trained, held-out loss 4.544
+  6x256 transformer, 5.87M params, vocabulary 4096
+  4,500 steps, 18.4M tokens seen, 1.2 h trained, held-out loss 3.412 (1.231 bits per byte)
 Memory
   228 passage(s) in the knowledge base
   3 past council session(s)
@@ -55,13 +58,15 @@ Memory
 
 | Line | Meaning |
 |---|---|
-| **Tier** | The model size your RAM supports: tiny, small, medium or large. It only applies when a **new** model is created; an existing model keeps its size. |
+| **Settings / Data** | Where your settings file and everything it has learned are stored. |
+| **CPU** | Cores, threads, and the fastest vector instructions detected (AVX-512 > AVX2 + FMA > SSE; NEON on Apple Silicon). All are used automatically. |
+| **Tier** | The model size your RAM supports. It only applies when a **new** model is created; an existing model keeps its size. |
 | **Corpus** | All the text the model trains on: your imported files plus Wikipedia articles from `research`. |
-| **params** | Number of learned numbers ("weights") in the model. More is smarter but slower to train. |
-| **steps** | How many learning updates it has made so far. |
-| **tokens seen** | How much text it has read in total, counting re-reads. A token is roughly ¾ of a word. |
-| **held-out loss** | **The number to watch.** It measures how well the model predicts text it has *never trained on*. Lower is better. It starts around 7.6 (random guessing); 4–5 is early, 3–3.5 is solid for this model size. |
-| **passages in the knowledge base** | Paragraphs it can look up while answering. |
+| **params** | Number of learned numbers ("weights") in the model. |
+| **steps / tokens seen** | How many learning updates it has made, and how much text it has read in total, counting re-reads. A token is roughly ¾ of a word. |
+| **held-out loss** | How well the model predicts text it has *never trained on*, in its own units. Lower is better. |
+| **bits per byte** | **The number to watch.** The same measure per byte of text, so it compares fairly across tokenizers and model sizes. Plain compression (like zip) manages about 2–3; lower means the model has learned the language better. |
+| **passages** | Paragraphs it can look up while answering. |
 | **past council sessions** | Claims you've asked about. `research` reads these to choose topics. |
 
 If it says `Model: none yet`, you haven't trained yet. Run `train` or `research`.
@@ -74,7 +79,7 @@ If it says `Model: none yet`, you haven't trained yet. Run `train` or `research`
 run keeps improving the same one.**
 
 ```bash
-python cli.py train [--data PATH] [--hours N | --steps N]
+council train [--data PATH] [--hours N | --steps N]
 ```
 
 | Option | Default | What it does |
@@ -86,10 +91,10 @@ python cli.py train [--data PATH] [--hours N | --steps N]
 ### Examples
 
 ```bash
-python cli.py train --data ~/Documents/books --hours 2    # import a folder, train 2 hours
-python cli.py train --data notes.txt --hours 0.5          # import one file
-python cli.py train --hours 8                             # keep training on what it already has
-python cli.py train --steps 200                           # quick top-up
+council train --data ~/Documents/books --hours 2    # import a folder, train 2 hours
+council train --data notes.txt --hours 0.5          # import one file
+council train --hours 8                             # keep training on what it already has
+council train --steps 200                           # quick top-up
 ```
 
 On Windows, write paths like `--data "C:\Users\you\Documents\books"`, with
@@ -101,24 +106,24 @@ quotes if there are spaces.
 2. **First run only:** it learns a vocabulary (word pieces) from your text,
    then creates a model sized for your RAM. This needs at least **200 KB** of
    text; with less it stops and tells you how much it has.
-3. **Tokenizing:** text is converted to numbers. This is slow the first time
-   and cached after that, so only new or changed files are redone.
+3. **Tokenizing:** text is turned into numbers, using every core. This
+   happens once per file and is cached; only new or changed files are redone.
 4. **Training:** it prints progress every 10 seconds, measures held-out loss
    every minute, and saves every 5 minutes.
 5. **Done** (or **Ctrl+C**): it saves and prints a summary.
 
-### Example output
+### Example output (illustrative numbers)
 
 ```
-Imported 3 file(s) into /home/you/Aegist/data/corpus.
+Imported 1 file(s) into /home/you/Aegist/data/corpus.
 Creating a new model for the 'small' tier (15.7 GB RAM).
-Learning a 2048-token vocabulary from the corpus...
-Model: 4 layers x 192 wide, 6 heads, 128-token context, 2.20M parameters.
-Corpus: 143,639 tokens (136,458 train / 7,181 held out).
-step     53 | loss 6.556 | held-out 6.206 | 3,606 tok/s | lr 4.6e-04
-step    420 | loss 4.005 | held-out 4.782 | 3,500 tok/s | lr 9.3e-04
+Learning a 4096-token vocabulary from the corpus...
+Model: 6 layers x 256 wide, 4 heads, 256-token context, 5.87M parameters.
+Corpus: 2,712,064 tokens (2,576,461 train / 135,603 held out).
+step     10 | loss 8.242 | held-out - |   3,958 tok/s | lr 8.1e-5
+step    420 | loss 4.105 | held-out 4.382 |   3,870 tok/s | lr 9.3e-4
 ...
-Saved: 2,289 steps total, 4.7M tokens seen, held-out loss 4.544.
+Saved: 2,289 steps total, 9.4M tokens seen, held-out loss 3.912 (1.402 bits per byte).
 ```
 
 | Column | Meaning |
@@ -126,8 +131,21 @@ Saved: 2,289 steps total, 4.7M tokens seen, held-out loss 4.544.
 | `step` | Learning updates so far, across all sessions. |
 | `loss` | How wrong it is on the text it's training on. Lower is better. |
 | `held-out` | How wrong it is on the 5% of text it never trains on. **This is its real skill.** It shows `-` until the first measurement, a minute in. |
-| `tok/s` | Speed. On a 4-core laptop: roughly 5,000 (tiny), 3,500 (small), 1,400 (medium), 700 (large). |
+| `tok/s` | Speed: tokens learned from per second. See the table below. |
 | `lr` | Learning rate. It ramps up for the first 100 steps, then eases down to 10% by the end of the session. That's automatic; you don't need to touch it. |
+
+### Speed
+
+On a 4-core laptop-class CPU with AVX-512 (faster with more cores):
+
+| Tier | Model | Tokens / second | Tokens / hour |
+|---|---|---|---|
+| tiny (≤ 8 GB RAM) | 4 × 192, ~2.2M params | ~7,900 | ~28M |
+| small (≤ 16 GB) | 6 × 256, ~5.9M params | ~3,700 | ~13M |
+| medium (≤ 32 GB) | 8 × 384, ~17M params | ~1,500 | ~5.5M |
+| large (more) | 12 × 512, ~42M params | ~680 | ~2.5M |
+
+`cargo run --release --example bench` measures your own machine.
 
 ### Is it working?
 
@@ -142,21 +160,21 @@ Saved: 2,289 steps total, 4.7M tokens seen, held-out loss 4.544.
 
 | Text | Good training time (small tier) |
 |---|---|
-| 200 KB (minimum) | ~20 minutes, then it starts memorizing |
+| 200 KB (minimum) | ~15 minutes, then it starts memorizing |
 | 5 MB (a few dozen books) | 2–4 hours |
 | 50 MB+ | overnight or longer; it keeps improving |
 
 ### Stopping and resuming
 
-Press **Ctrl+C** at any time. It saves before exiting and prints
-`Stopped; the checkpoint was saved.` The next `train` picks up exactly where
-it left off.
+Press **Ctrl+C** at any time. It finishes the current step, saves, and prints
+`Stopped; the checkpoint was saved.` Press Ctrl+C a second time to quit
+immediately without saving. The next `train` picks up exactly where it left off.
 
 ### Settings that change it (`config/settings.yaml` → `training:`)
 
 | Setting | Default | Effect |
 |---|---|---|
-| `batch_size` | 16 | Text snippets per learning step. Higher is smoother but slower per step. |
+| `tokens_per_step` | 4096 | Text per learning step (batch size × context length). |
 | `learning_rate` | 0.001 | Peak learning speed. Too high and the loss jumps around; too low and it's slow. |
 | `val_fraction` | 0.05 | Share of text held out to measure `held-out`. |
 | `checkpoint_every_s` | 300 | How often it saves, in seconds. |
@@ -169,7 +187,7 @@ it left off.
 **Runs on its own: reads Wikipedia, stores what it finds, and trains itself on it.**
 
 ```bash
-python cli.py research [--hours N]
+council research [--hours N]
 ```
 
 | Option | Default | What it does |
@@ -189,8 +207,8 @@ python cli.py research [--hours N]
      and headings), so `ask` can look it up;
    - the full text goes into `data/corpus/research/` for training.
 4. **Trains** for 5 minutes on everything it has.
-5. Repeats. It reads at most **6 topics per hour**; the rest of the time it
-   just keeps training.
+5. Repeats. It reads at most **6 topics per hour**, to be polite to
+   Wikipedia; the rest of the time it just keeps training.
 
 ### Example output (illustrative)
 
@@ -202,7 +220,7 @@ Researched 'unit economics': 18 new passages (Unit economics, Contribution margi
 Researched 'business model': 37 new passages (Business model, Business model canvas).
 Creating a new model for the 'small' tier (15.7 GB RAM).
 ...
-step    300 | loss 5.412 | held-out 5.630 | 3,480 tok/s | lr 8.1e-04
+step    300 | loss 5.412 | held-out 5.630 |   3,480 tok/s | lr 8.1e-4
 ...
 Done: 24 topic(s), 812 new passages, 214 min of training.
 ```
@@ -214,6 +232,8 @@ the model. That's normal.
 
 - **No internet:** it prints `Couldn't fetch '...' from Wikipedia`, keeps
   training on what it has, and retries the topic later.
+- **Behind a proxy:** it uses `HTTPS_PROXY` and respects `NO_PROXY`, and it
+  trusts your operating system's certificates.
 - **Ctrl+C:** stops cleanly, and everything read and learned so far is saved.
   Running it again continues, remembering which topics it has read and how
   many it fetched this hour.
@@ -247,7 +267,7 @@ The more you `ask` about a subject, the more it researches it.
 **Puts a claim in front of the council and prints the verdict.**
 
 ```bash
-python cli.py ask "<your claim>" [--no-recheck] [--json]
+council ask "<your claim>" [--no-recheck] [--json]
 ```
 
 | Option | What it does |
@@ -256,36 +276,34 @@ python cli.py ask "<your claim>" [--no-recheck] [--json]
 | `--no-recheck` | Skip the repeat run. About twice as fast, but it can't catch the council disagreeing with itself. |
 | `--json` | Print the complete result as JSON instead of the readable report, for other programs or for inspecting every number. |
 
-It takes a few seconds, and works fine while `train` or `research` runs in
-another terminal.
+It takes a second or two, and works fine while `train` or `research` runs in
+another terminal. Progress lines (`... Council deliberating`) go to stderr,
+so `--json` output stays clean.
 
-### Example output, annotated
+### Example output, annotated (illustrative numbers)
 
 ```
 CLAIM: Light is not refracted when it passes into glass
-Model: 4x192 transformer, 2.20M params, 4.7M tokens trained, held-out loss 4.54   <- (1)
+Model: 6x256 transformer, 5.87M params, 18.4M tokens trained, held-out loss 3.41   <- (1)
 Router: no Investor - No money-related words, so no Investor.                      <- (2)
-Familiarity: claim loss 7.11 vs. typical 4.54 -> confidence ceiling Low           <- (3)
+Familiarity: claim loss 4.71 vs. typical 3.41 -> confidence ceiling Medium        <- (3)
 Knowledge base: 3 relevant passage(s)                                              <- (4)
 
 BELIEVER  [Low]  signal -0.57                                                      <- (5)
   "This is true because in the two Prisms ... refracted in the first Prism ..."    <- (6)
-  - +0.07 Much after the same manner, if ACBD ... (Opticks (Newton, 1704))         <- (7)
+  - +0.07 Much after the same manner, if ACBD ... (Opticks)                        <- (7)
 
-SKEPTIC  [Low]  signal -0.23
+SKEPTIC  [Medium]  signal +0.23
   "This is false because the Sun's Light is also of these Sides ..."
 
-JUDGE  [Low, capped from Medium]  relied on: skeptic                               <- (8)
+JUDGE  [Medium, capped from High]  relied on: skeptic                              <- (8)
   Verdict: No - on what this model has read, the claim doesn't hold up.            <- (9)
-  Why: Believer signal -0.57 vs. Skeptic -0.23 nats/token (margin -0.34).          <- (10)
+  Why: Believer signal -0.57 vs. Skeptic +0.23 nats/token (margin -0.80).          <- (10)
   In its own words: "In conclusion, which comes through the Sun ..."
   Unresolved: the claim is unlike most of what the model has read ...              <- (11)
 
-JUDGE, REPEAT RUN  [Low, capped from Medium]  relied on: believer                  <- (12)
-  Verdict: Yes - on what this model has read, the claim holds up.
-  ...
-Low confidence: the council didn't agree with itself on a repeat run (verdict flipped: no -> yes).
-OVERALL CONFIDENCE: Low                                                            <- (13)
+Repeat run (dropout on) agreed with the first.                                     <- (12)
+OVERALL CONFIDENCE: Medium                                                         <- (13)
 ```
 
 1. **Model:** which model answered and how trained it is.
@@ -299,8 +317,9 @@ OVERALL CONFIDENCE: Low                                                         
    - more than 1.5× typical: Low.
 
    Also, until the model has read 2M tokens, everything is capped at Low.
-4. **Knowledge base:** how many stored passages matched the claim well enough
-   to be used. They're placed in front of the claim when the model reads it.
+4. **Knowledge base:** how many stored passages matched the claim well
+   enough to be used. They're placed in front of the claim when the model
+   reads it.
 5. **Signal:** how much the claim makes the model expect "This is true."
    (Believer) or "This is false." (Skeptic), measured in nats per token.
    Positive means the claim pushes toward that side; **around 0.5 or more is
@@ -309,8 +328,8 @@ OVERALL CONFIDENCE: Low                                                         
    Expect rough text from a small model; the signal is what counts.
 7. **Evidence:** stored passages that pushed the model toward this persona's
    side, with how much each one moved the signal.
-8. **Judge confidence:** "capped from Medium" means its own estimate was
-   Medium, but a rule lowered it. **Relied on** is whose case the verdict
+8. **Judge confidence:** "capped from High" means its own estimate was
+   higher, but a rule lowered it. **Relied on** is whose case the verdict
    rests on; the Judge can never be more confident than those personas.
 9. **Verdict:** **Yes**, **No**, or **Undecided**. "No" is a normal answer,
    not an error.
@@ -320,9 +339,10 @@ OVERALL CONFIDENCE: Low                                                         
     - below −0.1 is No;
     - in between is Undecided.
 11. **Unresolved:** what's holding confidence down.
-12. **Repeat run:** shown only when the second pass disagreed. The council
-    re-answers with a bit of randomness in the network. A real signal
-    survives that; noise doesn't.
+12. **Repeat run:** the council answers a second time with a bit of
+    randomness in the network (dropout on). A real signal survives that;
+    noise doesn't. If the answers disagree, both are shown, and the result
+    reads `Low confidence: the council didn't agree with itself on a repeat run`.
 13. **Overall confidence:** the final word. **High** is only possible when
     the signals are strong, the claim is familiar, the model is well
     trained, and both runs agree.
@@ -357,48 +377,46 @@ OVERALL CONFIDENCE: Low                                                         
 **First day:**
 
 ```bash
-python cli.py doctor
-python cli.py research --hours 2
-python cli.py ask "Customers prefer simple pricing"
+council doctor
+council research --hours 2
+council ask "Customers prefer simple pricing"
 ```
 
 **With your own documents:**
 
 ```bash
-python cli.py train --data ~/my_documents --hours 3
-python cli.py ask "..."
+council train --data ~/my_documents --hours 3
+council ask "..."
 ```
 
 **Let it grow overnight:**
 
 ```bash
-python cli.py research --hours 8
+council research --hours 8
 ```
 
-**Train and ask at the same time:** run `research` in one terminal, and
-`ask` in a second one (VS Code: the **+** button in the terminal panel).
+**Train and ask at the same time:** run `research` in one terminal, and `ask`
+in a second one (VS Code: the **+** button in the terminal panel).
 
 **Start over:** delete `data/brain/` (model only) or all of `data/`
 (everything), then train again.
 
 ---
 
-## Using it from Python instead of the terminal
+## Using it from other programs
 
-`ask` is a thin wrapper around one function:
+Any language can run `council ask --json "..."` and read the result:
 
-```python
-from engine.orchestrator import evaluate
-
-result = evaluate("We should switch to usage-based pricing")
-
-result["judge"]["verdict"]        # "No - on what this model has read, ..."
-result["judge"]["stance"]         # "yes" | "no" | "mixed"
-result["overall_confidence"]      # "Low" | "Medium" | "High"
-result["panel"]["skeptic"]        # each persona's signal, confidence, position, evidence
-result["consistency"]["agreed"]   # did the repeat run agree?
+```json
+{
+  "claim": "...",
+  "judge": {"verdict": "No - ...", "stance": "no", "margin": -0.8, "confidence": "Medium", "relied_on": ["skeptic"], ...},
+  "panel": [{"persona": "believer", "signal": -0.57, "confidence": "Low", "position": "...", "key_points": [...]}, ...],
+  "overall_confidence": "Medium",
+  "consistency": {"agreed": true, "reasons": [], "rerun_judge": {...}},
+  "familiarity": {...}, "memory": [...], "routing": {...}, "model": {...}
+}
 ```
 
-Optional arguments: `recheck=False` skips the repeat run, and `record=False`
-leaves the question out of the session log. `python cli.py ask --json "..."`
-shows the full structure.
+In Rust, depend on this crate and call `council::council::evaluate(...)`:
+the same function `council ask` uses.

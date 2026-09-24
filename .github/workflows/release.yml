@@ -1,0 +1,28 @@
+name: Release
+
+# Push a tag like v0.2.0 to publish ready-to-run programs for every system.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,  asset: council-linux-x86_64,       bin: council }
+          - { os: macos-latest,   asset: council-macos-arm64,        bin: council }
+          - { os: windows-latest, asset: council-windows-x86_64.exe, bin: council.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - shell: bash
+        run: cp target/release/${{ matrix.bin }} ${{ matrix.asset }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

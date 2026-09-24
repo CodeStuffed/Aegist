@@ -1,6 +1,0 @@
-numpy
-psutil
-PyYAML
-requests
-threadpoolctl
-pytest

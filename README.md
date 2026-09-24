@@ -1,18 +1,29 @@
 # council-engine
 
 A claim goes in and gets judged by four personas: Believer, Skeptic,
-Investor and Judge. They all run on **a neural network written and trained
-from scratch in this repo**. There's no Claude, no Ollama, no pretrained
-weights and no outside AI service. The model starts as random numbers
-and learns only from text you give it, or text its research loop collects.
+Investor and Judge. They all run on **a transformer written and trained from
+scratch in this repo, in Rust**. There's no Claude, no Ollama, no pretrained
+weights and no outside AI service. The model starts as random numbers and
+learns only from text you give it, or text its research loop collects.
+
+- **Guide:** it's a terminal program (VS Code's terminal works). See
+  [HOW_TO_RUN.md](HOW_TO_RUN.md) for setup on Windows, macOS and Linux.
+- **Command reference:** [COMMANDS.md](COMMANDS.md) covers every option,
+  annotated output, and the settings behind each command.
+
+```bash
+council doctor                               # hardware, model size, status
+council train --data ~/my_texts --hours 2    # a folder of .txt/.md files
+council ask "We should switch to usage-based pricing"
+council research --hours 4                   # read Wikipedia, keep training
+```
 
 ## Read this first: what to expect
 
-- **It's a small language model you train on a normal computer.** A few
-  hours of training on a few MB of text gives a model that has picked up
-  your corpus's vocabulary and phrasing. It doesn't reason. Its positions
-  "in its own words" will often be word salad, and that's honest output
-  for its size.
+- **It's a small language model you train on your own computer.** A few
+  hours on a few MB of text gives a model that has picked up your corpus's
+  vocabulary and phrasing. It doesn't reason like a chatbot. Its positions
+  "in its own words" will often be rough, and that's honest output for its size.
 - **The verdicts come from measurable signals, not from the prose.** Each
   persona is scored on how much the claim raises the model's probability of
   phrases like " This is true." or " This is false." (see *How it decides*).
@@ -21,86 +32,75 @@ and learns only from text you give it, or text its research loop collects.
 - **It says "I don't know" readily, by design.** Confidence is capped by how
   familiar the claim is to the model and by how much it has trained, and a
   repeat run with dropout on must agree before anything scores above Low.
-  An undertrained model answers Low to everything, and that's the correct answer.
 - **It keeps improving the longer it trains.** `train` and `research` update
-  the model's actual weights. That is real self-training, and it's the
-  point of building from scratch.
+  the model's actual weights. That is real self-training.
 
-## Quick start
+## Speed
 
-It's a terminal program. **New to terminals, or using VS Code?** See
-[HOW_TO_RUN.md](HOW_TO_RUN.md) for step-by-step setup on Windows, macOS and Linux.
-[COMMANDS.md](COMMANDS.md) is the full command reference.
+Everything is hand-written for speed:
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+- **Multithreaded, SIMD math:** matrix multiplies use AVX2 / AVX-512 / NEON,
+  whichever the CPU has, through the `gemm` crate (plain math, no AI).
+- **Attention as matrix multiplies:** attention runs as strided matrix
+  multiplies, with no copying.
+- **Fused, parallel operations:** normalization, activations and the loss
+  are each a single parallel pass over memory.
+- **No allocation during training:** buffers are set up once, before the
+  first step.
+- **Caching when answering:** `ask` processes each prompt once and scores
+  every probe phrase against the cached result in one batch, and text
+  generation reuses cached attention state.
 
-python cli.py doctor                               # hardware, model size, status
-python cli.py train --data ~/my_texts --hours 2    # a folder of .txt/.md files
-python cli.py ask "We should switch to usage-based pricing"
-python cli.py research --hours 4                   # read Wikipedia, keep training
-```
+Training throughput on a 4-core CPU with AVX-512 (`cargo run --release --example bench`):
 
-Plan on **several MB of text** at least. Books, articles, your own notes,
-anything in plain text. A new model won't start from less than 200 KB,
-because its vocabulary is learned once, from whatever text is there at the start. With a small corpus the model memorizes it:
-training loss keeps falling while the held-out loss stalls, and `train`
-prints both so you can see it happen. `research` grows the corpus from
-Wikipedia on its own if you don't have text handy.
+| Tier | Model | Tokens / second |
+|---|---|---|
+| tiny | 4 × 192, 2.2M params | ~7,900 |
+| small | 6 × 256, 5.9M params | ~3,700 |
+| medium | 8 × 384, 17M params | ~1,500 |
+| large | 12 × 512, 42M params | ~680 |
 
-## Commands
-
-| Command | What it does |
-|---|---|
-| `ask "<claim>"` | Full council run: each persona's signal, confidence and position, the Judge's verdict, the repeat-run check, and overall confidence. `--json` for the raw dict, `--no-recheck` to skip the repeat run. |
-| `train --hours N` / `--steps N` | Train, or keep training, on everything in `data/corpus/`. `--data DIR` copies a folder of text in first. Ctrl-C saves and stops. |
-| `research --hours N` | Loops until time's up: pick a topic, fetch Wikipedia articles, store them, then train on the grown corpus until the next fetch. |
-| `doctor` | RAM/CPU and model tier, corpus size, training progress, knowledge-base size. |
-
-From other code, call `evaluate(claim) -> dict` in `engine/orchestrator.py`.
-The CLI is a thin wrapper around it.
+At the same model size (2.2M parameters) that is about 2× the old NumPy version.
 
 ## How it's built
 
-**The model** (`model_backend/`), all from scratch on NumPy:
+**The model** (`src/`), all from scratch:
 
-- `autograd.py`: reverse-mode automatic differentiation. Every op has a
-  hand-derived gradient, and each is checked against finite differences in
-  `tests/test_autograd.py`.
-- `tokenizer.py`: byte-level BPE, trained on your corpus. Any text can be
-  encoded.
-- `transformer.py`: a GPT-style decoder with causal self-attention, a GELU
-  MLP, pre-LayerNorm and dropout. These are the "hidden layers".
-- `trainer.py`: hand-written AdamW, warmup plus cosine learning rate,
-  gradient clipping, held-out evaluation, and checkpoints in `data/brain/`.
-- `hardware_detect.py`: picks the size of a *new* model from your RAM:
+- `model.rs`: a decoder-only transformer in the style of current small
+  language models: RMSNorm, rotary position embeddings, a SwiGLU MLP, tied
+  embeddings, and dropout. The forward and backward passes are written by
+  hand, and every gradient is checked against finite differences in the tests.
+- `kernels.rs`: the math, forward and backward, parallelized.
+- `tokenizer.rs`: byte-level BPE trained on your corpus. Any text in any
+  language can be encoded.
+- `trainer.rs`, `optim.rs`: AdamW, warmup plus cosine learning rate,
+  gradient clipping, held-out evaluation (loss and bits per byte), and
+  checkpoints; Ctrl-C saves.
+- `brain.rs`: inference: batched probe scoring on a shared cached prompt,
+  and text generation with cached attention state.
+- `hardware.rs`: picks the size of a *new* model from your RAM:
 
-  | Tier | RAM | Layers × width | Context | Params | Speed (4-core laptop) |
-  |---|---|---|---|---|---|
-  | tiny | ≤ 8 GB | 2 × 128 | 128 | ~0.5M | ~20M tokens/hour |
-  | small | ≤ 16 GB | 4 × 192 | 128 | ~2.2M | ~12M tokens/hour |
-  | medium | ≤ 32 GB | 6 × 256 | 192 | ~5.8M | ~5M tokens/hour |
-  | large | more | 8 × 384 | 256 | ~16M | ~2.5M tokens/hour |
+  | Tier | RAM | Layers × width | Context | Params |
+  |---|---|---|---|---|
+  | tiny | ≤ 8 GB | 4 × 192 | 128 | ~2.2M |
+  | small | ≤ 16 GB | 6 × 256 | 256 | ~5.9M |
+  | medium | ≤ 32 GB | 8 × 384 | 256 | ~17M |
+  | large | more | 12 × 512 | 512 | ~42M |
 
-  Edit `model.tiers` in `config/settings.yaml` to change these. A trained
-  model keeps its size; delete `data/brain/` to start over at a new size.
+**The council:**
 
-**The council** (`engine/`):
-
-- **Router**: matches keywords from `router.money_keywords` to decide
-  whether the Investor runs.
-- **Personas** (`config/personas/*.yaml`): a small model can't follow
-  written instructions, so each persona is a *lead-in* the model continues
-  ("This is true because…") plus *probe phrases* it's scored on.
-- **Memory**: a BM25 search index, written from scratch, over passages in
+- `router.rs`: matches money words to decide whether the Investor runs.
+- `config/personas/*.yaml`: a small model can't follow written instructions,
+  so each persona is a *lead-in* the model continues ("This is true
+  because…") plus *probe phrases* it's scored on.
+- `knowledge.rs`: a BM25 search index, written from scratch, over passages in
   `data/knowledge_base/`. The top hits go in front of the claim, so they
-  change what the model scores and writes. Each persona also lists the
-  passages that moved the model toward its side.
-- **Research loop**: uses the plain Wikipedia search API. Topics are
+  change what the model scores and writes. Each persona lists the passages
+  that moved the model toward its side.
+- `research.rs`: uses the plain Wikipedia search API. Topics are
   `research.seed_topics` plus words that keep coming up in your past
-  `ask` sessions. Fetches are capped at `max_topics_per_hour`, and training
-  fills the time in between.
+  questions. Fetches are capped per hour, and training fills the time in between.
+- `council.rs`: the personas, the Judge's rules, familiarity, and the repeat-run check.
 
 ## How it decides
 
@@ -127,24 +127,20 @@ The CLI is a thin wrapper around it.
    "Low confidence: the council didn't agree with itself on a repeat run",
    and both verdicts are shown.
 
-All the thresholds live in `config/settings.yaml` under `council:`. They're
-starting points; tune them once your model has trained for a while.
+All the thresholds live in `config/settings.yaml` under `council:`.
 
 ## Layout
 
 ```
-config/settings.yaml         every tunable number
-config/personas/*.yaml       lead-ins and probe phrases
-model_backend/               the from-scratch model (see above)
-engine/orchestrator.py       evaluate(): the public entry point
-engine/agents.py             persona scoring and writing
-engine/router.py             Investor or not
-engine/uncertainty.py        the repeat-run comparison
-engine/memory/               knowledge store, session log, research loop
-cli.py                       ask / train / research / doctor
-data/                        corpus, checkpoints, knowledge base (gitignored)
-tests/                       pytest suite; runs in about 30 s, no network
+Cargo.toml, src/            the program (council) and library
+config/settings.yaml        every tunable number
+config/personas/*.yaml      lead-ins and probe phrases
+examples/bench.rs           training-speed benchmark
+data/                       corpus, checkpoints, knowledge base (gitignored)
+.github/workflows/          CI (tests + builds on Linux/macOS/Windows) and releases
+docs/build-brief.md         the original plan (Claude/Ollama), kept for history
 ```
 
-`docs/build-brief.md` is the original plan, which used Claude and Ollama.
-It's kept for history. This README describes what the code actually does.
+`cargo test` runs the whole suite (gradient checks, the tokenizer, training,
+inference, the council rules, and the research loop against a fake
+Wikipedia) in a few seconds, without internet.
