@@ -10,12 +10,17 @@ learns only from text you give it, or text its research loop collects.
   [HOW_TO_RUN.md](HOW_TO_RUN.md) for setup on Windows, macOS and Linux.
 - **Command reference:** [COMMANDS.md](COMMANDS.md) covers every option,
   annotated output, and the settings behind each command.
+- **Have an NVIDIA GPU?** [GPU_TRAINING.md](GPU_TRAINING.md) is the plan for
+  training on it (an RTX 5080 for 4 days on all of Wikipedia), with honest
+  expectations.
 
 ```bash
 council doctor                               # hardware, model size, status
 council train --data ~/my_texts --hours 2    # a folder of .txt/.md files
 council ask "We should switch to usage-based pricing"
 council research --hours 4                   # read Wikipedia, keep training
+council import-wikipedia enwiki-latest-pages-articles-multistream.xml.bz2
+council gpu-check                            # test an NVIDIA GPU for training
 ```
 
 ## Read this first: what to expect
@@ -34,6 +39,14 @@ council research --hours 4                   # read Wikipedia, keep training
   repeat run with dropout on must agree before anything scores above Low.
 - **It keeps improving the longer it trains.** `train` and `research` update
   the model's actual weights. That is real self-training.
+- **The model's size follows your training time.** A new model gets the
+  size that will be smartest when the time is up: the biggest that can still
+  read ~20 tokens of text per parameter. Bigger isn't smarter if it can't
+  finish learning.
+- **It looks things up.** The knowledge base can hold all of Wikipedia
+  on disk. Each question gets the most relevant passages plus the passages
+  linked to them (like following links in Obsidian), as much as fits in
+  the model's context.
 
 ## Speed
 
@@ -76,11 +89,14 @@ Training speed per size, from `cargo run --release --example bench`:
 
 Two switches:
 
-- `council train --tier NAME` picks the model size. Besides the four
-  automatic sizes there are opt-in `xl` (~126M params), `xxl` (~337M) and
-  `1b` (~1.28B). `council doctor` lists every size with its training memory
-  and how long it takes to train well on your machine, and `train` refuses a
-  size that doesn't fit in memory.
+- `council train --tier NAME` picks the model size yourself. Otherwise
+  `train --hours N` (or `--plan-hours N` for several sessions) picks the
+  size that ends up smartest in that time on your CPU or GPU. The sizes
+  run from `tiny` (2.2M params) through `xl` (~126M), the GPU sizes `110m`,
+  `235m`, `xxl` (~337M) and `730m`, up to `1b` (~1.28B). `council doctor`
+  (CPU) and `council gpu-check` (GPU) list every size with its memory and
+  how long it takes to train well, and `train` refuses a size that doesn't
+  fit.
 - `council ask --precision f32|int8|int4` (default `int8`, set in
   `inference.precision`) picks the weights used to answer:
   - `int8` is 4× smaller than f32 with practically identical answers;
@@ -116,9 +132,15 @@ same 4-core PC:
 Quantization shrinks a *trained* model (the 1b tier is 800 MB at int4); it
 doesn't speed up training, and an untrained giant model is just random
 numbers. Billion-parameter models are trained on thousands of GPUs. On a
-PC, the best results come from the automatic sizes plus lots of text. For
-short sessions a *smaller* size often wins, because it reads more text in
-the same time.
+PC, the best results come from the size `train` picks plus lots of text.
+For short sessions a *smaller* size often wins, because it reads more text
+in the same time.
+
+**On an NVIDIA GPU** training should run on the order of 100 times faster
+than on the 4-core CPU above. That's an estimate from the hardware's speed;
+`council gpu-check` measures yours. It moves the sweet spot to a few hundred
+million parameters for a few days of training. See
+[GPU_TRAINING.md](GPU_TRAINING.md).
 
 ## How it's built
 
@@ -136,7 +158,15 @@ the same time.
   checkpoints; Ctrl-C saves.
 - `brain.rs`: inference: batched probe scoring on a shared cached prompt,
   and text generation with cached attention state.
-- `hardware.rs`: picks the size of a *new* model from your RAM:
+- `gpu/`: the same training step on an NVIDIA GPU. It uses hand-written
+  CUDA kernels (`kernels.cu`, compiled at run time with NVRTC) and cuBLAS
+  for matrix multiplies, both loaded only if present. It keeps only each
+  layer's input during the forward pass and recomputes one layer at a time
+  during the backward pass. A self-check against the CPU runs before any
+  training. `cargo test --features gpu-emulator` runs the kernels on a CPU
+  emulator and checks them against the CPU model.
+- `trainer.rs` also sizes a *new* model for its training time (above).
+  Without a time budget (`--steps`), `hardware.rs` picks from your RAM:
 
   | Tier | RAM | Layers × width | Context | Params |
   |---|---|---|---|---|
@@ -144,6 +174,8 @@ the same time.
   | small | ≤ 16 GB | 6 × 256 | 256 | ~5.9M |
   | medium | ≤ 32 GB | 8 × 384 | 256 | ~17M |
   | large | more | 12 × 512 | 512 | ~42M |
+- `corpus.rs`: all the training text's tokens in one file on disk that
+  training memory-maps, so billions of tokens cost disk space, not RAM.
 
 **The council:**
 
@@ -152,12 +184,17 @@ the same time.
   so each persona is a *lead-in* the model continues ("This is true
   because…") plus *probe phrases* it's scored on.
 - `knowledge.rs`: a BM25 search index, written from scratch, over passages in
-  `data/knowledge_base/`. Passages are linked like Obsidian notes (to their
+  `data/knowledge_base/`. The index lives on disk in segments that are
+  memory-mapped, so millions of passages open instantly (1M passages: 0.1 ms
+  to open, ~20 ms per search on 4 cores). Passages are linked like Obsidian notes (to their
   neighbors in the same article, and to passages sharing their rarest
   words). The best matches plus their strongest links go in front of the
   claim, filling the model's context window with only what's relevant, so
   they change what the model scores and writes. Each persona lists the
   passages that moved the model toward its side.
+- `wikipedia.rs`: imports a whole Wikipedia dump: unpacks the multistream
+  `.bz2` on every core, turns wiki markup into plain paragraphs, and fills
+  both the corpus and the knowledge base.
 - `research.rs`: uses the plain Wikipedia search API. Topics are
   `research.seed_topics` plus words that keep coming up in your past
   questions. Fetches are capped per hour, and training fills the time in between.
@@ -196,13 +233,25 @@ All the thresholds live in `config/settings.yaml` under `council:`.
 Cargo.toml, src/            the program (council) and library
 config/settings.yaml        every tunable number
 config/personas/*.yaml      lead-ins and probe phrases
+src/gpu/                    GPU training: CUDA kernels, cuBLAS/NVRTC bindings, CPU emulator
 examples/bench.rs           training speed per size on this machine
 examples/quant_eval.rs      what f32 / int8 / int4 cost and buy on your trained model
+examples/kb_bench.rs        knowledge-base speed at a million passages
+examples/tok_speed.rs       tokenizer training and encoding speed
+GPU_TRAINING.md             training on an NVIDIA GPU, and what to expect
 data/                       corpus, checkpoints, knowledge base (gitignored)
 .github/workflows/          CI (tests + builds on Linux/macOS/Windows) and releases
 docs/build-brief.md         the original plan (Claude/Ollama), kept for history
 ```
 
-`cargo test` runs the whole suite (gradient checks, the tokenizer, training,
-inference, the council rules, and the research loop against a fake
-Wikipedia) in a few seconds, without internet.
+`cargo test` runs the whole suite in a few seconds, without internet:
+- gradient checks;
+- the tokenizer, checked against textbook BPE;
+- training;
+- inference;
+- the council rules;
+- the knowledge base (on disk and in memory);
+- the Wikipedia importer, on a small multistream dump;
+- the research loop, against a fake Wikipedia.
+
+`cargo test --features gpu-emulator` adds the GPU tests (a few minutes).

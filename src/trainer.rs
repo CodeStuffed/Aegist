@@ -106,11 +106,17 @@ pub fn measure_cpu_flops() -> f64 {
         let (a, b) = (vec![0.5f32; n * n], vec![0.25f32; n * n]);
         let mut c = vec![0f32; n * n];
         crate::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
-        let start = Instant::now();
-        for _ in 0..8 {
-            crate::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
-        }
-        0.6 * 8.0 * 2.0 * (n * n * n) as f64 / start.elapsed().as_secs_f64()
+        // best of three, so a busy moment doesn't change the answer
+        let best = (0..3)
+            .map(|_| {
+                let start = Instant::now();
+                for _ in 0..8 {
+                    crate::kernels::matmul(&mut c, &a, &b, n, n, n, false, false, false);
+                }
+                start.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min);
+        0.6 * 8.0 * 2.0 * (n * n * n) as f64 / best
     };
     rayon::ThreadPoolBuilder::new().build().map(|p| p.install(measure)).unwrap_or_else(|_| measure())
 }

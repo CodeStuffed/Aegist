@@ -296,7 +296,7 @@ fn doctor(settings: &Settings) -> Result<()> {
     let flops_per_s = cpu.training_flops();
     println!("Sizes (to choose one: council train --tier NAME; times assume {:.0} GFLOP/s)", flops_per_s / 1e9);
     let mut tiers: Vec<_> = settings.model.tiers.iter().collect();
-    tiers.sort_by(|a, b| (a.1.manual, a.1.max_ram_gb).partial_cmp(&(b.1.manual, b.1.max_ram_gb)).unwrap());
+    tiers.sort_by_key(|(_, t)| (t.n_layer * t.d_model * t.d_model, t.vocab_size));
     for (name, t) in tiers {
         let cfg = ModelConfig {
             vocab_size: t.vocab_size, block_size: t.block_size, n_layer: t.n_layer, n_head: t.n_head, d_model: t.d_model,

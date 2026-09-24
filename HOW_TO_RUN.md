@@ -141,6 +141,8 @@ command, see **[COMMANDS.md](COMMANDS.md)**.
 | `council train --data <folder> --hours 2` | Teach the model from your `.txt` / `.md` files. |
 | `council research --hours 4` | Let it read Wikipedia and train itself on what it finds. |
 | `council ask "<claim>"` | Put a claim in front of the council. |
+| `council import-wikipedia <dump.xml.bz2>` | Add a whole Wikipedia download to the training text and the knowledge base. |
+| `council gpu-check` | Test an NVIDIA GPU for training (see [GPU_TRAINING.md](GPU_TRAINING.md)). |
 
 **Ctrl+C** stops `train` or `research` at any time. It saves first, so nothing is lost.
 
@@ -168,7 +170,8 @@ with several MB. Good sources: books from <https://www.gutenberg.org> (the
 | `config/personas/*.yaml` | what each persona writes and listens for |
 | `data/corpus/` | all the text it trains on (yours plus Wikipedia) |
 | `data/brain/` | the trained model itself |
-| `data/knowledge_base/` | passages it can look up when answering |
+| `data/knowledge_base/` | passages it can look up when answering (`index/` is their search index) |
+| `data/brain/token_cache/` | the corpus turned into tokens, cached (safe to delete; it's rebuilt) |
 | `data/sessions.jsonl` | a log of the claims you've asked about |
 
 - **Start the model over** (for example after changing its size): delete `data/brain/`.
@@ -185,13 +188,14 @@ with several MB. Good sources: books from <https://www.gutenberg.org> (the
 | `Only 12 KB of text so far ...` | Give it more text (at least 200 KB), or run `research` longer. |
 | `... made by an older version ...` | Your model came from the old Python version. Delete `data/brain/` and train again; your text and knowledge base are kept. |
 | `Couldn't fetch '...' from Wikipedia` | Check your internet connection. It keeps training and retries later. |
-| Training is slower than expected | It runs on your CPU. Close heavy programs, or choose a smaller tier in `config/settings.yaml`. |
+| Training is slower than expected | On the CPU: close heavy programs, or pick a smaller size (`--tier`). With an NVIDIA GPU, see [GPU_TRAINING.md](GPU_TRAINING.md): `council gpu-check` says whether training can use it. |
 | The written positions are nonsense | Normal for a small model early on. Judge it by the signals and confidence, and give it more text and training time. |
 
 ## For developers
 
 ```bash
 cargo test                                  # the whole test suite, no internet needed
+cargo test --features gpu-emulator --lib gpu  # the GPU code, on a CPU emulator (needs a C++20 compiler)
 cargo run --release --example bench         # training speed on this machine
 council ask --json "..."                    # machine-readable output for other programs
 ```

@@ -14,6 +14,8 @@ council <command> [options]
 | [`train`](#train) | Teach the model from text | No (creates one) | No |
 | [`research`](#research) | Read Wikipedia and train itself | No (creates one) | Yes |
 | [`ask`](#ask) | Put a claim in front of the council | **Yes** | No |
+| [`import-wikipedia`](#import-wikipedia) | Add a Wikipedia download to the text and the knowledge base | No | No (you download the file) |
+| [`gpu-check`](#gpu-check) | Test an NVIDIA GPU for training | No | No |
 
 - `council --help` lists the commands; `council <command> --help` lists one
   command's options.
@@ -35,7 +37,7 @@ whenever you're curious.**
 council doctor
 ```
 
-### Example output (a real run on a 4-core laptop-class CPU)
+### Example output (a real run on a 4-core laptop-class CPU, with 185 MB of Wikipedia text and a model trained for 30 steps; folder paths shortened)
 
 ```
 Files
@@ -44,35 +46,45 @@ Files
 Hardware
   RAM        15.7 GB
   CPU        4 cores, 4 threads, AVX-512
-  Tier       small -> a new model would be 6 layers x 256 wide, 256-token context (~5.9M params)
-Sizes (council train --tier NAME; * = picked automatically; time assumes 140 GFLOP/s)
-   tiny       2.2M params |    0.4 GB to train | ~  1.1 hours to train well | int4 file    1 MB
-  *small      5.9M params |    0.8 GB to train | ~  8.2 hours to train well | int4 file    4 MB
-   medium    17.3M params |    1.6 GB to train | ~     3 days to train well | int4 file   11 MB
-   large     42.2M params |    3.4 GB to train | ~    18 days to train well | int4 file   26 MB
-   xl       125.9M params |    7.4 GB to train | ~   158 days to train well | int4 file   79 MB
-   xxl      337.2M params |   18.9 GB to train | ~    3 years to train well | int4 file  211 MB  (too big for this machine)
-   1b        1.28B params |   40.3 GB to train | ~   44 years to train well | int4 file  798 MB  (too big for this machine)
+  GPU        none usable (no NVIDIA driver found); training uses the CPU
+Sizes (to choose one: council train --tier NAME; times assume 135 GFLOP/s)
+  tiny       2.2M params |    0.4 GB to train | ~  1.3 hours to train well | int4 file    1 MB
+  small      5.9M params |    0.8 GB to train | ~  9.6 hours to train well | int4 file    4 MB
+  medium    17.3M params |    1.6 GB to train | ~     3 days to train well | int4 file   11 MB
+  large     42.2M params |    3.4 GB to train | ~    21 days to train well | int4 file   26 MB
+  110m     110.1M params |    7.3 GB to train | ~   146 days to train well | int4 file   69 MB
+  xl       125.9M params |    7.4 GB to train | ~   179 days to train well | int4 file   79 MB
+  235m     236.0M params |   13.0 GB to train | ~   653 days to train well | int4 file  147 MB
+  xxl      337.2M params |   18.9 GB to train | ~    4 years to train well | int4 file  211 MB  (too big for this machine)
+  730m     729.9M params |   28.4 GB to train | ~   17 years to train well | int4 file  456 MB  (too big for this machine)
+  1b        1.28B params |   40.3 GB to train | ~   49 years to train well | int4 file  798 MB  (too big for this machine)
+  Otherwise a new model gets the size that will be smartest after its training time
+  (--hours, or --plan-hours for several sessions), with this corpus: 1 h -> tiny, 8 h -> tiny, 24 h -> small, 96 h -> small
 Corpus
-  152 file(s), 10.5 MB in /home/you/Aegist/data/corpus
+  3 file(s), 185.5 MB in /home/you/Aegist/data/corpus
 Model
   6x256 transformer, 5.87M params, vocabulary 4096
   Answers with int8 weights (inference.precision): f32 23 MB | int8 ~6 MB | int4 ~4 MB
-  544 steps, 2.2M tokens seen, 0.2 h trained, held-out loss 3.563 (1.652 bits per byte)
-  Trained on 2% of the ~117M tokens (20 per parameter) a model this size should see
+  30 steps, 0.1M tokens seen, 0.0 h trained, held-out loss 7.656 (2.686 bits per byte)
+  Trained on 0% of the ~117M tokens (20 per parameter) a model this size should see
 Memory
-  228 passage(s) in the knowledge base
-  9 past council session(s)
+  0 passage(s) in the knowledge base
+  0 past council session(s)
 ```
+
+The CPU speed is measured each time, so the times (and, near a boundary,
+the automatic choice) shift a little between runs. With a GPU, the GPU line
+names it; `council gpu-check` shows the same table for the GPU.
 
 ### Reading it
 
 | Line | Meaning |
 |---|---|
 | **Settings / Data** | Where your settings file and everything it has learned are stored. |
-| **Sizes** | Every model size in settings.yaml: parameters, memory needed to train it, and how long it takes on this machine to read ~20 tokens per parameter (a rough rule for "trained well"). `*` marks the size picked automatically for a new model; others need `council train --tier NAME`. |
+| **GPU** | An NVIDIA GPU, if the driver finds one. `council gpu-check` tests it for training. |
+| **Sizes** | Every model size in settings.yaml: parameters, memory needed to train it, and how long it takes on this machine's CPU to read ~20 tokens per parameter (a rough rule for "trained well"). |
+| **Otherwise ... smartest** | Which size `train --hours N` would pick for a new model, for a few N. It's the biggest that can read ~20 tokens per parameter in that time without repeating your text more than 4 times, so more text and more time both allow bigger. |
 | **CPU** | Cores, threads, and the fastest vector instructions detected (AVX-512 > AVX2 + FMA > SSE; NEON on Apple Silicon). All are used automatically. |
-| **Tier** | The model size your RAM supports. It only applies when a **new** model is created; an existing model keeps its size. |
 | **Corpus** | All the text the model trains on: your imported files plus Wikipedia articles from `research`. |
 | **params** | Number of learned numbers ("weights") in the model. |
 | **Answers with** | The precision `ask` uses by default, and the model's size at each precision. |
@@ -80,7 +92,7 @@ Memory
 | **steps / tokens seen** | How many learning updates it has made, and how much text it has read in total, counting re-reads. A token is roughly ¾ of a word. |
 | **held-out loss** | How well the model predicts text it has *never trained on*, in its own units. Lower is better. |
 | **bits per byte** | **The number to watch.** The same measure per byte of text, so it compares fairly across tokenizers and model sizes. Plain compression (like zip) manages about 2–3; lower means the model has learned the language better. |
-| **passages** | Paragraphs it can look up while answering. |
+| **passages** | Paragraphs it can look up while answering. With many of them, a `Search index` line shows how many are indexed on disk (memory-mapped) and how big the index is. |
 | **past council sessions** | Claims you've asked about. `research` reads these to choose topics. |
 
 If it says `Model: none yet`, you haven't trained yet. Run `train` or `research`.
@@ -93,7 +105,7 @@ If it says `Model: none yet`, you haven't trained yet. Run `train` or `research`
 run keeps improving the same one.**
 
 ```bash
-council train [--data PATH] [--hours N | --steps N]
+council train [--data PATH] [--hours N | --steps N] [--plan-hours N] [--tier NAME] [--device auto|cpu|gpu]
 ```
 
 | Option | Default | What it does |
@@ -101,7 +113,9 @@ council train [--data PATH] [--hours N | --steps N]
 | `--data PATH` | none | A folder (searched recursively) or a single file. Every `.txt` and `.md` file is **copied** into `data/corpus/imported/`, then training starts. You only need to import a folder once; re-importing just refreshes the copies. Other file types (PDF, Word…) are skipped, so save them as `.txt` first. |
 | `--hours N` | `1` | Train for N hours. Decimals work: `0.25` is 15 minutes. |
 | `--steps N` | none | Train for exactly N learning steps instead of a set time. Can't be combined with `--hours`. |
-| `--tier NAME` | picked from RAM | Size for a **new** model: `tiny`, `small`, `medium`, `large`, or the opt-in `xl`, `xxl`, `1b`. `council doctor` lists them with memory and time. It refuses a size that won't fit in memory; to resize an existing model, delete `data/brain/` first. |
+| `--plan-hours N` | `--hours` | For a **new** model: the total time you plan to train it, across all sessions. It picks the model's size (see below). |
+| `--tier NAME` | sized for the time | Size for a **new** model, chosen yourself: `tiny`, `small`, `medium`, `large`, `xl`, the GPU sizes `110m`, `235m`, `xxl`, `730m`, or `1b`. `council doctor` and `council gpu-check` list them with memory and time. It refuses a size that won't fit in memory; to resize an existing model, delete `data/brain/` first. |
+| `--device D` | `auto` | Where to train. `auto`: an NVIDIA GPU if one passes its self-check, else the CPU. `cpu` or `gpu` to choose. The default is `gpu.device` in settings. See [GPU_TRAINING.md](GPU_TRAINING.md). |
 
 ### Examples
 
@@ -118,14 +132,35 @@ quotes if there are spaces.
 ### What happens, in order
 
 1. **Import:** with `--data`, files are copied into the corpus.
-2. **First run only:** it learns a vocabulary (word pieces) from your text,
-   then creates a model sized for your RAM. This needs at least **200 KB** of
-   text; with less it stops and tells you how much it has.
-3. **Tokenizing:** text is turned into numbers, using every core. This
-   happens once per file and is cached; only new or changed files are redone.
-4. **Training:** it prints progress every 10 seconds, measures held-out loss
+2. **Device:** with an NVIDIA GPU (and `--device auto`/`gpu`) it compiles the
+   GPU code, runs a small model on both GPU and CPU, and uses the GPU only if
+   the results match.
+3. **First run only:** it learns a vocabulary (word pieces) from a sample of
+   your text taken evenly across every file, then creates the model. This
+   needs at least **200 KB** of text; with less it stops and tells you how
+   much it has.
+
+   **The size** is the one that will be smartest when the time is up
+   (`--plan-hours`, else `--hours`): the biggest that can still read about
+   20 tokens of text per parameter in that time on this CPU or GPU,
+   without repeating the text more than 4 times. A bigger model would be
+   cut off half-trained; a smaller one would stop improving early. The log
+   says what it picked and why. From a real run (4-core CPU, 185 MB of text):
+   ```
+   Training on the CPU (no NVIDIA driver found).
+   Size for 8 hour(s) of training on the CPU: small (5.9M parameters): 8 h at ~4,737 tokens/s reads ~136M tokens,
+   23 per parameter; the next size up (medium, 17.3M) would get only 2.8 per parameter - about 20 is needed to train well.
+   ```
+   (The speed there is an estimate made before training; this machine
+   really trains `small` at ~3,600 tokens/s.) With `--steps` and no
+   `--plan-hours` it picks from RAM instead, as `council doctor` shows.
+4. **Tokenizing:** text is turned into numbers, using every core. This
+   happens once per file and is cached; only new or changed files are
+   redone. All the tokens go into one file on disk that training reads
+   directly (memory-mapped), so even billions of tokens don't need RAM.
+5. **Training:** it prints progress every 10 seconds, measures held-out loss
    every minute, and saves every 5 minutes.
-5. **Done** (or **Ctrl+C**): it saves and prints a summary.
+6. **Done** (or **Ctrl+C**): it saves and prints a summary.
 
 ### Example output (real: the start of one run and the end of a 10-minute one, same settings and text)
 
@@ -206,6 +241,77 @@ immediately without saving. The next `train` picks up exactly where it left off.
 | `val_fraction` | 0.05 | Share of text held out to measure `held-out`. |
 | `checkpoint_every_s` | 300 | How often it saves, in seconds. |
 | `min_new_model_chars` | 200000 | Minimum text needed to create a new model. |
+| `tokenizer_train_chars` | 50000000 | Text sampled (evenly across files) to learn a new model's vocabulary. |
+
+On a GPU, `gpu:` in settings takes over the batch and learning rate:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `gpu.device` | auto | `auto`, `cpu` or `gpu` (the `--device` default). |
+| `gpu.tokens_per_step` | 131072 | Text per learning step on the GPU, split into micro-batches that fit its memory. |
+| `gpu.learning_rate` | 0.0006 | Peak learning rate for the bigger models a GPU trains. |
+| `gpu.warmup_steps` | 500 | Steps to ramp the learning rate up. |
+
+---
+
+## `import-wikipedia`
+
+**Adds a whole Wikipedia download to the training text and the knowledge base.**
+
+```bash
+council import-wikipedia <dump> [--max-articles N] [--no-knowledge]
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `<dump>` | required | The file from <https://dumps.wikimedia.org/>, for example `enwiki-latest-pages-articles-multistream.xml.bz2` (~24 GB for English; any language works). An unpacked `.xml` works too. |
+| `--max-articles N` | all | Stop after N articles in total. Running it again continues from there. |
+| `--no-knowledge` | off | Only add text to the corpus, not to the knowledge base (saves ~40 GB for English). |
+
+What it does:
+- Unpacks the multistream `.bz2` on every core, and turns wiki markup into
+  plain paragraphs. Infoboxes, tables, references, image captions, category
+  links, "See also"/"References" sections and disambiguation pages are
+  dropped; links keep their visible words.
+- Writes each article to `data/corpus/wikipedia/part-*.txt` (64 MB files)
+  for training.
+- Stores each paragraph of 150+ characters in the knowledge base, with its
+  title and URL, linked to its neighbors. The search index is built at the
+  end.
+- Prints progress every 10 seconds, with an estimate of the time left.
+  **Ctrl+C** keeps everything imported so far.
+
+Speed: on a 4-core test machine, about 50 MB of wiki markup per second, and
+45 seconds to index a million passages. That's roughly one to two hours for
+English Wikipedia. Disk: about 110 GB free for the English dump, text,
+tokens and knowledge base together.
+
+After importing, `council train --hours N` trains on it. See
+[GPU_TRAINING.md](GPU_TRAINING.md) for a multi-day GPU plan.
+
+---
+
+## `gpu-check`
+
+**Tests an NVIDIA GPU for training, and shows what it can train.**
+
+```bash
+council gpu-check
+```
+
+1. Loads the NVIDIA driver and the CUDA Toolkit's cuBLAS and NVRTC (12.8 or
+   newer), and compiles the GPU code for the card.
+2. **Self-check:** trains a small model for one step on the GPU and on the
+   CPU and compares the loss, every weight's gradient, and the weights after
+   the update. Training only uses the GPU when this passes (`train` repeats
+   it every time).
+3. Measures the card's matrix-multiply speed (TF32) and free memory.
+4. Lists every size with how many sequences fit per micro-batch and roughly
+   how long it takes to train well, and what `train` would pick for 8, 24
+   and 96 hours.
+
+Exits with status 1 when no usable GPU is found (the message says what's
+missing). Setup steps and troubleshooting: [GPU_TRAINING.md](GPU_TRAINING.md).
 
 ---
 
@@ -214,12 +320,13 @@ immediately without saving. The next `train` picks up exactly where it left off.
 **Runs on its own: reads Wikipedia, stores what it finds, and trains itself on it.**
 
 ```bash
-council research [--hours N]
+council research [--hours N] [--device auto|cpu|gpu]
 ```
 
 | Option | Default | What it does |
 |---|---|---|
-| `--hours N` | `1` | How long to run. Decimals work. Leave it running overnight with `--hours 8`. |
+| `--hours N` | `1` | How long to run. Decimals work. Leave it running overnight with `--hours 8`. A new model is sized for this many hours. |
+| `--device D` | `auto` | Where the training bursts run, as for `train`. |
 
 ### What it does, on repeat
 
