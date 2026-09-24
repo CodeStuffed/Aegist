@@ -6,7 +6,6 @@ stronger case and why. A flat "no, this doesn't hold up" is exactly as
 valid an output as "yes" — never manufacture a positive spin the evidence
 doesn't support. Your confidence can never rate higher than the lowest
 confidence among the inputs you relied on most.
-
 Respond as JSON: {"verdict": <the actual answer, in plain language>,
 "reasoning": <2-4 sentences citing specific points from each side>,
 "confidence": "High"|"Medium"|"Low", "unresolved": <anything the sides
