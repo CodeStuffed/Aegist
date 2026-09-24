@@ -33,6 +33,9 @@ const B: f64 = 0.75;
 const LINK_MIN: f64 = 0.15;
 /// `commit_if_large` moves the in-memory passages to disk past this many.
 const TAIL_COMMIT: usize = 5_000;
+/// Opening indexes on disk first when more passage text than this isn't
+/// (a fresh import, an old index version): never load it all into RAM.
+const MAX_UNINDEXED_BYTES: u64 = 256 << 20;
 /// Postings held in memory while building a segment before spilling a sorted
 /// run to disk (~8 bytes each, plus the words): bounds RAM at any size.
 const CHUNK_POSTINGS: usize = 30_000_000;
@@ -626,6 +629,7 @@ pub struct KnowledgeStore {
     reader: Option<File>,
     /// postings per sorted run when committing (small in tests, to exercise merging)
     chunk_postings: usize,
+    max_unindexed: u64,
 }
 
 /// Where a passage lives.
@@ -640,24 +644,30 @@ impl KnowledgeStore {
     }
 
     pub fn open(settings: &Settings) -> Result<Self> {
-        Self::open_at(Self::path_for(settings), CHUNK_POSTINGS)
+        Self::open_at(Self::path_for(settings), CHUNK_POSTINGS, MAX_UNINDEXED_BYTES)
     }
 
-    fn open_at(path: PathBuf, chunk_postings: usize) -> Result<Self> {
+    fn open_at(path: PathBuf, chunk_postings: usize, max_unindexed: u64) -> Result<Self> {
+        let dir = path.with_file_name("index");
+        let unindexed = unindexed_bytes(&path, &dir);
+        if unindexed > max_unindexed {
+            eprintln!("Indexing {:.0} MB of knowledge-base passages on disk (once; it can take a while)...", unindexed as f64 / 1e6);
+            build_index(&path, &dir, chunk_postings, true)?;
+        }
         // A merge in another process can delete a segment between reading
         // the manifest and mapping it; the new manifest is then already there.
         for _ in 0..5 {
-            if let Ok(kb) = Self::try_open(&path, chunk_postings, true) {
+            if let Ok(kb) = Self::try_open(&path, chunk_postings, max_unindexed, true) {
                 return Ok(kb);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // index damaged (e.g. a folder deleted by hand): read the passages
         // directly; the next commit rebuilds it
-        Self::try_open(&path, chunk_postings, false)
+        Self::try_open(&path, chunk_postings, max_unindexed, false)
     }
 
-    fn try_open(path: &Path, chunk_postings: usize, use_index: bool) -> Result<Self> {
+    fn try_open(path: &Path, chunk_postings: usize, max_unindexed: u64, use_index: bool) -> Result<Self> {
         let dir = path.with_file_name("index");
         let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let mut manifest = read_manifest(&dir);
@@ -673,6 +683,7 @@ impl KnowledgeStore {
             tail: Tail { base, ..Tail::default() },
             reader: File::open(path).ok(),
             chunk_postings,
+            max_unindexed,
         };
         if let Some(f) = &mut kb.reader {
             f.seek(SeekFrom::Start(start_byte))?;
@@ -730,44 +741,10 @@ impl KnowledgeStore {
     /// If another process is committing right now, does nothing (it will
     /// pick these passages up too).
     pub fn commit(&mut self) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
-        let lock = File::create(self.dir.join(".lock"))?;
-        if lock.try_lock().is_err() {
-            return Ok(());
+        if build_index(&self.path, &self.dir, self.chunk_postings, false)? {
+            let path = self.path.clone();
+            *self = Self::open_at(path, self.chunk_postings, self.max_unindexed)?;
         }
-        let end = complete_len(&self.path)?;
-        let mut manifest = read_manifest(&self.dir);
-        if manifest.segments.last().is_some_and(|s| s.end_byte > end) {
-            manifest.segments.clear();
-        }
-        let (start_doc, start_byte) = manifest.segments.last().map_or((0, 0), |s| (s.end_doc, s.end_byte));
-        if end > start_byte {
-            manifest.segments.push(build_segment(&self.path, &self.dir, start_doc, start_byte, end, self.chunk_postings)?);
-            // like a binary counter: a segment at least half its predecessor's size merges into it
-            while let [.., a, b] = manifest.segments.as_slice() {
-                if (b.end_doc - b.start_doc) * 2 < a.end_doc - a.start_doc {
-                    break;
-                }
-                let merged = build_segment(&self.path, &self.dir, a.start_doc, a.start_byte, b.end_byte, self.chunk_postings)?;
-                manifest.segments.truncate(manifest.segments.len() - 2);
-                manifest.segments.push(merged);
-            }
-            manifest.segments.retain(|s| s.end_doc > s.start_doc || s.end_byte > s.start_byte);
-            manifest.version = INDEX_VERSION;
-            write_atomic(&self.dir.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
-        }
-        // remove segments no longer listed (and leftovers of interrupted builds);
-        // on Windows one still mapped by a running `ask` stays until next time
-        let keep: HashSet<&str> = manifest.segments.iter().map(|s| s.dir.as_str()).collect();
-        for e in std::fs::read_dir(&self.dir)?.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("seg-") && !keep.contains(name.as_str()) {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
-        let path = self.path.clone();
-        *self = Self::open_at(path, self.chunk_postings)?;
-        drop(lock);
         Ok(())
     }
 
@@ -1009,6 +986,62 @@ impl KnowledgeStore {
     }
 }
 
+/// Bytes of passages.jsonl that no intact on-disk segment covers.
+fn unindexed_bytes(path: &Path, dir: &Path) -> u64 {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let m = read_manifest(dir);
+    let intact = m.segments.iter().all(|s| dir.join(&s.dir).join("docs.bin").is_file());
+    match m.segments.last() {
+        Some(s) if intact && s.end_byte <= len => len - s.end_byte,
+        _ => len,
+    }
+}
+
+/// Index everything after the last on-disk segment into a new segment, and
+/// merge. Returns false if another process holds the lock (unless `wait`).
+fn build_index(path: &Path, dir: &Path, chunk_postings: usize, wait: bool) -> Result<bool> {
+    std::fs::create_dir_all(dir)?;
+    let lock = File::create(dir.join(".lock"))?;
+    if wait {
+        lock.lock()?;
+    } else if lock.try_lock().is_err() {
+        return Ok(false);
+    }
+    let end = complete_len(path)?;
+    let mut manifest = read_manifest(dir);
+    let intact = manifest.segments.iter().all(|s| dir.join(&s.dir).join("docs.bin").is_file());
+    if !intact || manifest.segments.last().is_some_and(|s| s.end_byte > end) {
+        manifest.segments.clear(); // damaged or stale: start over
+    }
+    let (start_doc, start_byte) = manifest.segments.last().map_or((0, 0), |s| (s.end_doc, s.end_byte));
+    if end > start_byte {
+        manifest.segments.push(build_segment(path, dir, start_doc, start_byte, end, chunk_postings)?);
+        // like a binary counter: a segment at least half its predecessor's size merges into it
+        while let [.., a, b] = manifest.segments.as_slice() {
+            if (b.end_doc - b.start_doc) * 2 < a.end_doc - a.start_doc {
+                break;
+            }
+            let merged = build_segment(path, dir, a.start_doc, a.start_byte, b.end_byte, chunk_postings)?;
+            manifest.segments.truncate(manifest.segments.len() - 2);
+            manifest.segments.push(merged);
+        }
+        manifest.segments.retain(|s| s.end_doc > s.start_doc || s.end_byte > s.start_byte);
+        manifest.version = INDEX_VERSION;
+        write_atomic(&dir.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
+    }
+    // remove segments no longer listed (and leftovers of interrupted builds);
+    // on Windows one still mapped by a running `ask` stays until next time
+    let keep: HashSet<&str> = manifest.segments.iter().map(|s| s.dir.as_str()).collect();
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("seg-") && !keep.contains(name.as_str()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+    drop(lock);
+    Ok(true)
+}
+
 /// Appends passages to passages.jsonl without indexing them (see `KnowledgeStore::bulk`).
 pub struct BulkWriter<'a> {
     kb: &'a KnowledgeStore,
@@ -1172,7 +1205,7 @@ mod tests {
         let s = testing::settings(tmp.path());
         let path = KnowledgeStore::path_for(&s);
         // tiny runs, so building the segment spills and merges many of them
-        let mut kb = KnowledgeStore::open_at(path.clone(), 50).unwrap();
+        let mut kb = KnowledgeStore::open_at(path.clone(), 50, MAX_UNINDEXED_BYTES).unwrap();
         fill(&mut kb, 400, 1);
         let before = answers(&kb);
         assert!(before.iter().filter(|h| !h.is_empty()).count() > 40);
@@ -1191,7 +1224,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = testing::settings(tmp.path());
         let path = KnowledgeStore::path_for(&s);
-        let mut kb = KnowledgeStore::open_at(path.clone(), 1000).unwrap();
+        let mut kb = KnowledgeStore::open_at(path.clone(), 1000, MAX_UNINDEXED_BYTES).unwrap();
         for round in 0..9 {
             fill(&mut kb, 30, 100 + round);
             kb.commit().unwrap();
@@ -1215,6 +1248,27 @@ mod tests {
         let dirs = std::fs::read_dir(path.with_file_name("index")).unwrap().flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("seg-")).count();
         assert_eq!(dirs, kb.stats().0);
+    }
+
+    #[test]
+    fn opening_indexes_a_big_unindexed_store_instead_of_loading_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = testing::settings(tmp.path());
+        let path = KnowledgeStore::path_for(&s);
+        let mut kb = KnowledgeStore::open(&s).unwrap();
+        fill(&mut kb, 200, 4);
+        let before = answers(&kb);
+        // over the limit: opening builds the on-disk index first
+        let big = KnowledgeStore::open_at(path.clone(), 1000, 2000).unwrap();
+        assert_eq!((big.stats().1, big.stats().2), (200, 0));
+        assert_eq!(answers(&big), before);
+        // a segment folder deleted by hand: the index is rebuilt from scratch
+        let seg = std::fs::read_dir(path.with_file_name("index")).unwrap().flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("seg-")).unwrap();
+        std::fs::remove_dir_all(seg.path()).unwrap();
+        let rebuilt = KnowledgeStore::open_at(path.clone(), 1000, 2000).unwrap();
+        assert_eq!((rebuilt.stats().1, rebuilt.stats().2), (200, 0));
+        assert_eq!(answers(&rebuilt), before);
     }
 
     #[test]
