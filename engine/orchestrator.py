@@ -12,6 +12,7 @@ import logging
 from datetime import datetime, timezone
 
 import numpy as np
+from threadpoolctl import threadpool_limits
 
 from config import load_settings
 from engine import uncertainty
@@ -132,6 +133,14 @@ def evaluate(claim: str, *, recheck: bool | None = None, record: bool = True,
     uncertainty.enabled in settings.yaml). record: log the session so the
     research loop can learn what you ask about.
     """
+    # One sequence at a time gains nothing from multithreaded BLAS, and if
+    # training is running alongside, the extra threads fight it for cores
+    # (a ~40x slowdown when measured).
+    with threadpool_limits(limits=1):
+        return _evaluate(claim, recheck, record, settings)
+
+
+def _evaluate(claim: str, recheck: bool | None, record: bool, settings: dict | None) -> dict:
     settings = settings if settings is not None else load_settings()
     brain = load_brain(settings)
     routing = route(claim, settings)
