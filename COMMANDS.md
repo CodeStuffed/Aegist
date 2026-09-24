@@ -16,6 +16,7 @@ council <command> [options]
 | [`ask`](#ask) | Put a claim in front of the council | **Yes** | No |
 | [`import-wikipedia`](#import-wikipedia) | Add a Wikipedia download to the text and the knowledge base | No | No (you download the file) |
 | [`gpu-check`](#gpu-check) | Test an NVIDIA GPU for training | No | No |
+| [`remember`](#remember) | Add your own documents (any size) to the knowledge base | No | No |
 | [`eval`](#eval) | Measure how well the model tells true from false | **Yes** | No |
 
 - `council --help` lists the commands; `council <command> --help` lists one
@@ -316,6 +317,32 @@ council gpu-check
 
 Exits with status 1 when no usable GPU is found (the message says what's
 missing). Setup steps and troubleshooting: [GPU_TRAINING.md](GPU_TRAINING.md).
+
+---
+
+## `remember`
+
+**Adds your own documents to the knowledge base, so every question can look
+things up in them.**
+
+```bash
+council remember <file or folder>
+```
+
+- Takes a `.txt` or `.md` file, or a folder of them (searched recursively),
+  of any size: a book, years of notes, a pile of reports.
+- Each document is cut into passages of a few paragraphs (long paragraphs
+  are split between sentences) and linked in reading order.
+- When you `ask`, the passages that match the claim are found, plus the
+  passages just before and after them, as much as fits in the model's
+  context. This is how a model that reads 1,024 tokens at a time can use
+  documents of millions.
+- The search index lives on disk, so size costs disk space, not memory.
+- Remembering the same text twice adds nothing new.
+
+This is separate from `train --data`, which teaches the model from text
+(changing its weights). `remember` only makes text available to look up. You
+can do both with the same folder.
 
 ---
 

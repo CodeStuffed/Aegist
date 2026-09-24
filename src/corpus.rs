@@ -37,6 +37,20 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every .txt/.md file in `path` (a file or a folder, searched recursively), sorted.
+pub fn text_files(path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if path.is_file() {
+        if is_text(path) {
+            files.push(path.to_path_buf());
+        }
+    } else {
+        walk(path, &mut files);
+    }
+    files.sort();
+    files
+}
+
 pub fn corpus_files(settings: &Settings) -> Vec<PathBuf> {
     let mut files = Vec::new();
     walk(&corpus_dir(settings), &mut files);

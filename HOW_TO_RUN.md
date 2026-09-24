@@ -143,6 +143,8 @@ command, see **[COMMANDS.md](COMMANDS.md)**.
 | `council ask "<claim>"` | Put a claim in front of the council. |
 | `council import-wikipedia <dump.xml.bz2>` | Add a whole Wikipedia download to the training text and the knowledge base. |
 | `council gpu-check` | Test an NVIDIA GPU for training (see [GPU_TRAINING.md](GPU_TRAINING.md)). |
+| `council remember <file or folder>` | Add your own documents, of any size, for `ask` to look things up in. |
+| `council eval` | Measure how often the model tells a true claim from a false one. |
 
 **Ctrl+C** stops `train` or `research` at any time. It saves first, so nothing is lost.
 

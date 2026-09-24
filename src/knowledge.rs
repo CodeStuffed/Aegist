@@ -1046,6 +1046,75 @@ fn build_index(path: &Path, dir: &Path, chunk_postings: usize, wait: bool) -> Re
     Ok(true)
 }
 
+/// A document cut into passages of about `target` characters: paragraphs,
+/// short ones joined with the next, long ones split between sentences.
+pub fn document_passages(text: &str, target: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let push = |current: &mut String, out: &mut Vec<String>| {
+        if current.chars().filter(|c| c.is_alphabetic()).count() >= 3 {
+            out.push(std::mem::take(current));
+        }
+        current.clear();
+    };
+    for para in text.split("\n\n").map(normalize).filter(|p| !p.is_empty()) {
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(&para);
+        while current.len() > 2 * target {
+            // split a long run of text after the sentence end nearest `target`
+            let cut = current
+                .match_indices(". ")
+                .map(|(i, _)| i + 1)
+                .min_by_key(|&i| i.abs_diff(target))
+                .filter(|&i| i >= target / 3)
+                .unwrap_or_else(|| {
+                    let mut i = target;
+                    while !current.is_char_boundary(i) {
+                        i += 1;
+                    }
+                    i
+                });
+            let rest = current[cut..].trim_start().to_string();
+            current.truncate(cut);
+            push(&mut current, &mut out);
+            current = rest;
+        }
+        if current.len() >= target / 2 {
+            push(&mut current, &mut out);
+        }
+    }
+    push(&mut current, &mut out);
+    out
+}
+
+/// Add documents (a .txt/.md file, or a folder of them) to the knowledge
+/// base, each cut into passages linked in reading order. Returns (files, new passages).
+pub fn remember(settings: &Settings, path: &Path) -> Result<(usize, usize)> {
+    anyhow::ensure!(path.exists(), "{} doesn't exist", path.display());
+    let files = crate::corpus::text_files(path);
+    let mut kb = KnowledgeStore::open(settings)?;
+    let mut added = 0;
+    {
+        let mut w = kb.bulk()?;
+        for f in &files {
+            let text = crate::corpus::normalize_text(&String::from_utf8_lossy(&std::fs::read(f)?));
+            let title = f.file_stem().map(|s| s.to_string_lossy().replace(['_', '-'], " ")).unwrap_or_default();
+            for p in document_passages(&text, 600) {
+                let mut meta = Map::new();
+                meta.insert("title".into(), Value::from(title.clone()));
+                meta.insert("source".into(), Value::from("document"));
+                meta.insert("path".into(), Value::from(f.to_string_lossy().into_owned()));
+                added += w.add(&p, meta)? as usize;
+            }
+        }
+        w.finish()?;
+    }
+    kb.commit()?;
+    Ok((files.len(), added))
+}
+
 /// Appends passages to passages.jsonl without indexing them (see `KnowledgeStore::bulk`).
 pub struct BulkWriter<'a> {
     kb: &'a KnowledgeStore,
@@ -1273,6 +1342,35 @@ mod tests {
         let rebuilt = KnowledgeStore::open_at(path.clone(), 1000, 2000).unwrap();
         assert_eq!((rebuilt.stats().1, rebuilt.stats().2), (200, 0));
         assert_eq!(answers(&rebuilt), before);
+    }
+
+    #[test]
+    fn documents_are_remembered_as_linked_passages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = testing::settings(&tmp.path().join("data"));
+        let docs = tmp.path().join("docs");
+        std::fs::create_dir_all(docs.join("sub")).unwrap();
+        let para = |w: &str| format!("{w} ").repeat(60);
+        std::fs::write(docs.join("field_notes.md"), format!("{}\n\n{}\n\n{}", para("heron"), para("marsh"), para("reeds"))).unwrap();
+        std::fs::write(docs.join("sub/other.txt"), "Short.\n\nAlso short but has words.").unwrap();
+        std::fs::write(docs.join("image.png"), [0u8; 4]).unwrap();
+        let (files, added) = remember(&s, &docs).unwrap();
+        assert_eq!(files, 2);
+        assert!(added >= 3, "{added}");
+        let kb = KnowledgeStore::open(&s).unwrap();
+        let hits = kb.search_linked("heron", 1, 0.1, 100_000);
+        assert_eq!(hits[0].passage.meta("title"), "field notes");
+        assert!(hits.iter().any(|h| h.via.contains("next to it in field notes")), "{:?}", hits.iter().map(|h| &h.via).collect::<Vec<_>>());
+        assert_eq!(remember(&s, &docs).unwrap().1, 0); // already remembered
+    }
+
+    #[test]
+    fn long_text_is_cut_between_sentences() {
+        let text = "One sentence here. ".repeat(200);
+        let ps = document_passages(&text, 300);
+        assert!(ps.len() > 5 && ps.iter().all(|p| p.len() <= 700 && p.ends_with('.')), "{:?}", ps.iter().map(|p| p.len()).collect::<Vec<_>>());
+        assert_eq!(document_passages("a\n\nb", 300), Vec::<String>::new());
+        assert_eq!(document_passages("Hello there.\n\nGeneral Kenobi.", 300), vec!["Hello there. General Kenobi."]);
     }
 
     #[test]

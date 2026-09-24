@@ -83,6 +83,12 @@ enum Command {
         #[arg(long, value_enum)]
         device: Option<Device>,
     },
+    /// Add your own documents (a .txt/.md file or a folder of them, any size) to
+    /// the knowledge base: every question then looks up the relevant parts.
+    Remember {
+        /// A file or a folder of .txt / .md files.
+        path: PathBuf,
+    },
     /// Measure how well the trained model tells true claims from false ones
     /// (built from article first sentences in the corpus).
     Eval {
@@ -237,6 +243,11 @@ fn run(command: Command) -> Result<ExitCode> {
             if r.articles > 0 {
                 println!("Next: `council train --hours <how long>` trains on it (see `council doctor` for sizes).");
             }
+        }
+        Command::Remember { path } => {
+            let (files, added) = council::knowledge::remember(&settings, &path)?;
+            println!("Remembered {} new passage(s) from {files} file(s); `ask` now looks them up (and the passages next to them).",
+                commas(added as u64));
         }
         Command::Eval { pairs } => {
             let brain = Brain::load(&settings)?;
