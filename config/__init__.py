@@ -14,16 +14,11 @@ import os
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "config"
 PERSONA_DIR = CONFIG_DIR / "personas"
 DEFAULT_SETTINGS_PATH = CONFIG_DIR / "settings.yaml"
-
-# Pick up ANTHROPIC_API_KEY (and friends) from a local .env. Existing
-# environment variables win over the file.
-load_dotenv(ROOT / ".env")
 
 
 def settings_path() -> Path:

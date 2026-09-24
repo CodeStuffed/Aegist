@@ -1,7 +1,5 @@
-anthropic
-chromadb
+numpy
 psutil
-python-dotenv
 PyYAML
-pytest
 requests
+pytest
