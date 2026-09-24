@@ -453,8 +453,9 @@ fn render(r: &Evaluation) -> String {
     if let Some(n) = &r.negation_test {
         out.push(format!("NEGATION TEST  [{}]  {:+.2}", n.confidence, n.contrast));
         out.push(wrap(&format!("Against: \"{}\"", n.flipped), WIDTH, "  ", ""));
-        out.push(wrap(&format!("The rest of the claim is {} likely as stated ({:.2} vs. {:.2} nats/token).",
-            if n.contrast >= 0.0 { "more" } else { "less" }, n.stated_logp, n.flipped_logp), WIDTH, "  ", ""));
+        out.push(wrap(&format!("The rest of the claim after the verb as stated vs. flipped: {:+.2} nats/token; for any subject \
+            (\"It is\" vs. \"It is not\") it would be {:+.2}, so this subject adds {:+.2}.",
+            n.raw_contrast, n.baseline, n.contrast), WIDTH, "  ", ""));
         out.push(String::new());
     }
     out.extend(render_judge(&r.judge, "JUDGE"));

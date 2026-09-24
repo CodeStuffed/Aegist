@@ -80,6 +80,11 @@ pub struct Negation {
     pub rest: String,
     /// the flipped claim in full
     pub flipped: String,
+    /// the same verb, as stated and flipped, after a generic subject
+    /// ("It is" / "It is not"): the baseline that removes the general cost
+    /// of "not" from the comparison
+    pub generic_stated: String,
+    pub generic_flipped: String,
 }
 
 /// How much more likely the rest of the claim is after its stated polarity
@@ -89,8 +94,12 @@ pub struct NegationTest {
     pub flipped: String,
     pub stated_logp: f32,
     pub flipped_logp: f32,
-    /// > 0 supports the claim as stated
+    /// > 0 supports the claim as stated: raw_contrast minus baseline
     pub contrast: f32,
+    /// stated minus flipped, for the claim's own subject
+    pub raw_contrast: f32,
+    /// the same for a generic subject: how much "not" costs this sentence anyway
+    pub baseline: f32,
     pub confidence: Confidence,
 }
 
@@ -143,13 +152,31 @@ pub fn negate(claim: &str) -> Option<Negation> {
         if !rest.chars().any(|c| c.is_alphabetic()) {
             return None;
         }
-        return Some(Negation { flipped: format!("{flipped} {rest}"), stated_prefix: stated, flipped_prefix: flipped, rest });
+        // the verb part alone, after a subject it agrees with
+        let subject = join(&words[..i]);
+        let verb = |prefix: &str| prefix[subject.len()..].trim().to_string();
+        let (sv, fv) = (verb(&stated), verb(&flipped));
+        let base = if lower == "am" {
+            "I"
+        } else if ["are", "were", "have", "do", "aren't", "weren't", "haven't", "don't"].contains(&lower.as_str()) {
+            "They"
+        } else {
+            "It"
+        };
+        return Some(Negation {
+            flipped: format!("{flipped} {rest}"),
+            stated_prefix: stated,
+            flipped_prefix: flipped,
+            rest,
+            generic_stated: format!("{base} {sv}"),
+            generic_flipped: format!("{base} {fv}"),
+        });
     }
     None
 }
 
 /// Evidence, then `text` - as build_prompt, without making `text` a sentence.
-fn evidence_then(text: &str, passages: &[&Hit]) -> String {
+pub fn evidence_then(text: &str, passages: &[&Hit]) -> String {
     let mut parts: Vec<String> = passages.iter().rev().map(|h| h.passage.text.clone()).collect();
     parts.push(text.to_string());
     parts.join("\n\n")
@@ -165,16 +192,22 @@ fn negation_room(brain: &Brain, neg: &Negation) -> usize {
 /// (`evidence_prefix`), shared by both versions of the claim.
 pub fn negation_test(brain: &Brain, neg: &Negation, evidence: &Prefix, settings: &Settings, mut rng: Option<&mut Rng>) -> NegationTest {
     let rest = vec![format!(" {}", neg.rest)];
-    let stated_p = brain.extend(evidence, &neg.stated_prefix, rng.as_deref_mut());
-    let stated = brain.score_after(&stated_p, &rest, rng.as_deref_mut())[0];
-    let flipped_p = brain.extend(evidence, &neg.flipped_prefix, rng.as_deref_mut());
-    let flipped = brain.score_after(&flipped_p, &rest, rng)[0];
-    let contrast = stated - flipped;
+    let mut after = |prefix: &str| {
+        let p = brain.extend(evidence, prefix, rng.as_deref_mut());
+        brain.score_after(&p, &rest, rng.as_deref_mut())[0]
+    };
+    let (stated, flipped) = (after(&neg.stated_prefix), after(&neg.flipped_prefix));
+    let baseline = after(&neg.generic_stated) - after(&neg.generic_flipped);
+    let raw = stated - flipped;
+    let contrast = raw - baseline;
+    let r = |x: f32| (x * 1000.0).round() / 1000.0;
     NegationTest {
         flipped: neg.flipped.clone(),
-        stated_logp: (stated * 1000.0).round() / 1000.0,
-        flipped_logp: (flipped * 1000.0).round() / 1000.0,
-        contrast: (contrast * 1000.0).round() / 1000.0,
+        stated_logp: r(stated),
+        flipped_logp: r(flipped),
+        contrast: r(contrast),
+        raw_contrast: r(raw),
+        baseline: r(baseline),
         confidence: confidence_from_signal(contrast.abs(), settings),
     }
 }
@@ -620,6 +653,10 @@ mod tests {
         assert_eq!(n("We can't win this market"), t("We can't", "We can", "win this market."));
         assert_eq!(n("The firm has grown quickly"), t("The firm has", "The firm has not", "grown quickly."));
         assert_eq!(negate("It isn’t cheap").unwrap().flipped, "It is cheap.");
+        let g = negate("Heavy objects do not fall faster").unwrap();
+        assert_eq!((g.generic_stated.as_str(), g.generic_flipped.as_str()), ("They do not", "They do"));
+        let g = negate("The firm will grow").unwrap();
+        assert_eq!((g.generic_stated.as_str(), g.generic_flipped.as_str()), ("It will", "It will not"));
         assert_eq!(n("I have a dog"), None); // "have" as a main verb
         assert_eq!(n("They had to leave"), None);
         assert_eq!(n("Prices have fallen"), t("Prices have", "Prices have not", "fallen."));
@@ -629,7 +666,7 @@ mod tests {
     }
 
     fn negation(contrast: f32, confidence: Confidence) -> NegationTest {
-        NegationTest { flipped: "x is not y".into(), stated_logp: 0.0, flipped_logp: -contrast, contrast, confidence }
+        NegationTest { flipped: "x is not y".into(), stated_logp: 0.0, flipped_logp: -contrast, contrast, raw_contrast: contrast, baseline: 0.0, confidence }
     }
 
     #[test]
