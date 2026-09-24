@@ -41,8 +41,8 @@ council gpu-check
 ```
 
 It compiles the GPU code for your card, runs a small model through **both
-the GPU and the CPU**, and checks that every gradient matches: exactly in
-fp32, and within bf16's rounding for the bf16 path. Then it
+the GPU and the CPU**, and checks that every gradient matches: to within
+0.1% in fp32, and within bf16's rounding for the bf16 path. Then it
 measures the card's speed and lists which model sizes fit. You should see
 `Check passed`. If not, the message says what's missing (driver, CUDA
 Toolkit, or a result that doesn't match).
@@ -107,11 +107,14 @@ What `train` does with a new model:
    stop improving early. The log says which size it picked and why.
    `council gpu-check` shows the choice in advance.
 2. **Learns a 32,768-token vocabulary** from a sample spread across all
-   your text (seconds).
-3. **Turns all the text into tokens once.** For all of Wikipedia that's
-   minutes at the measured 60–75 MB/s on 4 cores, and later runs reuse it.
-4. **Trains**, printing progress every 10 seconds and saving every 5
-   minutes. Ctrl-C saves and stops; the same command continues.
+   your text (seconds: 1.2 s from 11 MB of Wikipedia text on the test
+   machine).
+3. **Turns all the text into tokens once.** At the 35 MB/s measured on 4
+   busy cores that's about ten minutes for all of Wikipedia, and later runs
+   reuse it.
+4. **Trains**, printing progress every 10 seconds and saving every 30
+   minutes (`gpu.checkpoint_every_s`). Ctrl-C saves and stops; the same
+   command continues.
 
 **Training in several sessions?** Give the total up front so the size fits
 it: `council train --plan-hours 96 --hours 24` today, then
@@ -161,8 +164,10 @@ run on a 5080 yet); the real numbers print when training starts.
 as GPT-2 (2019):
 - It writes fluent, Wikipedia-style English.
 - It knows common facts some of the time.
-- Its sense of which statements "sound true" is much better than a
-  CPU-trained model's, which is what the council measures.
+- How well it tells true claims from false ones is what the council relies
+  on, and `council eval` measures it. For comparison, a tiny model trained
+  for an hour on a CPU scored at chance (50%). How much better a GPU-trained
+  model does hasn't been measured yet; this code hasn't run on a real card.
 
 It will **not**:
 - follow instructions or chat;
