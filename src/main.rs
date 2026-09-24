@@ -253,7 +253,13 @@ fn doctor(settings: &Settings) -> Result<()> {
     }
 
     println!("Memory");
-    println!("  {} passage(s) in the knowledge base", KnowledgeStore::open(settings)?.count());
+    let kb = KnowledgeStore::open(settings)?;
+    let (segments, on_disk, in_memory, bytes) = kb.stats();
+    println!("  {} passage(s) in the knowledge base", commas(kb.count() as u64));
+    if segments > 0 {
+        println!("  Search index: {} passage(s) on disk in {segments} segment(s), {:.1} MB, memory-mapped; {} in memory",
+                 commas(on_disk as u64), bytes as f64 / 1e6, commas(in_memory as u64));
+    }
     println!("  {} past council session(s)", session_log::sessions(settings).len());
     Ok(())
 }

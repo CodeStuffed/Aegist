@@ -206,6 +206,7 @@ pub fn store_articles(topic: &str, articles: &[Article], settings: &Settings, kb
             std::fs::write(corpus.join(format!("{}.txt", slug(&a.title))), passages.join("\n\n"))?;
         }
     }
+    kb.commit_if_large()?;
     Ok(stored)
 }
 
