@@ -473,7 +473,8 @@ OVERALL CONFIDENCE: Medium                                                      
 6. **The quote:** the persona's position, written by the model itself.
    Expect rough text from a small model; the signal is what counts.
 7. **Evidence:** stored passages that pushed the model toward this persona's
-   side, with how much each one moved the signal.
+   side, with how much each one moved the signal (the 5 strongest passages
+   are checked one by one).
 8. **Judge confidence:** "capped from High" means its own estimate was
    higher, but a rule lowered it. **Relied on** is whose case the verdict
    rests on; the Judge can never be more confident than those personas.
