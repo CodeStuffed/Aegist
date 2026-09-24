@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 
 import psutil
 
@@ -89,12 +90,19 @@ def pick_tier(memory_gb: float, tiers: dict) -> str:
     return ordered[-1][0]
 
 
-def detect_hardware(settings: dict | None = None) -> dict:
-    """Return {"tier": str, "ram_gb": float, "vram_gb": float, "cpu_cores": int, ...}."""
-    settings = settings if settings is not None else load_settings()
+@lru_cache(maxsize=1)
+def _measure() -> tuple[float, float, str, int]:
+    """The raw numbers don't change while the process runs, so probe once."""
     ram_gb = psutil.virtual_memory().total / GIB
     vram_gb, vram_source = detect_vram()
     cpu_cores = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+    return ram_gb, vram_gb, vram_source, cpu_cores
+
+
+def detect_hardware(settings: dict | None = None) -> dict:
+    """Return {"tier": str, "ram_gb": float, "vram_gb": float, "cpu_cores": int, ...}."""
+    settings = settings if settings is not None else load_settings()
+    ram_gb, vram_gb, vram_source, cpu_cores = _measure()
     # A model has to fit somewhere: system RAM normally, or the GPU if it's
     # the bigger pool.
     tier = pick_tier(max(ram_gb, vram_gb), settings["local"]["tiers"])
