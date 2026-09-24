@@ -237,6 +237,9 @@ pub struct Evaluation {
     pub confidence_note: Option<String>,
 }
 
+/// Passages checked one by one for how they moved each persona.
+const MAX_ATTRIBUTED: usize = 5;
+
 pub const LOW_NOTE: &str = "Low confidence: the council didn't agree with itself on a repeat run";
 
 pub fn confidence_from_signal(signal: f32, settings: &Settings) -> Confidence {
@@ -396,7 +399,8 @@ pub fn run_council(
     let per_passage: Vec<Vec<f32>> = if stochastic {
         Vec::new()
     } else {
-        refs.iter().map(|h| scorer.pmi_all(&build_prompt(claim, &[*h]), None)).collect()
+        // the strongest few (matches first, then the strongest links): one model pass each
+        refs.iter().take(MAX_ATTRIBUTED).map(|h| scorer.pmi_all(&build_prompt(claim, &[*h]), None)).collect()
     };
 
     let mut panel = Vec::new();
