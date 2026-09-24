@@ -43,6 +43,8 @@ pub struct TrainingSettings {
     pub weight_decay: f32,
     pub grad_clip: f32,
     pub val_fraction: f64,
+    #[serde(default = "default_max_val")]
+    pub max_val_tokens: usize,
     pub eval_batches: usize,
     pub eval_every_s: f64,
     pub checkpoint_every_s: f64,
@@ -124,6 +126,10 @@ impl Default for InferenceSettings {
     }
 }
 
+fn default_max_val() -> usize {
+    20_000_000
+}
+
 /// Where training runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -155,6 +161,9 @@ fn default_gpu_lr() -> f32 {
 fn default_gpu_warmup() -> u64 {
     500
 }
+fn default_gpu_checkpoint() -> f64 {
+    1800.0
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GpuSettings {
@@ -169,11 +178,15 @@ pub struct GpuSettings {
     pub learning_rate: f32,
     #[serde(default = "default_gpu_warmup")]
     pub warmup_steps: u64,
+    /// Seconds between checkpoints on the GPU (big models: GBs per save).
+    #[serde(default = "default_gpu_checkpoint")]
+    pub checkpoint_every_s: f64,
 }
 
 impl Default for GpuSettings {
     fn default() -> Self {
-        GpuSettings { device: Device::Auto, precision: GpuPrecision::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(), warmup_steps: default_gpu_warmup() }
+        GpuSettings { device: Device::Auto, precision: GpuPrecision::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(), warmup_steps: default_gpu_warmup(),
+                      checkpoint_every_s: default_gpu_checkpoint() }
     }
 }
 

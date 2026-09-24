@@ -31,6 +31,7 @@ training:
   weight_decay: 0.1
   grad_clip: 1.0
   val_fraction: 0.05         # tail of the corpus held out to measure real progress
+  max_val_tokens: 20000000   # ...but never more than this (a big corpus needs only a sample)
   eval_batches: 8
   eval_every_s: 60
   checkpoint_every_s: 300
@@ -88,6 +89,7 @@ gpu:
   tokens_per_step: 131072    # batch per step on the GPU (split into micro-batches that fit its memory)
   learning_rate: 0.0006      # peak, for the bigger models a GPU trains
   warmup_steps: 500
+  checkpoint_every_s: 1800   # a big model's checkpoint is GBs: save every 30 min (Ctrl-C always saves)
 
 uncertainty:
   enabled: true              # re-run the council with dropout on and compare

@@ -375,7 +375,7 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
             "The corpus is only {} tokens; add more text first (need at least {}).",
             commas(tokens.len() as u64), commas(tcfg.min_corpus_tokens as u64))).into());
     }
-    let n_val = ((tokens.len() as f64 * tcfg.val_fraction) as usize).max(t + 2);
+    let n_val = ((tokens.len() as f64 * tcfg.val_fraction) as usize).min(tcfg.max_val_tokens).max(t + 2);
     let (train_tok, val_tok) = tokens.split_at(tokens.len() - n_val);
     let val_bytes: usize = val_tok.iter().map(|&i| tokenizer.token_len(i as u32)).sum();
     let bits_per_byte = |loss: f32| loss / std::f32::consts::LN_2 * (val_tok.len() as f32 / val_bytes.max(1) as f32);
@@ -385,11 +385,11 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
     let mut opt = AdamW::new(model.num_params(), &model.layout.matrices, tcfg.weight_decay);
     checkpoint::load_optimizer(settings, &mut opt);
     // b sequences per step; eval_rows per held-out batch
-    let (mut engine, b, eval_rows, lr_max, warmup) = match compute {
+    let (mut engine, b, eval_rows, lr_max, warmup, save_every) = match compute {
         Compute::Cpu { .. } => {
             let b = (tcfg.tokens_per_step / t).max(1);
             let engine = Engine::Cpu { acts: Acts::new(&cfg, b, t), grads: vec![0f32; model.num_params()] };
-            (engine, b, b, tcfg.learning_rate, tcfg.warmup_steps)
+            (engine, b, b, tcfg.learning_rate, tcfg.warmup_steps, tcfg.checkpoint_every_s)
         }
         Compute::Gpu { backend, bf16, .. } => {
             let (free, _) = backend.memory()?;
@@ -398,7 +398,7 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
             let b = per_step.div_ceil(seqs) * seqs;
             let engine = Engine::Gpu(Box::new(GpuTrainer::new(&**backend, &model, &opt, seqs, *bf16)?));
             log(format!("Training on the GPU: {} tokens per step, in micro-batches of {seqs} sequences.", commas((b * t) as u64)));
-            (engine, b, seqs, settings.gpu.learning_rate, settings.gpu.warmup_steps)
+            (engine, b, seqs, settings.gpu.learning_rate, settings.gpu.warmup_steps, settings.gpu.checkpoint_every_s)
         }
     };
     let mut rng = Rng::new(seed ^ 0x5eed);
@@ -471,7 +471,7 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
             }
             last_log = now;
         }
-        if now - last_save >= tcfg.checkpoint_every_s {
+        if now - last_save >= save_every {
             meta.stats.train_seconds += now - last_save;
             last_save = now;
             let v = evaluate(&mut engine, &model, &mut ex, &mut ey)?;

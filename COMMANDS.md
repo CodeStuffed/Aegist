@@ -239,7 +239,7 @@ immediately without saving. The next `train` picks up exactly where it left off.
 |---|---|---|
 | `tokens_per_step` | 4096 | Text per learning step (batch size × context length). |
 | `learning_rate` | 0.001 | Peak learning speed. Too high and the loss jumps around; too low and it's slow. |
-| `val_fraction` | 0.05 | Share of text held out to measure `held-out`. |
+| `val_fraction` | 0.05 | Share of text held out to measure `held-out`, up to `max_val_tokens` (20M): a big corpus needs only a sample. |
 | `checkpoint_every_s` | 300 | How often it saves, in seconds. |
 | `min_new_model_chars` | 200000 | Minimum text needed to create a new model. |
 | `tokenizer_train_chars` | 50000000 | Text sampled (evenly across files) to learn a new model's vocabulary. |
@@ -253,6 +253,7 @@ On a GPU, `gpu:` in settings takes over the batch and learning rate:
 | `gpu.tokens_per_step` | 131072 | Text per learning step on the GPU, split into micro-batches that fit its memory. |
 | `gpu.learning_rate` | 0.0006 | Peak learning rate for the bigger models a GPU trains. |
 | `gpu.warmup_steps` | 500 | Steps to ramp the learning rate up. |
+| `gpu.checkpoint_every_s` | 1800 | How often GPU training saves. A big model's checkpoint is several GB, so it saves less often than on the CPU. Ctrl+C always saves. |
 
 ---
 
