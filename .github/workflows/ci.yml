@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+
+  gpu-emulated:
+    # The GPU kernels and the GPU training step, run on a CPU emulator and
+    # checked against the CPU model (no GPU needed).
+    name: GPU kernels (CPU emulation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features gpu-emulator --lib gpu
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: council-linux-x86_64,       bin: council }
+          - { os: macos-latest,   name: council-macos-arm64,        bin: council }
+          - { os: windows-latest, name: council-windows-x86_64.exe, bin: council.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: target/release/${{ matrix.bin }}
