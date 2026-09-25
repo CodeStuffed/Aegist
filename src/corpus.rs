@@ -2,7 +2,7 @@
 //! import, Wikipedia dumps, articles the research loop collects - and its
 //! tokens, cached per file so a growing corpus stays cheap to reload.
 //!
-//! All the tokens are joined into one file on disk (brain/token_cache/all.bin)
+//! All the tokens are joined into one file on disk (brain/token_cache/all-*.bin)
 //! that training memory-maps instead of loading: billions of tokens cost
 //! disk space, not RAM, and the operating system keeps the hot parts cached.
 
@@ -158,9 +158,13 @@ struct Manifest {
     merges_hash: u64,
     /// file -> (size, modified) when its tokens were cached
     files: BTreeMap<String, (u64, u128)>,
-    /// the files whose tokens are in all.bin, in order, with their token counts
+    /// the files whose tokens are in the joined file, in order, with their token counts
     #[serde(default)]
     order: Vec<(String, (u64, u128), u64)>,
+    /// the joined file's name; a rebuild writes a new one, because Windows
+    /// won't replace or delete a file that is memory-mapped
+    #[serde(default)]
+    joined: String,
 }
 
 /// The corpus's tokens, memory-mapped from disk; use it like a `&[u16]`.
@@ -177,7 +181,7 @@ impl std::ops::Deref for Tokens {
         match &self.map {
             // Safety: mappings start page-aligned, and the file holds u16s
             // written little-endian (checked above) and is never truncated
-            // while mapped (rebuilds write a new file and rename it).
+            // (rebuilds write a new file; old ones are only deleted).
             Some(m) => unsafe { std::slice::from_raw_parts(m.as_ptr() as *const u16, m.len() / 2) },
             None => &[],
         }
@@ -244,20 +248,29 @@ pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
         current.insert(rel.as_str(), (*st, n?, bin.as_path()));
     }
 
-    // all.bin: every file's tokens plus a paragraph break. If the files
-    // already in it are unchanged, new files are appended; otherwise rebuilt.
+    // The joined file: every file's tokens plus a paragraph break. If the
+    // files already in it are unchanged, new files are appended (a mapping
+    // made earlier keeps seeing its own length); otherwise a new file is
+    // written under a new name, so no mapped file is ever replaced.
     let sep = u16_bytes(&tok.encode("\n\n").into_iter().map(|i| i as u16).collect::<Vec<_>>());
-    let all = cache.join("all.bin");
+    let joined = if manifest.joined.is_empty() { "all.bin".to_string() } else { manifest.joined.clone() };
     let expected: u64 = manifest.order.iter().map(|(_, _, n)| 2 * n + sep.len() as u64).sum();
-    let reusable = std::fs::metadata(&all).is_ok_and(|m| m.len() == expected)
+    let reusable = std::fs::metadata(cache.join(&joined)).is_ok_and(|m| m.len() == expected)
         && manifest.order.iter().all(|(rel, st, n)| current.get(rel.as_str()).is_some_and(|c| (c.0, c.1) == (*st, *n)));
-    let mut order = if reusable { manifest.order } else { Vec::new() };
+    let (joined, mut order, file) = if reusable {
+        let file = std::fs::OpenOptions::new().append(true).open(cache.join(&joined))?;
+        (joined, manifest.order, file)
+    } else {
+        let mut n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        while cache.join(format!("all-{n:x}.bin")).exists() {
+            n += 1;
+        }
+        let name = format!("all-{n:x}.bin");
+        let file = File::create(cache.join(&name))?;
+        (name, Vec::new(), file)
+    };
     let listed: HashSet<String> = order.iter().map(|(rel, _, _)| rel.clone()).collect();
-    let target = if reusable { all.clone() } else { cache.join("all.tmp") };
-    let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::OpenOptions::new().create(true).append(true).open(&target)?);
-    if !reusable {
-        out.get_ref().set_len(0)?;
-    }
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
     for (rel, _, st, bin) in &entries {
         if listed.contains(rel) {
             continue;
@@ -269,12 +282,18 @@ pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
     }
     out.flush()?;
     drop(out);
-    if !reusable {
-        std::fs::rename(&target, &all)?;
-    }
     let files = entries.iter().map(|(rel, _, st, _)| (rel.clone(), *st)).collect();
-    write_atomic(&manifest_path, &serde_json::to_vec(&Manifest { merges_hash, files, order })?)?;
-    let f = File::open(&all)?;
+    let manifest = Manifest { merges_hash, files, order, joined: joined.clone() };
+    write_atomic(&manifest_path, &serde_json::to_vec(&manifest)?)?;
+    // Older joined files go once nothing maps them (on Windows a mapped one
+    // can't be deleted yet; it is tried again next time).
+    for e in std::fs::read_dir(&cache)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name != joined && name.starts_with("all") && (name.ends_with(".bin") || name.ends_with(".tmp")) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let f = File::open(cache.join(&joined))?;
     let map = if f.metadata()?.len() == 0 { None } else { Some(unsafe { memmap2::Mmap::map(&f)? }) };
     drop(lock);
     Ok(Tokens { map })
@@ -332,6 +351,13 @@ mod tests {
         assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha\n\ndelta epsilon\n\nzeta\n\n");
         std::fs::remove_file(corpus_dir(&s).join("zeta.txt")).unwrap();
         assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha\n\ndelta epsilon\n\n");
+        // a rebuild never touches a file still mapped; old ones go once released
+        assert_eq!(text(&first), "alpha beta gamma\n\ndelta epsilon\n\n");
+        drop(first);
+        corpus_tokens(&tok, &s).unwrap();
+        let joined = std::fs::read_dir(s.data_path("brain/token_cache")).unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("all")).count();
+        assert_eq!(joined, 1);
         assert!(import_texts(&tmp.path().join("missing"), &s).is_err());
     }
 }
