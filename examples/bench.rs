@@ -1,10 +1,10 @@
 //! Training speed for every tier in config/settings.yaml on this machine:
 //!     cargo run --release --example bench
-use council::config::Settings;
-use council::hardware;
-use council::trainer::training_bytes;
-use council::model::{Acts, Model, ModelConfig};
-use council::rng::Rng;
+use aegist::config::Settings;
+use aegist::hardware;
+use aegist::trainer::training_bytes;
+use aegist::model::{Acts, Model, ModelConfig};
+use aegist::rng::Rng;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {

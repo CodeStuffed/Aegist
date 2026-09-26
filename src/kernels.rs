@@ -174,6 +174,11 @@ impl Rope {
         Rope { half, cos, sin }
     }
 
+    /// Positions it has angles for.
+    pub fn max_pos(&self) -> usize {
+        if self.half == 0 { 0 } else { self.cos.len() / self.half }
+    }
+
     /// (cos, sin), each max_pos x head_dim/2.
     pub fn tables(&self) -> (&[f32], &[f32]) {
         (&self.cos, &self.sin)
@@ -258,107 +263,163 @@ fn causal_softmax_rows(s: &mut [f32], t: usize, offset: usize) {
     }
 }
 
+/// Queries handled together by the attention kernels. Each task keeps only
+/// ATT_CHUNK x T scores at a time instead of T x T, which is what makes long
+/// contexts affordable: memory grows with T, not T squared.
+pub const ATT_CHUNK: usize = 128;
+
 /// Causal self-attention for training. qkv rows hold [q | k | v] (q and k
-/// already rotated). Writes out (B*T x C) and keeps the attention weights.
-pub fn attention_fwd(out: &mut [f32], probs: &mut [f32], qkv: &[f32], b: usize, t: usize, c: usize, nh: usize) {
-    assert!(out.len() >= b * t * c && probs.len() >= b * nh * t * t && qkv.len() >= b * t * 3 * c);
+/// already rotated). Writes out (B*T x C) and each row's log-sum-exp of its
+/// scores (B*nh*T), from which the backward pass recomputes the weights -
+/// the T x T weights themselves are never kept.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_fwd(out: &mut [f32], lse: &mut [f32], qkv: &[f32], b: usize, t: usize, c: usize, nh: usize) {
+    assert!(out.len() >= b * t * c && lse.len() >= b * nh * t && qkv.len() >= b * t * 3 * c);
     let hd = c / nh;
     let scale = 1.0 / (hd as f32).sqrt();
-    let (o, q) = (Ptr(out.as_mut_ptr()), ConstPtr(qkv.as_ptr()));
-    probs.par_chunks_mut(t * t).take(b * nh).enumerate().for_each(|(bh, p)| {
+    let chunks = t.div_ceil(ATT_CHUNK);
+    let (o, q, ls) = (Ptr(out.as_mut_ptr()), ConstPtr(qkv.as_ptr()), Ptr(lse.as_mut_ptr()));
+    (0..b * nh * chunks).into_par_iter().for_each(|task| {
+        let (bh, ci) = (task / chunks, task % chunks);
         let (bb, h) = (bh / nh, bh % nh);
-        let (o, q) = (o, q);
+        let (i0, i1) = (ci * ATT_CHUNK, ((ci + 1) * ATT_CHUNK).min(t));
+        let (rows, n) = (i1 - i0, i1);
+        let (o, q, ls) = (o, q, ls);
+        let mut p = vec![0f32; rows * n];
         // SAFETY: offsets stay inside the asserted buffers; this task writes
-        // only rows bb*t.. and columns h*hd.. of `out`, disjoint from others.
+        // only rows i0..i1 of sequence bb, head h's columns of `out`, and the
+        // matching entries of `lse` - disjoint from every other task.
         unsafe {
             let qp = q.0.add(bb * t * 3 * c + h * hd);
             let (kp, vp) = (qp.add(c), qp.add(2 * c));
-            gemm_strided(t, t, hd, p.as_mut_ptr(), t, 1, false, qp, 3 * c, 1, kp, 1, 3 * c, scale);
-            causal_softmax_rows(p, t, 0);
-            gemm_strided(t, hd, t, o.0.add(bb * t * c + h * hd), c, 1, false, p.as_ptr(), t, 1, vp, 3 * c, 1, 1.0);
+            gemm_strided(rows, n, hd, p.as_mut_ptr(), n, 1, false, qp.add(i0 * 3 * c), 3 * c, 1, kp, 1, 3 * c, scale);
+            for r in 0..rows {
+                let row = &mut p[r * n..(r + 1) * n];
+                let valid = i0 + r + 1;
+                let max = row[..valid].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for v in row[..valid].iter_mut() {
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                let inv = 1.0 / sum;
+                row[..valid].iter_mut().for_each(|v| *v *= inv);
+                row[valid..].fill(0.0);
+                *ls.0.add(bh * t + i0 + r) = max + sum.ln();
+            }
+            gemm_strided(rows, hd, n, o.0.add((bb * t + i0) * c + h * hd), c, 1, false, p.as_ptr(), n, 1, vp, 3 * c, 1, 1.0);
         }
     });
 }
 
 /// Backward of attention_fwd: writes d[q | k | v] (gradients w.r.t. the
-/// rotated q and k; the caller un-rotates) into dqkv rows. dout is B*T x C.
+/// rotated q and k; the caller un-rotates) into dqkv rows. dout and `att`
+/// (attention_fwd's output) are B*T x C. The weights are recomputed a chunk
+/// of queries at a time from `lse`.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_bwd(dqkv: &mut [f32], dout: &[f32], qkv: &[f32], probs: &[f32], b: usize, t: usize, c: usize, nh: usize) {
-    assert!(dqkv.len() >= b * t * 3 * c && dout.len() >= b * t * c && probs.len() >= b * nh * t * t);
+pub fn attention_bwd(dqkv: &mut [f32], dout: &[f32], qkv: &[f32], att: &[f32], lse: &[f32], b: usize, t: usize, c: usize, nh: usize) {
+    assert!(dqkv.len() >= b * t * 3 * c && dout.len() >= b * t * c && att.len() >= b * t * c && lse.len() >= b * nh * t);
     let hd = c / nh;
     let scale = 1.0 / (hd as f32).sqrt();
-    let (d, q, g) = (Ptr(dqkv.as_mut_ptr()), ConstPtr(qkv.as_ptr()), ConstPtr(dout.as_ptr()));
-    probs.par_chunks(t * t).take(b * nh).enumerate().for_each(|(bh, p)| {
+    let (d, q, g, a) = (Ptr(dqkv.as_mut_ptr()), ConstPtr(qkv.as_ptr()), ConstPtr(dout.as_ptr()), ConstPtr(att.as_ptr()));
+    (0..b * nh).into_par_iter().for_each(|bh| {
         let (bb, h) = (bh / nh, bh % nh);
-        let (d, q, g) = (d, q, g);
-        let mut ds = vec![0f32; t * t];
-        // SAFETY: as in attention_fwd; this task writes only its own rows and
-        // head columns of the q, k and v blocks of dqkv.
+        let (d, q, g, a) = (d, q, g, a);
+        let lse = &lse[bh * t..(bh + 1) * t];
+        let mut p = vec![0f32; ATT_CHUNK.min(t) * t];
+        let mut dp = vec![0f32; ATT_CHUNK.min(t) * t];
+        // SAFETY: as in attention_fwd; this task writes only its own sequence's
+        // rows and head columns of the q, k and v blocks of dqkv.
         unsafe {
             let qp = q.0.add(bb * t * 3 * c + h * hd);
             let (kp, vp) = (qp.add(c), qp.add(2 * c));
             let dop = g.0.add(bb * t * c + h * hd);
+            let ap = a.0.add(bb * t * c + h * hd);
             let dq = d.0.add(bb * t * 3 * c + h * hd);
             let (dk, dv) = (dq.add(c), dq.add(2 * c));
-            // dP = dO . V^T ;  dV = P^T . dO
-            gemm_strided(t, t, hd, ds.as_mut_ptr(), t, 1, false, dop, c, 1, vp, 1, 3 * c, 1.0);
-            gemm_strided(t, hd, t, dv, 3 * c, 1, false, p.as_ptr(), 1, t, dop, c, 1, 1.0);
-            // dS = P * (dP - rowsum(P * dP)) * scale
+            // D_i = dO_i . O_i  (equals the row sum of P * dP)
+            let dsum: Vec<f32> = (0..t)
+                .map(|i| dot(std::slice::from_raw_parts(dop.add(i * c), hd), std::slice::from_raw_parts(ap.add(i * c), hd)))
+                .collect();
             for i in 0..t {
-                let (pr, dr) = (&p[i * t..(i + 1) * t], &mut ds[i * t..(i + 1) * t]);
-                let s: f32 = (0..=i).map(|j| pr[j] * dr[j]).sum();
-                for j in 0..=i {
-                    dr[j] = pr[j] * (dr[j] - s) * scale;
-                }
-                dr[i + 1..].fill(0.0);
+                std::slice::from_raw_parts_mut(dk.add(i * 3 * c), hd).fill(0.0);
+                std::slice::from_raw_parts_mut(dv.add(i * 3 * c), hd).fill(0.0);
             }
-            // dQ = dS . K ;  dK = dS^T . Q
-            gemm_strided(t, hd, t, dq, 3 * c, 1, false, ds.as_ptr(), t, 1, kp, 3 * c, 1, 1.0);
-            gemm_strided(t, hd, t, dk, 3 * c, 1, false, ds.as_ptr(), 1, t, qp, 3 * c, 1, 1.0);
+            for i0 in (0..t).step_by(ATT_CHUNK) {
+                let i1 = (i0 + ATT_CHUNK).min(t);
+                let (rows, n) = (i1 - i0, i1);
+                let (p, dp) = (&mut p[..rows * n], &mut dp[..rows * n]);
+                gemm_strided(rows, n, hd, p.as_mut_ptr(), n, 1, false, qp.add(i0 * 3 * c), 3 * c, 1, kp, 1, 3 * c, scale);
+                for r in 0..rows {
+                    let row = &mut p[r * n..(r + 1) * n];
+                    let (valid, l) = (i0 + r + 1, lse[i0 + r]);
+                    row[..valid].iter_mut().for_each(|v| *v = (*v - l).exp());
+                    row[valid..].fill(0.0);
+                }
+                // dV[0..n] += P^T . dO_chunk ;  dP = dO_chunk . V^T
+                gemm_strided(n, hd, rows, dv, 3 * c, 1, true, p.as_ptr(), 1, n, dop.add(i0 * c), c, 1, 1.0);
+                gemm_strided(rows, n, hd, dp.as_mut_ptr(), n, 1, false, dop.add(i0 * c), c, 1, vp, 1, 3 * c, 1.0);
+                // dS = P * (dP - D) * scale, written over dP
+                for r in 0..rows {
+                    let (pr, dr) = (&p[r * n..(r + 1) * n], &mut dp[r * n..(r + 1) * n]);
+                    let (valid, di) = (i0 + r + 1, dsum[i0 + r]);
+                    for j in 0..valid {
+                        dr[j] = pr[j] * (dr[j] - di) * scale;
+                    }
+                    dr[valid..].fill(0.0);
+                }
+                // dQ_chunk = dS . K ;  dK[0..n] += dS^T . Q_chunk
+                gemm_strided(rows, hd, n, dq.add(i0 * 3 * c), 3 * c, 1, false, dp.as_ptr(), n, 1, kp, 3 * c, 1, 1.0);
+                gemm_strided(n, hd, rows, dk, 3 * c, 1, true, dp.as_ptr(), 1, n, qp.add(i0 * 3 * c), 3 * c, 1, 1.0);
+            }
         }
     });
 }
 
 /// Attention at inference: B sequences of L new tokens, each continuing a
-/// shared prefix whose keys/values (P x C, already rotated) are cached.
+/// shared prefix whose keys/values (already rotated) are cached. The prefix
+/// may be split into segments - (keys, values), each rows x C - so several
+/// continuations can share one cached prompt without copying it.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_infer(out: &mut [f32], qkv: &[f32], prefix_k: &[f32], prefix_v: &[f32], p: usize, b: usize, l: usize, c: usize, nh: usize) {
-    assert!(out.len() >= b * l * c && qkv.len() >= b * l * 3 * c && prefix_k.len() >= p * c && prefix_v.len() >= p * c);
+pub fn attention_infer(out: &mut [f32], qkv: &[f32], segments: &[(&[f32], &[f32])], b: usize, l: usize, c: usize, nh: usize) {
+    assert!(out.len() >= b * l * c && qkv.len() >= b * l * 3 * c);
+    assert!(segments.iter().all(|(k, v)| k.len() == v.len() && k.len() % c == 0));
     let hd = c / nh;
     let scale = 1.0 / (hd as f32).sqrt();
-    let n = p + l; // score columns: prefix, then this sequence's own tokens
-    let (o, q, pk, pv) = (Ptr(out.as_mut_ptr()), ConstPtr(qkv.as_ptr()), ConstPtr(prefix_k.as_ptr()), ConstPtr(prefix_v.as_ptr()));
+    let segs: Vec<(ConstPtr, ConstPtr, usize)> =
+        segments.iter().filter(|(k, _)| !k.is_empty()).map(|(k, v)| (ConstPtr(k.as_ptr()), ConstPtr(v.as_ptr()), k.len() / c)).collect();
+    let p: usize = segs.iter().map(|s| s.2).sum();
+    let (o, q) = (Ptr(out.as_mut_ptr()), ConstPtr(qkv.as_ptr()));
     if l <= 4 {
         // A few new tokens (generation): plain dot products beat setting up
         // matrix multiplies for such small shapes.
+        let n = p + l;
         let work = b * nh * l * n * hd;
         (0..b * nh).into_par_iter().with_min_len(if work < MIN_ELEMS * 8 { b * nh } else { 1 }).for_each(|bh| {
             let (bb, h) = (bh / nh, bh % nh);
-            let (o, q, pk, pv) = (o, q, pk, pv);
+            let (o, q) = (o, q);
+            let segs = &segs;
             let mut scores = vec![0f32; n];
-            for i in 0..l {
-                // SAFETY: offsets stay inside the asserted buffers, and this task
-                // writes only its own (sequence, head) slice of `out`.
-                unsafe {
+            // SAFETY: offsets stay inside the asserted buffers, and this task
+            // writes only its own (sequence, head) slice of `out`.
+            unsafe {
+                let row_of = |j: usize, block: usize| -> &[f32] {
+                    let mut j = j;
+                    for (k, v, rows) in segs.iter() {
+                        if j < *rows {
+                            let base = if block == 1 { k.0 } else { v.0 };
+                            return std::slice::from_raw_parts(base.add(j * c + h * hd), hd);
+                        }
+                        j -= rows;
+                    }
+                    std::slice::from_raw_parts(q.0.add((bb * l + j) * 3 * c + block * c + h * hd), hd)
+                };
+                for i in 0..l {
                     let qrow = std::slice::from_raw_parts(q.0.add((bb * l + i) * 3 * c + h * hd), hd);
-                    let key = |j: usize| -> &[f32] {
-                        if j < p {
-                            std::slice::from_raw_parts(pk.0.add(j * c + h * hd), hd)
-                        } else {
-                            std::slice::from_raw_parts(q.0.add((bb * l + j - p) * 3 * c + c + h * hd), hd)
-                        }
-                    };
-                    let value = |j: usize| -> &[f32] {
-                        if j < p {
-                            std::slice::from_raw_parts(pv.0.add(j * c + h * hd), hd)
-                        } else {
-                            std::slice::from_raw_parts(q.0.add((bb * l + j - p) * 3 * c + 2 * c + h * hd), hd)
-                        }
-                    };
                     let len = p + i + 1;
                     let mut max = f32::NEG_INFINITY;
                     for (j, sj) in scores[..len].iter_mut().enumerate() {
-                        *sj = dot(qrow, key(j)) * scale;
+                        *sj = dot(qrow, row_of(j, 1)) * scale;
                         max = max.max(*sj);
                     }
                     let mut sum = 0.0;
@@ -370,31 +431,43 @@ pub fn attention_infer(out: &mut [f32], qkv: &[f32], prefix_k: &[f32], prefix_v:
                     out.fill(0.0);
                     for (j, &sj) in scores[..len].iter().enumerate() {
                         let w = sj / sum;
-                        out.iter_mut().zip(value(j)).for_each(|(a, v)| *a += w * v);
+                        out.iter_mut().zip(row_of(j, 2)).for_each(|(a, v)| *a += w * v);
                     }
                 }
             }
         });
         return;
     }
-    (0..b * nh).into_par_iter().for_each(|bh| {
+    // A longer run of new tokens (a prompt): a chunk of queries at a time,
+    // so the scores held at once are ATT_CHUNK x (P + L), never L x (P + L).
+    let chunks = l.div_ceil(ATT_CHUNK);
+    (0..b * nh * chunks).into_par_iter().for_each(|task| {
+        let (bh, ci) = (task / chunks, task % chunks);
         let (bb, h) = (bh / nh, bh % nh);
-        let (o, q, pk, pv) = (o, q, pk, pv);
-        let mut s = vec![0f32; l * n];
-        // SAFETY: as in attention_fwd.
+        let (r0, r1) = (ci * ATT_CHUNK, ((ci + 1) * ATT_CHUNK).min(l));
+        let (rows, cols) = (r1 - r0, p + r1);
+        let (o, q) = (o, q);
+        let mut s = vec![0f32; rows * cols];
+        // SAFETY: as in attention_fwd; this task writes rows r0..r1 of its
+        // own sequence and head in `out`.
         unsafe {
             let qp = q.0.add(bb * l * 3 * c + h * hd);
             let (kp, vp) = (qp.add(c), qp.add(2 * c));
-            if p > 0 {
-                gemm_strided(l, p, hd, s.as_mut_ptr(), n, 1, false, qp, 3 * c, 1, pk.0.add(h * hd), 1, c, scale);
+            let qc = qp.add(r0 * 3 * c);
+            let mut col = 0;
+            for (k, _, n) in &segs {
+                gemm_strided(rows, *n, hd, s.as_mut_ptr().add(col), cols, 1, false, qc, 3 * c, 1, k.0.add(h * hd), 1, c, scale);
+                col += n;
             }
-            gemm_strided(l, l, hd, s.as_mut_ptr().add(p), n, 1, false, qp, 3 * c, 1, kp, 1, 3 * c, scale);
-            causal_softmax_rows(&mut s, n, p);
-            let op = o.0.add(bb * l * c + h * hd);
-            if p > 0 {
-                gemm_strided(l, hd, p, op, c, 1, false, s.as_ptr(), n, 1, pv.0.add(h * hd), c, 1, 1.0);
+            gemm_strided(rows, r1, hd, s.as_mut_ptr().add(p), cols, 1, false, qc, 3 * c, 1, kp, 1, 3 * c, scale);
+            causal_softmax_rows(&mut s, cols, p + r0);
+            let op = o.0.add((bb * l + r0) * c + h * hd);
+            let mut col = 0;
+            for (_, v, n) in &segs {
+                gemm_strided(rows, hd, *n, op, c, 1, col > 0, s.as_ptr().add(col), cols, 1, v.0.add(h * hd), c, 1, 1.0);
+                col += n;
             }
-            gemm_strided(l, hd, l, op, c, 1, p > 0, s.as_ptr().add(p), n, 1, vp, 3 * c, 1, 1.0);
+            gemm_strided(rows, hd, r1, op, c, 1, p > 0, s.as_ptr().add(p), cols, 1, vp, 3 * c, 1, 1.0);
         }
     });
 }
@@ -546,6 +619,92 @@ mod tests {
             assert!(c.iter().zip(&want).all(|(x, y)| (x - y).abs() < 1e-3));
             matmul(&mut c, &a, &b, m, k, n, ta, tb, true);
             assert!(c.iter().zip(&want).all(|(x, y)| (x - 2.0 * y).abs() < 2e-3));
+        }
+    }
+
+    /// Plain causal attention for one (sequence, head): (out, dq, dk, dv).
+    #[allow(clippy::type_complexity)]
+    fn reference_attention(q: &[Vec<f32>], k: &[Vec<f32>], v: &[Vec<f32>], dout: &[Vec<f32>]) -> [Vec<Vec<f32>>; 4] {
+        let (t, hd) = (q.len(), q[0].len());
+        let scale = 1.0 / (hd as f32).sqrt();
+        let dotp = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let mut p = vec![vec![0f32; t]; t];
+        for i in 0..t {
+            let s: Vec<f32> = (0..=i).map(|j| dotp(&q[i], &k[j]) * scale).collect();
+            let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = s.iter().map(|x| (x - m).exp()).sum();
+            for j in 0..=i {
+                p[i][j] = (s[j] - m).exp() / z;
+            }
+        }
+        let mut out = vec![vec![0f32; hd]; t];
+        let (mut dq, mut dk, mut dv) = (vec![vec![0f32; hd]; t], vec![vec![0f32; hd]; t], vec![vec![0f32; hd]; t]);
+        for i in 0..t {
+            for j in 0..=i {
+                for d in 0..hd {
+                    out[i][d] += p[i][j] * v[j][d];
+                    dv[j][d] += p[i][j] * dout[i][d];
+                }
+            }
+            let dp: Vec<f32> = (0..=i).map(|j| dotp(&dout[i], &v[j])).collect();
+            let rs: f32 = (0..=i).map(|j| p[i][j] * dp[j]).sum();
+            for j in 0..=i {
+                let ds = p[i][j] * (dp[j] - rs) * scale;
+                for d in 0..hd {
+                    dq[i][d] += ds * k[j][d];
+                    dk[j][d] += ds * q[i][d];
+                }
+            }
+        }
+        [out, dq, dk, dv]
+    }
+
+    #[test]
+    fn chunked_attention_matches_plain_attention() {
+        let (b, t, c, nh) = (2, 2 * ATT_CHUNK + 37, 16, 2);
+        let hd = c / nh;
+        let mut rng = Rng::new(21);
+        let qkv: Vec<f32> = (0..b * t * 3 * c).map(|_| rng.normal()).collect();
+        let dout: Vec<f32> = (0..b * t * c).map(|_| rng.normal()).collect();
+        let mut out = vec![0f32; b * t * c];
+        let mut lse = vec![0f32; b * nh * t];
+        attention_fwd(&mut out, &mut lse, &qkv, b, t, c, nh);
+        let mut dqkv = vec![7f32; b * t * 3 * c]; // stale values must not leak in
+        attention_bwd(&mut dqkv, &dout, &qkv, &out, &lse, b, t, c, nh);
+        let close = |a: f32, b: f32| (a - b).abs() < 2e-3 * (1.0 + b.abs());
+        for bb in 0..b {
+            for h in 0..nh {
+                let col = |base: &[f32], stride: usize, off: usize| -> Vec<Vec<f32>> {
+                    (0..t).map(|i| base[(bb * t + i) * stride + off + h * hd..][..hd].to_vec()).collect()
+                };
+                let [ro, rdq, rdk, rdv] = reference_attention(&col(&qkv, 3 * c, 0), &col(&qkv, 3 * c, c), &col(&qkv, 3 * c, 2 * c), &col(&dout, c, 0));
+                for (got, want, name) in [(col(&out, c, 0), ro, "out"), (col(&dqkv, 3 * c, 0), rdq, "dq"), (col(&dqkv, 3 * c, c), rdk, "dk"),
+                                          (col(&dqkv, 3 * c, 2 * c), rdv, "dv")] {
+                    for i in 0..t {
+                        for d in 0..hd {
+                            assert!(close(got[i][d], want[i][d]), "{name} seq {bb} head {h} row {i}: {} vs {}", got[i][d], want[i][d]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // inference over a cached prefix in two segments gives the same rows
+        let (p1, p2) = (100, ATT_CHUNK + 20);
+        let l = t - p1 - p2;
+        let (mut ks, mut vs) = (Vec::new(), Vec::new());
+        for i in 0..p1 + p2 {
+            ks.extend_from_slice(&qkv[i * 3 * c + c..i * 3 * c + 2 * c]);
+            vs.extend_from_slice(&qkv[i * 3 * c + 2 * c..i * 3 * c + 3 * c]);
+        }
+        let segs = [(&ks[..p1 * c], &vs[..p1 * c]), (&ks[p1 * c..], &vs[p1 * c..])];
+        for new in [l, 3] {
+            let rows = &qkv[(p1 + p2) * 3 * c..(p1 + p2 + new) * 3 * c];
+            let mut got = vec![0f32; new * c];
+            attention_infer(&mut got, rows, &segs, 1, new, c, nh);
+            for i in 0..new * c {
+                assert!(close(got[i], out[(p1 + p2) * c + i]), "inference row {} ({new} new)", i / c);
+            }
         }
     }
 

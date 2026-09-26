@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn tiers_follow_settings_thresholds() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let s = Settings::from_file(&root.join("config/settings.yaml"), &root).unwrap();
+        let s = Settings::from_file(&root.join("config/aegist.yaml"), &root).unwrap();
         for (gb, want) in [(7.6, "tiny"), (8.0, "tiny"), (15.5, "small"), (31.2, "medium"), (64.0, "large"), (1024.0, "large")] {
             assert_eq!(pick_tier(gb, &s.model.tiers), want, "{gb} GB");
         }

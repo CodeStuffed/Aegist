@@ -108,7 +108,7 @@ pub struct Acts {
     xn1: Vec<Vec<f32>>,
     inv1: Vec<Vec<f32>>,
     qkv: Vec<Vec<f32>>,
-    probs: Vec<Vec<f32>>,
+    lse: Vec<Vec<f32>>, // per row: log-sum-exp of its attention scores
     att: Vec<Vec<f32>>,
     mask1: Vec<Vec<f32>>,
     xmid: Vec<Vec<f32>>,
@@ -135,9 +135,11 @@ impl Acts {
         let (c, h, v, l, nh) = (cfg.d_model, cfg.mlp_hidden, cfg.vocab_size, cfg.n_layer, cfg.n_head);
         let bt = b * t;
         let drop = if cfg.dropout > 0.0 { 2 * bt * c } else { 0 };
-        let per_layer = bt * c * 5 + bt * 2 + bt * 3 * c + b * nh * t * t + bt * 2 * h + bt * h + drop;
+        let per_layer = bt * c * 5 + bt * 2 + bt * 3 * c + b * nh * t + bt * 2 * h + bt * h + drop;
         let rest = (l + 1) * bt * c + bt * c + bt + bt * v + bt * c + bt * c * 2 + bt * 3 * c + bt * 2 * h + bt * h;
-        4 * (l * per_layer + rest)
+        // each thread's attention scratch: two chunks of scores
+        let scratch = rayon::current_num_threads() * 2 * k::ATT_CHUNK.min(t) * t;
+        4 * (l * per_layer + rest + scratch)
     }
 
     pub fn new(cfg: &ModelConfig, b: usize, t: usize) -> Self {
@@ -152,7 +154,7 @@ impl Acts {
             xn1: per(bt * c),
             inv1: per(bt),
             qkv: per(bt * 3 * c),
-            probs: per(b * nh * t * t),
+            lse: per(b * nh * t),
             att: per(bt * c),
             mask1: masks(bt * c),
             xmid: per(bt * c),
@@ -174,18 +176,40 @@ impl Acts {
     }
 }
 
-/// Keys and values of a prefix already run through the model (per layer,
-/// len x C, rotated), so later tokens can attend to it without recomputing.
+/// Keys and values of tokens already run through the model (per layer,
+/// len x C, rotated), so later tokens can attend to them without
+/// recomputing. A cache can sit on top of a shared one (`fork`): several
+/// continuations of one prompt then share the prompt's keys and values.
 #[derive(Clone, Debug)]
 pub struct KvCache {
+    pub shared: Option<std::sync::Arc<KvCache>>,
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
+    /// Rows in this cache's own part.
     pub len: usize,
 }
 
 impl KvCache {
     pub fn empty(cfg: &ModelConfig) -> Self {
-        KvCache { k: vec![Vec::new(); cfg.n_layer], v: vec![Vec::new(); cfg.n_layer], len: 0 }
+        KvCache { shared: None, k: vec![Vec::new(); cfg.n_layer], v: vec![Vec::new(); cfg.n_layer], len: 0 }
+    }
+
+    /// An empty cache continuing `base`.
+    pub fn fork(base: &std::sync::Arc<KvCache>) -> Self {
+        let layers = base.k.len();
+        KvCache { shared: Some(base.clone()), k: vec![Vec::new(); layers], v: vec![Vec::new(); layers], len: 0 }
+    }
+
+    /// Every row, shared ones included.
+    pub fn total_len(&self) -> usize {
+        self.len + self.shared.as_ref().map_or(0, |s| s.total_len())
+    }
+
+    fn segments<'a>(&'a self, layer: usize, out: &mut Vec<(&'a [f32], &'a [f32])>) {
+        if let Some(s) = &self.shared {
+            s.segments(layer, out);
+        }
+        out.push((&self.k[layer], &self.v[layer]));
     }
 
     /// Append row `row` of an inference step's new keys/values.
@@ -195,6 +219,15 @@ impl KvCache {
             self.v[layer].extend_from_slice(&out.new_v[layer][row * c..(row + 1) * c]);
         }
         self.len += 1;
+    }
+
+    /// Append every row of a single-sequence inference step.
+    pub fn push_all(&mut self, out: &Inference, c: usize) {
+        for layer in 0..self.k.len() {
+            self.k[layer].extend_from_slice(&out.new_k[layer]);
+            self.v[layer].extend_from_slice(&out.new_v[layer]);
+        }
+        self.len += out.new_k.first().map_or(0, |k| k.len() / c);
     }
 }
 
@@ -263,7 +296,7 @@ impl Model {
             k::rmsnorm_fwd(&mut acts.xn1[l], &mut acts.inv1[l], x_in, self.p(la.rms1, c), c);
             k::matmul(&mut acts.qkv[l], &acts.xn1[l], self.p(la.wqkv, c * 3 * c), bt, c, 3 * c, false, false, false);
             self.rope.apply(&mut acts.qkv[l], c, nh, |row| row % t, false);
-            k::attention_fwd(&mut acts.att[l], &mut acts.probs[l], &acts.qkv[l], b, t, c, nh);
+            k::attention_fwd(&mut acts.att[l], &mut acts.lse[l], &acts.qkv[l], b, t, c, nh);
             k::matmul(&mut acts.tmp, &acts.att[l], self.p(la.wo, c * c), bt, c, c, false, false, false);
             if let Some(seed) = drop {
                 k::dropout_mask(&mut acts.mask1[l], cfg.dropout, seed ^ (2 * l as u64 + 1));
@@ -333,7 +366,7 @@ impl Model {
             };
             k::matmul(&mut grads[la.wo..la.wo + c * c], &acts.att[l], dproj, c, bt, c, true, false, true);
             k::matmul(&mut acts.dn, dproj, self.p(la.wo, c * c), bt, c, c, false, true, false);
-            k::attention_bwd(&mut acts.dqkv, &acts.dn, &acts.qkv[l], &acts.probs[l], b, t, c, nh);
+            k::attention_bwd(&mut acts.dqkv, &acts.dn, &acts.qkv[l], &acts.att[l], &acts.lse[l], b, t, c, nh);
             self.rope.apply(&mut acts.dqkv, c, nh, |row| row % t, true);
             k::matmul(&mut grads[la.wqkv..la.wqkv + c * 3 * c], &acts.xn1[l], &acts.dqkv, c, bt, 3 * c, true, false, true);
             k::matmul(&mut acts.dn, &acts.dqkv, self.p(la.wqkv, c * 3 * c), bt, 3 * c, c, false, true, false);
@@ -397,16 +430,43 @@ impl InferModel {
         self.wte.bytes() + norms + self.layers.iter().map(|l| l.wqkv.bytes() + l.wo.bytes() + l.w13.bytes() + l.w2.bytes()).sum::<usize>()
     }
 
+    /// Rotary positions for a sequence of `len` tokens. Up to the trained
+    /// context they are the ones the model learned; beyond it they are
+    /// stretched (NTK-aware scaling: a larger base, so the slow rotations
+    /// cover the longer span while the fast ones - which tell neighbouring
+    /// tokens apart - barely change).
+    pub fn rope_for(&self, len: usize) -> Rope {
+        let block = self.cfg.block_size;
+        if len <= block {
+            return self.rope.clone();
+        }
+        let scale = len.div_ceil(block) as f64;
+        let hd = self.cfg.head_dim() as f64;
+        let base = self.cfg.rope_base as f64 * scale.powf(hd / (hd - 2.0));
+        Rope::new(block * scale as usize, self.cfg.head_dim(), base as f32)
+    }
+
     /// `b` sequences of `l` new tokens, all continuing the prefix in `cache`.
     /// Returns logits for every new token plus their keys/values.
     /// `rng`: Some switches dropout on (Monte Carlo dropout).
-    pub fn infer(&self, cache: &KvCache, tokens: &[u32], b: usize, l: usize, mut rng: Option<&mut Rng>) -> Inference {
+    pub fn infer(&self, cache: &KvCache, tokens: &[u32], b: usize, l: usize, rng: Option<&mut Rng>) -> Inference {
+        self.infer_with(&self.rope, cache, tokens, b, l, l, rng)
+    }
+
+    /// `infer` with these rotary positions (from `rope_for`; the cache must
+    /// have been made with the same ones), computing logits only for the
+    /// last `logit_rows` tokens of each sequence - a long prompt needs just
+    /// its last one, and the output layer is the most expensive part there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn infer_with(&self, rope: &Rope, cache: &KvCache, tokens: &[u32], b: usize, l: usize, logit_rows: usize,
+                      mut rng: Option<&mut Rng>) -> Inference {
         let cfg = &self.cfg;
         let (c, h, v, nh) = (cfg.d_model, cfg.mlp_hidden, cfg.vocab_size, cfg.n_head);
         let n = b * l;
         assert_eq!(tokens.len(), n);
-        assert!(cache.len + l <= cfg.block_size, "sequence longer than the model's context");
-        let p0 = cache.len;
+        let p0 = cache.total_len();
+        assert!(p0 + l <= rope.max_pos(), "sequence longer than the model's context");
+        let logit_rows = logit_rows.clamp(1, l);
         let mut x = vec![0f32; n * c];
         let mut xn = vec![0f32; n * c];
         let mut inv = vec![0f32; n];
@@ -426,8 +486,10 @@ impl InferModel {
         for (li, la) in self.layers.iter().enumerate() {
             k::rmsnorm_fwd(&mut xn, &mut inv, &x, &la.rms1, c);
             la.wqkv.matmul(&mut qkv, &xn, n);
-            self.rope.apply(&mut qkv, c, nh, |row| p0 + row % l, false);
-            k::attention_infer(&mut att, &qkv, &cache.k[li], &cache.v[li], p0, b, l, c, nh);
+            rope.apply(&mut qkv, c, nh, |row| p0 + row % l, false);
+            let mut segs = Vec::new();
+            cache.segments(li, &mut segs);
+            k::attention_infer(&mut att, &qkv, &segs, b, l, c, nh);
             let (mut kk, mut vv) = (Vec::with_capacity(n * c), Vec::with_capacity(n * c));
             for r in qkv.chunks(3 * c) {
                 kk.extend_from_slice(&r[c..2 * c]);
@@ -448,9 +510,16 @@ impl InferModel {
             k::residual(&mut xnext, &x, &tmp, m);
             std::mem::swap(&mut x, &mut xnext);
         }
-        k::rmsnorm_fwd(&mut xn, &mut inv, &x, &self.rmsf, c);
-        let mut logits = vec![0f32; n * v];
-        self.wte.matmul(&mut logits, &xn, n);
+        let rows: Vec<usize> = (0..b).flat_map(|s| (l - logit_rows..l).map(move |r| s * l + r)).collect();
+        let mut last = vec![0f32; rows.len() * c];
+        for (dst, &r) in last.chunks_mut(c).zip(&rows) {
+            dst.copy_from_slice(&x[r * c..(r + 1) * c]);
+        }
+        let mut xn = vec![0f32; rows.len() * c];
+        let mut inv = vec![0f32; rows.len()];
+        k::rmsnorm_fwd(&mut xn, &mut inv, &last, &self.rmsf, c);
+        let mut logits = vec![0f32; rows.len() * v];
+        self.wte.matmul(&mut logits, &xn, rows.len());
         Inference { logits, new_k, new_v }
     }
 

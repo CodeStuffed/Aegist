@@ -13,9 +13,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest,  asset: council-linux-x86_64,       bin: council }
-          - { os: macos-latest,   asset: council-macos-arm64,        bin: council }
-          - { os: windows-latest, asset: council-windows-x86_64.exe, bin: council.exe }
+          - { os: ubuntu-latest,  asset: aegist-linux-x86_64,       bin: aegist }
+          - { os: macos-latest,   asset: aegist-macos-arm64,        bin: aegist }
+          - { os: windows-latest, asset: aegist-windows-x86_64.exe, bin: aegist.exe }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

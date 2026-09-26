@@ -203,7 +203,7 @@ pub fn open_checked_gpu(settings: &Settings, log: &mut dyn FnMut(String)) -> Res
     let r = gpu::self_check(&backend)?;
     if !r.passed {
         anyhow::bail!("the GPU's results don't match the CPU's (loss {} vs {}, worst gradient error {:.1e} in {}, weights after a step {:.1e}). \
-                       Update the NVIDIA driver and CUDA Toolkit, then run `council gpu-check`.",
+                       Update the NVIDIA driver and CUDA Toolkit, then run `aegist gpu-check`.",
             r.loss_gpu, r.loss_cpu, r.worst_grad.1, r.worst_grad.0, r.step_error);
     }
     let flops = gpu::gemm_flops(&backend, bf16)? * GPU_EFFICIENCY;
@@ -263,7 +263,7 @@ pub fn pick_for_hours(settings: &Settings, hours: f64, compute: &Compute, corpus
     let mut why = format!("{name} ({:.1}M parameters): {} h at ~{} tokens/s reads ~{} tokens, {} per parameter",
         params / 1e6, hours, commas(tps as u64), tokens(readable(tps)), ratio(per_param));
     if let Some(&(next, next_params, next_tps)) = sized.iter().find(|t| t.1 > params) {
-        let limit = if tps * hours * 3600.0 > MAX_EPOCHS * corpus_tokens { " (the corpus is the limit: add more text)" } else { "" };
+        let limit = if tps * hours * 3600.0 > MAX_EPOCHS * corpus_tokens { " (the corpus is the limit: add more code)" } else { "" };
         why += &format!("; the next size up ({next}, {:.1}M) would get only {} per parameter - about 20 is needed to train well{limit}",
             next_params / 1e6, ratio(readable(next_tps) / next_params));
     }
@@ -284,7 +284,7 @@ fn check_memory_in(cfg: &ModelConfig, settings: &Settings, have: f64) -> Result<
     if need > 0.85 * have {
         anyhow::bail!(
             "Training this {}x{} model needs about {need:.1} GB of memory, but this machine has {have:.1} GB. \
-             Pick a smaller size (`council train --tier small`) or lower training.tokens_per_step.",
+             Pick a smaller size (`aegist train --tier small`) or lower training.tokens_per_step.",
             cfg.n_layer, cfg.d_model);
     }
     Ok(())
@@ -295,7 +295,7 @@ fn new_model(settings: &Settings, seed: u64, size: Size, compute: &Compute, log:
     let needed = settings.training.min_new_model_chars;
     if text.len() < needed {
         return Err(NotEnoughText(format!(
-            "Only {} KB of text so far; a new model needs at least {} KB to learn its vocabulary from.",
+            "Only {} KB of code so far; a new model needs at least {} KB to learn its vocabulary from. Add more with `aegist learn`.",
             text.len() / 1000, needed / 1000)).into());
     }
     let hw = hardware::detect();
@@ -367,7 +367,7 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
                 let c = &loaded.0.cfg;
                 if want.map_or(true, |t| (t.n_layer, t.d_model, t.block_size) != (c.n_layer, c.d_model, c.block_size)) {
                     anyhow::bail!("A {}x{} model already exists in {}. Delete that folder to start a new one at the {name:?} size \
-                                   (your text and knowledge base are kept).", c.n_layer, c.d_model, checkpoint::brain_dir(settings).display());
+                                   (your code corpus is kept).", c.n_layer, c.d_model, checkpoint::brain_dir(settings).display());
                 }
             }
             compute.check_fits(&loaded.0.cfg, settings)?;
@@ -376,11 +376,11 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
         None => new_model(settings, seed, size, compute, log)?,
     };
     let cfg = model.cfg.clone();
-    let tokens = corpus::corpus_tokens(&tokenizer, settings)?;
+    let tokens = corpus::corpus_tokens(&tokenizer, settings, fim_for(&cfg, settings))?;
     let t = cfg.block_size;
     if tokens.len() < tcfg.min_corpus_tokens.max(4 * (t + 2)) {
         return Err(NotEnoughText(format!(
-            "The corpus is only {} tokens; add more text first (need at least {}).",
+            "The corpus is only {} tokens; add more code first with `aegist learn` (need at least {}).",
             commas(tokens.len() as u64), commas(tcfg.min_corpus_tokens as u64))).into());
     }
     let n_val = ((tokens.len() as f64 * tcfg.val_fraction) as usize).min(tcfg.max_val_tokens).max(t + 2);
@@ -471,7 +471,7 @@ pub fn train_on(settings: &Settings, budget: Budget, size: Size, compute: &Compu
                              (20 per parameter, roughly \"trained well\").",
                         commas(rate as u64), model.num_params() as f64 / 1e6, human_duration(left / rate.max(1.0)), target / 1e6)
                 } else {
-                    "This model has already read ~20 tokens per parameter; more new text now helps more than more time.".to_string()
+                    "This model has already read ~20 tokens per parameter; more new code now helps more than more time.".to_string()
                 });
             }
             last_log = now;
@@ -510,10 +510,16 @@ fn learning_rate(lr_max: f32, floor: f32, warm: f32, frac: f32) -> f32 {
 
 fn check_corpus(settings: &Settings) -> Result<()> {
     if corpus::corpus_files(settings).is_empty() {
-        return Err(NotEnoughText("The corpus is empty. Add text with `council train --data <folder>`, \
-                                  or let `council research` collect some.".into()).into());
+        return Err(NotEnoughText("There's no code to learn from yet. Add some with `aegist learn <folder or git URL>`, \
+                                  or `aegist learn --pack python` for a ready-made set.".into()).into());
     }
     Ok(())
+}
+
+/// How the corpus becomes fill-in-the-middle examples for a model this size:
+/// each example fits in its context (~3 characters of code per token).
+pub fn fim_for(cfg: &ModelConfig, settings: &Settings) -> corpus::Fim {
+    corpus::Fim { rate: settings.code.fim_rate, window_chars: cfg.block_size * 3 }
 }
 
 /// `x`/`y`: random windows of `src` (rows of t tokens) and the tokens after them.
@@ -583,20 +589,25 @@ pub mod tests {
     use super::*;
     use crate::config::testing;
 
-    pub const CORPUS: &str = "Light is refracted when it passes from air into glass. The rays of light bend toward the \
-perpendicular. This is true. White light is made of many colours, and a prism separates them.\n\n\
-The market for a product depends on customers who will pay for it. A business that charges more than its costs \
-is profitable. It will make money when customers pay for it.\n\n\
-Heavy objects do not fall faster than light objects in a vacuum. This is false. That is not right, because \
-gravity accelerates every body at the same rate.\n\n";
+    pub const CORPUS: &str = "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n\n\n\
+class Stack:\n    def __init__(self):\n        self.items = []\n\n    def push(self, item):\n        self.items.append(item)\n\n\
+    def pop(self):\n        return self.items.pop()\n\n\ndef is_even(n):\n    return n % 2 == 0\n\n\n\
+for i in range(10):\n    if is_even(i):\n        print(add(i, 1))\n";
 
-    /// A data dir with CORPUS imported and a model trained for `steps`.
+    /// Put `code` into the corpus as data/corpus/test/<name>.
+    pub fn add_code(s: &Settings, name: &str, code: &str) {
+        let path = corpus::corpus_dir(s).join("test").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, code).unwrap();
+    }
+
+    /// A data dir with CORPUS in it and a model trained for `steps`.
     pub fn trained(steps: u64) -> (tempfile::TempDir, Settings) {
         let tmp = tempfile::tempdir().unwrap();
         let s = testing::settings(&tmp.path().join("data"));
-        let src = tmp.path().join("notes.txt");
-        std::fs::write(&src, CORPUS.repeat(20)).unwrap();
-        corpus::import_texts(&src, &s).unwrap();
+        for i in 0..20 {
+            add_code(&s, &format!("m{i}.py"), CORPUS);
+        }
         train(&s, Budget::Steps(steps), Size::FromRam, &mut |_| {}, Some(0), &AtomicBool::new(false)).unwrap();
         (tmp, s)
     }
@@ -607,11 +618,10 @@ gravity accelerates every body at the same rate.\n\n";
         let mut s = testing::settings(&tmp.path().join("data"));
         let stop = AtomicBool::new(false);
         let err = train(&s, Budget::Steps(1), Size::FromRam, &mut |_| {}, None, &stop).unwrap_err();
-        assert!(err.downcast_ref::<NotEnoughText>().unwrap().0.contains("corpus is empty"));
-        std::fs::write(tmp.path().join("t.txt"), "too short").unwrap();
-        corpus::import_texts(&tmp.path().join("t.txt"), &s).unwrap();
+        assert!(err.downcast_ref::<NotEnoughText>().unwrap().0.contains("no code to learn from"));
+        add_code(&s, "t.py", "x = 1\n");
         let err = train(&s, Budget::Steps(1), Size::FromRam, &mut |_| {}, None, &stop).unwrap_err();
-        assert!(err.to_string().contains("KB of text so far"));
+        assert!(err.to_string().contains("KB of code so far"));
         s.training.min_new_model_chars = 1;
         let err = train(&s, Budget::Steps(1), Size::FromRam, &mut |_| {}, None, &stop).unwrap_err();
         assert!(err.to_string().contains("only"));
@@ -660,7 +670,7 @@ gravity accelerates every body at the same rate.\n\n";
     #[test]
     fn the_size_follows_the_time_and_text_available() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let s = Settings::from_file(&root.join("config/settings.yaml"), &root).unwrap();
+        let s = Settings::from_file(&root.join("config/aegist.yaml"), &root).unwrap();
         let (gflops, ram) = (200e9, 1024.0);
         let cpu = |ram_gb: f64| Compute::Cpu { flops: gflops, ram_gb };
         let pick = |hours: f64, tokens: f64| pick_for_hours(&s, hours, &cpu(ram), tokens).0;

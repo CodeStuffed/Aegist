@@ -1,8 +1,5 @@
-# Runtime data: knowledge base, session log, research state
-data/*
-!data/knowledge_base/
-data/knowledge_base/*
-!data/knowledge_base/.gitkeep
+# Runtime data: learned code, downloaded sources, the model
+/data/
 
 # Rust build output
 /target/

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 
 extern "C" {
-    fn council_emu_launch(name: *const c_char, gx: u32, gy: u32, bx: u32, params: *mut *mut c_void) -> i32;
+    fn aegist_emu_launch(name: *const c_char, gx: u32, gy: u32, bx: u32, params: *mut *mut c_void) -> i32;
 }
 
 #[derive(Default)]
@@ -124,7 +124,7 @@ impl Backend for EmulatedBackend {
         let mut ptrs: Vec<*mut c_void> = slots.iter_mut().map(|s| s as *mut u64 as *mut c_void).collect();
         let name = CString::new(k.name()).unwrap();
         // Safety: one pointer per kernel parameter, each to a value of its size.
-        if unsafe { council_emu_launch(name.as_ptr(), grid.0, grid.1, EMU_BLOCK, ptrs.as_mut_ptr()) } != 0 {
+        if unsafe { aegist_emu_launch(name.as_ptr(), grid.0, grid.1, EMU_BLOCK, ptrs.as_mut_ptr()) } != 0 {
             bail!("the emulator has no kernel {}", k.name());
         }
         Ok(())
@@ -181,9 +181,9 @@ mod tests {
         s.gpu.tokens_per_step = 4 * 48;
         s.gpu.learning_rate = 3e-3;
         s.gpu.warmup_steps = 5;
-        let src = tmp.path().join("notes.txt");
-        std::fs::write(&src, trainer::tests::CORPUS.repeat(20)).unwrap();
-        crate::corpus::import_texts(&src, &s).unwrap();
+        for i in 0..20 {
+            trainer::tests::add_code(&s, &format!("m{i}.py"), trainer::tests::CORPUS);
+        }
         let gpu = Compute::Gpu { backend: Box::new(EmulatedBackend::new()), flops: 1e12, bf16: true };
         let mut lines = Vec::new();
         let r = trainer::train_on(&s, Budget::Steps(40), Size::FromRam, &gpu, &mut |l| lines.push(l), Some(0), &AtomicBool::new(false)).unwrap();

@@ -1,0 +1,92 @@
+# Aegist's settings. Everything runs on this machine: a transformer written
+# from scratch in this repo, trained only on code you give it. No outside AI
+# services, no pretrained weights, no API keys.
+
+model:
+  # Size of a NEW model, picked from total RAM: the first automatic tier whose
+  # max_ram_gb is >= this machine's RAM. An existing trained model keeps the
+  # size it was created with (delete data/brain/ to start over).
+  # block_size is the context the model trains on, in tokens (a token is
+  # ~3-4 characters of code). inference.context_scale stretches it further.
+  tiers:
+    tiny:   {max_ram_gb: 8,    n_layer: 4,  n_head: 4,  d_model: 192,  block_size: 512,  vocab_size: 4096}
+    small:  {max_ram_gb: 16,   n_layer: 6,  n_head: 4,  d_model: 256,  block_size: 1024, vocab_size: 8192}
+    medium: {max_ram_gb: 32,   n_layer: 8,  n_head: 6,  d_model: 384,  block_size: 1024, vocab_size: 8192}
+    large:  {max_ram_gb: 9999, n_layer: 12, n_head: 8,  d_model: 512,  block_size: 2048, vocab_size: 16384}
+    # Bigger sizes, only when asked for: `aegist train --tier xl`. `aegist doctor`
+    # and `aegist gpu-check` show what each needs and how long it takes.
+    xl:     {max_ram_gb: 64,   n_layer: 16, n_head: 12, d_model: 768,  block_size: 2048, vocab_size: 16384, manual: true}
+    # Sizes for an NVIDIA GPU (longer contexts and a 32k vocabulary):
+    110m:   {max_ram_gb: 64,   n_layer: 12, n_head: 12, d_model: 768,  block_size: 2048, vocab_size: 32768, manual: true}
+    235m:   {max_ram_gb: 128,  n_layer: 16, n_head: 16, d_model: 1024, block_size: 2048, vocab_size: 32768, manual: true}
+    xxl:    {max_ram_gb: 128,  n_layer: 24, n_head: 16, d_model: 1024, block_size: 4096, vocab_size: 32768, manual: true}
+    730m:   {max_ram_gb: 256,  n_layer: 24, n_head: 16, d_model: 1536, block_size: 4096, vocab_size: 32768, manual: true}
+    1b:     {max_ram_gb: 256,  n_layer: 24, n_head: 16, d_model: 2048, block_size: 4096, vocab_size: 32768, manual: true}
+  dropout: 0.0
+  rope_base: 10000.0
+
+training:
+  tokens_per_step: 8192      # batch size x context; the batch shrinks for long contexts
+  learning_rate: 0.001       # peak; cosine-decays to min_lr_fraction over each session
+  min_lr_fraction: 0.1
+  warmup_steps: 100
+  weight_decay: 0.1
+  grad_clip: 1.0
+  val_fraction: 0.05         # tail of the corpus held out to measure real progress
+  max_val_tokens: 20000000   # ...but never more than this (a big corpus needs only a sample)
+  eval_batches: 8
+  eval_every_s: 60
+  checkpoint_every_s: 300
+  log_every_s: 10
+  tokenizer_train_chars: 50000000 # code sampled evenly from the corpus to learn the vocabulary
+  min_corpus_tokens: 5000    # refuse to train on less than this
+  min_new_model_chars: 200000 # a new model's vocabulary is learned once, from at least this much code
+
+code:
+  # Share of files trained as fill-in-the-middle (the model sees the code
+  # before and after a gap, then writes the gap). This is what lets it
+  # complete code in the middle of a file, not just at the end.
+  fim_rate: 0.5
+  max_file_kb: 512           # skip bigger files (usually generated or minified)
+  max_line_chars: 1000       # skip files with longer lines (minified bundles, data blobs)
+
+inference:
+  # Weights used to write code (training always uses full precision):
+  #   f32  exact | int8  ~4x smaller, near-identical | int4  ~7x smaller, small accuracy cost
+  precision: int8
+  # Read up to this many times the trained context, by stretching the
+  # rotary positions (NTK scaling) only when a prompt needs it.
+  context_scale: 4
+  temperature: 0.2           # 0 = always the most likely token
+  top_p: 0.95
+  max_new_tokens: 400
+  # Guess the next tokens by copying from the prompt and check them all in
+  # one pass: much faster when code repeats what's already in the file.
+  speculative: true
+
+honesty:
+  # How Aegist decides what it can stand behind. Every piece of code it
+  # writes is checked before it reaches your files; it says what passed,
+  # what failed, and "I don't know" when it can't back an answer up.
+  samples: 4                 # candidates written and checked; the best one that passes wins
+  min_confidence: 0.35       # average token probability below this => "I don't know"
+  uncertain_below: 0.3       # tokens less likely than this are marked as unsure
+  max_invented_names: 0      # names it can't find anywhere, allowed before it refuses
+  require_syntax_check: true # never write code into your files that fails its language's own check
+  check_timeout_s: 20
+
+gpu:
+  # Training on an NVIDIA GPU (RTX 20xx or newer, CUDA Toolkit 12.8+; see
+  # docs/GPU.md). auto: use it if one works - a self-check against the CPU
+  # runs first - else the CPU. `aegist train --device cpu|gpu` overrides this.
+  device: auto
+  # Matrix multiplies: bf16 (tensor cores, fp32 accumulation - about twice
+  # tf32's speed), or tf32. auto = bf16 where the GPU supports it (RTX 30xx+).
+  precision: auto
+  tokens_per_step: 131072    # batch per step on the GPU (split into micro-batches that fit its memory)
+  learning_rate: 0.0006      # peak, for the bigger models a GPU trains
+  warmup_steps: 500
+  checkpoint_every_s: 1800   # a big model's checkpoint is GBs: save every 30 min (Ctrl-C always saves)
+
+paths:
+  data_dir: data             # relative to Aegist's home (this repo, or ~/.aegist)

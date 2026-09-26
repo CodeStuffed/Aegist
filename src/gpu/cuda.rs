@@ -1,5 +1,5 @@
 //! The real GPU: NVIDIA's driver API, cuBLAS and NVRTC, loaded at run time
-//! (so `council` still starts on machines without them). Only the handful
+//! (so `aegist` still starts on machines without them). Only the handful
 //! of C functions used here are declared; everything runs on the default
 //! stream, so work happens in the order it's issued.
 
@@ -371,7 +371,7 @@ pub fn compile_ptx(arch: &str) -> Result<String> {
 
 fn compile(nvrtc: &Nvrtc, arch: &str) -> Result<CString> {
     let src = CString::new(KERNELS_CU).unwrap();
-    let name = CString::new("council_kernels.cu").unwrap();
+    let name = CString::new("aegist_kernels.cu").unwrap();
     let mut prog: NvrtcProgram = std::ptr::null_mut();
     // Safety (this block): NVRTC calls with valid pointers; the program is destroyed at the end.
     unsafe {

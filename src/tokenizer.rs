@@ -3,6 +3,10 @@
 //! Text is split into word-ish chunks, each chunk becomes its UTF-8 bytes
 //! (ids 0-255, so any text at all can be encoded), and training repeatedly
 //! merges the most frequent adjacent pair into a new token.
+//!
+//! Control characters (other than whitespace) are always tokens of their
+//! own: the corpus uses a few of them as markers (start of a file, the
+//! parts of a fill-in-the-middle example), so they never merge with code.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -14,6 +18,7 @@ enum Class {
     Letter,
     Digit,
     Space,
+    Control,
     Other,
 }
 
@@ -24,6 +29,8 @@ fn class(c: char) -> Class {
         Class::Digit
     } else if c.is_whitespace() {
         Class::Space
+    } else if c.is_control() {
+        Class::Control
     } else {
         Class::Other
     }
@@ -41,7 +48,7 @@ pub fn pretokenize(text: &str) -> Vec<&str> {
     while i < chars.len() {
         let start = chars[i].0;
         let mut j = i;
-        if chars[j].1 == ' ' && j + 1 < chars.len() && class(chars[j + 1].1) != Class::Space {
+        if chars[j].1 == ' ' && j + 1 < chars.len() && !matches!(class(chars[j + 1].1), Class::Space | Class::Control) {
             j += 1; // the space belongs to the next chunk
         }
         let kind = class(chars[j].1);
@@ -59,6 +66,7 @@ pub fn pretokenize(text: &str) -> Vec<&str> {
                     j += 1;
                 }
             }
+            Class::Control => j += 1,
             Class::Digit => {
                 let mut n = 0;
                 while j < chars.len() && class(chars[j].1) == Class::Digit && n < 3 {
@@ -100,6 +108,11 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    /// The bytes a token stands for (empty for an unknown id).
+    pub fn bytes(&self, id: u32) -> &[u8] {
+        self.vocab.get(id as usize).map_or(&[], |v| v.as_slice())
     }
 
     /// How many bytes of text a token stands for.
@@ -297,6 +310,7 @@ mod tests {
         assert_eq!(pretokenize(s).concat(), s);
         let chunks = pretokenize("a  word");
         assert_eq!(chunks, vec!["a", " ", " word"]);
+        assert_eq!(pretokenize("x\u{1}\u{1}(y \u{2}"), vec!["x", "\u{1}", "\u{1}", "(", "y", " ", "\u{2}"]);
         assert_eq!(pretokenize("12345"), vec!["123", "45"]);
     }
 

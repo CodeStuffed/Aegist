@@ -1,7 +1,0 @@
-name: Believer
-role: Builds the strongest case FOR the claim.
-lead_in: "This is true because"
-probes:
-  - " This is true."
-  - " This is correct."
-  - " That is right."

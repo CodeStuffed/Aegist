@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const FORMAT: &str = "council-rust-1";
+pub const FORMAT: &str = "aegist-code-1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryPoint {
@@ -83,6 +83,15 @@ pub fn saved_config(settings: &Settings) -> Option<crate::model::ModelConfig> {
     serde_json::from_value(raw.get("config")?.clone()).ok()
 }
 
+/// The saved model's config, tokenizer and stats, without its weights.
+pub fn load_meta(settings: &Settings) -> Option<Meta> {
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(brain_dir(settings).join("brain.json")).ok()?).ok()?;
+    if raw.get("format").and_then(|f| f.as_str()) != Some(FORMAT) {
+        return None;
+    }
+    serde_json::from_value(raw).ok()
+}
+
 /// The saved model, or None if there isn't one yet.
 pub fn load(settings: &Settings) -> Result<Option<(Model, Tokenizer, Meta)>> {
     let dir = brain_dir(settings);
@@ -92,8 +101,8 @@ pub fn load(settings: &Settings) -> Result<Option<(Model, Tokenizer, Meta)>> {
     }
     let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
     if raw.get("format").and_then(|f| f.as_str()) != Some(FORMAT) {
-        bail!("The model in {} was made by an older version of council-engine and can't be loaded. \
-               Delete that folder and train again - your corpus and knowledge base are kept.", dir.display());
+        bail!("The model in {} was made by an older version (council-engine, trained on prose) and can't be used for code. \
+               Delete that folder and train again with `aegist train` - your code corpus is kept.", dir.display());
     }
     let meta: Meta = serde_json::from_value(raw).context("reading brain.json")?;
     meta.config.validate()?;

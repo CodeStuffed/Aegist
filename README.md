@@ -1,268 +1,234 @@
-# council-engine
+# Aegist
 
-A claim goes in and gets judged by four personas: Believer, Skeptic,
-Investor and Judge. They all run on **a transformer written and trained from
-scratch in this repo, in Rust**. There's no Claude, no Ollama, no pretrained
-weights and no outside AI service. The model starts as random numbers and
-learns only from text you give it, or text its research loop collects.
+**A coding AI grown from scratch.** Aegist is a transformer written and
+trained from scratch in this repository, in Rust, with its own tokenizer
+and its own training loop. There's no Claude, no GPT, no Ollama, no
+pretrained weights and no outside AI service. It starts as random numbers
+and learns only from the code you give it.
 
-- **Guide:** it's a terminal program (VS Code's terminal works). See
-  [HOW_TO_RUN.md](HOW_TO_RUN.md) for setup on Windows, macOS and Linux.
-- **Command reference:** [COMMANDS.md](COMMANDS.md) covers every option,
-  annotated output, and the settings behind each command.
-- **Have an NVIDIA GPU?** [GPU_TRAINING.md](GPU_TRAINING.md) is the plan for
-  training on it (an RTX 5080 for 4 days on all of Wikipedia), with honest
-  expectations.
+Around the model is a workbench for coding in the terminal: a live,
+highlighted session where Aegist writes, completes and fixes code, runs
+programs and tests, keeps servers and games running, serves websites, and
+looks at web pages in a headless browser, all without leaving the terminal.
+
+Everything the model writes is **checked before you get it**, and when the
+checks fail it says **no** instead of handing you something that looks
+right and isn't.
 
 ```bash
-council doctor                               # hardware, model size, status
-council train --data ~/my_texts --hours 2    # a folder of .txt/.md files
-council ask "We should switch to usage-based pricing"
-council research --hours 4                   # read Wikipedia, keep training
-council import-wikipedia enwiki-latest-pages-articles-multistream.xml.bz2
-council gpu-check                            # test an NVIDIA GPU for training
-council eval                                 # how often it tells true from false
-council remember ~/Documents/notes           # your own documents, looked up when you ask
+aegist learn --pack python          # code to learn from (or: aegist learn ~/code)
+aegist train --hours 1              # train it on your CPU or NVIDIA GPU
+aegist                              # open the session
 ```
 
 ## Read this first: what to expect
 
-- **It's a small language model you train on your own computer.** A few
-  hours on a few MB of text gives a model that has picked up your corpus's
-  vocabulary and phrasing. It doesn't reason like a chatbot. Its positions
-  "in its own words" will often be rough, and that's honest output for its size.
-- **The verdicts come from measurable signals, not from the prose.** Each
-  persona is scored on how much the claim raises the model's probability of
-  phrases like " This is true." or " This is false." (see *How it decides*).
-  Those numbers mean something even when the generated text doesn't. How
-  much they mean depends entirely on what the model has read.
-- **It says "I don't know" readily, by design.** Confidence is capped by how
-  familiar the claim is to the model and by how much it has trained, and a
-  repeat run with dropout on must agree before anything scores above Low.
-- **It keeps improving the longer it trains.** `train` and `research` update
-  the model's actual weights. That is real self-training.
-- **The model's size follows your training time.** A new model gets the
-  size that will be smartest when the time is up: the biggest that can still
-  read ~20 tokens of text per parameter. Bigger isn't smarter if it can't
-  finish learning.
-- **It looks things up.** The knowledge base can hold all of Wikipedia
-  on disk. Each question gets the most relevant passages plus the passages
-  linked to them (like following links in Obsidian), as much as fits in
-  the model's context.
+- **It's a small model you train yourself.** An hour on a laptop gives a
+  model that has picked up the style and vocabulary of the code it read.
+  Days on a GPU give a few-hundred-million-parameter model in the class of
+  the small open code models of 2022. It is **not** comparable to the
+  frontier AIs labs train on thousands of GPUs; that gap is about a million
+  times more computing, not cleverer code. `aegist eval` measures exactly
+  how good yours is.
+- **It completes code; it doesn't chat.** It writes code that follows a
+  comment, a docstring, a signature or the code around it. It can't answer
+  questions or explain things in English. Ask it one and it says no plainly,
+  rather than making something up.
+- **It tells you when it might be wrong.** Every answer comes with checks:
+  the language's own compiler or parser, a search for names it may have
+  invented, the tests when there are any, and how sure the model was of each
+  token. Unsure tokens are underlined. If the checks fail, nothing touches
+  your files.
+- **It gets better the more it reads and trains.** `learn` adds code and
+  `train` updates the model's weights: real self-training, on your machine.
 
-## Speed
+## The session
 
-Everything is hand-written for speed:
+`aegist` opens an interactive session in whatever folder you run it from.
+It reads the project there (respecting `.gitignore`) so the model can see
+related code from other files, and so the invented-name check knows your
+project's names.
 
-- **Multithreaded, SIMD math:** matrix multiplies use AVX2 / AVX-512 / NEON,
-  whichever the CPU has, through the `gemm` crate (plain math, no AI).
-- **Attention as matrix multiplies:** attention runs as strided matrix
-  multiplies, with no copying.
-- **Fused, parallel operations:** normalization, activations and the loss
-  are each a single parallel pass over memory.
-- **No allocation during training:** buffers are set up once, before the
-  first step.
-- **Caching when answering:** `ask` processes each prompt once and scores
-  every probe phrase against the cached result in one batch, and text
-  generation reuses cached attention state.
+Just say what you want:
 
-Measured on a 4-core CPU with AVX-512 (16 GB RAM):
+```
+❯ write a function that checks whether a number is prime
+❯ write a snake game as a web page
+❯ complete src/app.py:42
+❯ fix `pytest -q`
+❯ run main.py
+❯ where is parse_config defined
+```
 
-| Same 11 MB of text, 10 minutes each | Speed | Held-out bits per byte (lower is better) |
-|---|---|---|
-| Old Python/NumPy version, 2.2M params | 3,990 tokens/s | 1.900 |
-| This version, same 2.2M size | **9,227 tokens/s (2.3×)** | **1.527 (20% better)** |
-| This version, default 5.9M size | 3,600 tokens/s | 1.652 |
+Or use a command (`/` shows the menu, tab completes):
 
-A full `council ask` (panel, negation test, Judge, repeat run) on the 5.9M
-model takes about **half a second** with int8 weights on 2 threads (measured
-with a training run using the other cores).
+| Command | What it does |
+|---|---|
+| `/write <file> <what it should do>` | Write a new file, or add to an existing one, checked before it's saved |
+| `/complete <file>[:line]` | Fill in code at a line: a `TODO`, an empty line, or the end of the file |
+| `/fix [command]` | Make a failing command pass (default: the project's tests) |
+| `/run <command or file>` | Run a program and stream its output (`!command` works too) |
+| `/test` | Find and run the project's tests (cargo, npm, go, pytest, make, ...) |
+| `/start <command>` · `/jobs` · `/logs <job>` · `/stop <job>` | Keep programs running in the background: dev servers, games, watchers |
+| `/serve [folder]` | Serve a website folder on localhost |
+| `/preview <url, file or job>` | Load a page in a headless browser and draw it in the terminal, with its console errors |
+| `/open <file>[:from-to]` · `/find` · `/grep` · `/tree` | Look around the code |
+| `/diff` · `/undo` | Everything Aegist changed this session; put the last change back |
+| `/show` | The last code Aegist refused to stand behind, marked unverified |
+| `/learn` · `/train [hours]` · `/model` | Teach it more, train it, see its state and limits |
 
-Training speed per size, from `cargo run --release --example bench`:
+Keys: **enter** sends, **shift/alt+enter** (or `\` then enter) adds a line,
+**↑ ↓** history, **tab** completes commands and paths, **esc** or
+**ctrl+c** stops the work in progress, **ctrl+c** twice leaves.
 
-| Tier | Model | Tokens / second |
-|---|---|---|
-| tiny | 4 × 192, 2.2M params | ~8,400 |
-| small | 6 × 256, 5.9M params | ~3,600 |
-| medium | 8 × 384, 17M params | ~1,600 |
-| large | 12 × 512, 42M params | ~680 |
-| xl | 16 × 768, 126M params | ~260 |
+Output scrolls into your terminal's history like any program's; only the
+input box and the work in progress are redrawn in place. Copy and paste and
+scrollback keep working. Colors are 24-bit where the terminal supports
+them, and fall back to 256 or 16 colors, or none with `NO_COLOR` or
+`--no-color`.
 
-## Bigger models, and quantization
+### How it stays honest
 
-Two switches:
+A small model's words aren't evidence, so Aegist checks every answer:
 
-- `council train --tier NAME` picks the model size yourself. Otherwise
-  `train --hours N` (or `--plan-hours N` for several sessions) picks the
-  size that ends up smartest in that time on your CPU or GPU. The sizes
-  run from `tiny` (2.2M params) through `xl` (~126M), the GPU sizes `110m`,
-  `235m`, `xxl` (~337M) and `730m`, up to `1b` (~1.28B). `council doctor`
-  (CPU) and `council gpu-check` (GPU) list every size with its memory and
-  how long it takes to train well, and `train` refuses a size that doesn't
-  fit.
-- `council ask --precision f32|int8|int4` (default `int8`, set in
-  `inference.precision`) picks the weights used to answer:
-  - `int8` is 4× smaller than f32 with practically identical answers;
-  - `int4` is about 6× smaller, at a small accuracy cost.
+| Check | How |
+|---|---|
+| **syntax** | The language's own tools: Python's parser, `node --check`, `rustc`, `gofmt`, `cc -fsyntax-only`, `ruby -c`, `php -l`, `bash -n`, ... |
+| **names** | Every function, method and module the code uses must exist somewhere: in your project, in the code Aegist learned from, or in the language. A name found nowhere was probably made up, and Aegist names it. |
+| **tests** | `/fix` runs your tests on every candidate and only keeps a change that makes them pass. |
+| **certainty** | How likely the model found each token it wrote, pulled down when the surrounding code is unlike anything it has read. |
 
-  Both have hand-written integer kernels.
+Each request writes several candidates (one careful, the rest more
+adventurous), checks all of them, and offers the best that passes. The
+verdict can only go down:
 
-**What quantization does, measured** on a trained 5.9M model
-(`cargo run --release --example quant_eval` runs this on yours):
+- **Verified**: every check passed and tests ran.
+- **Checked**: every check it could run passed; nothing has run it yet.
+- **Unverified**: something couldn't be checked (for example no checker installed); it's offered, clearly marked.
+- **No**: a check failed or the model wasn't sure. Nothing is written, and it says why.
 
-| Precision | Weights | Held-out bits per byte | Generation speed |
-|---|---|---|---|
-| f32 | 23.5 MB | 1.3573 | ~800 tokens/s |
-| int8 | 6.0 MB | 1.3574 | ~1,650 tokens/s |
-| int4 | 3.7 MB | 1.3576 | ~1,250 tokens/s |
+`aegist eval` measures how well these verdicts predict the truth: of the
+code Aegist stood behind, how much passed its tests, and of the code it
+refused, how much really did fail.
 
-**Why there's no "trillion" setting.** Training takes about
-6 × parameters × tokens operations, and a model needs about 20 tokens of text
-per parameter to become good. These are `council doctor`'s estimates for the
-same 4-core PC:
+## Install
 
-| Size | Memory to train | Time to train well |
-|---|---|---|
-| tiny, 2.2M | 0.4 GB | ~1 hour |
-| small, 5.9M | 0.8 GB | ~8 hours |
-| medium, 17M | 1.6 GB | ~3 days |
-| large, 42M | 3.4 GB | ~18 days |
-| xl, 126M | 7.4 GB | ~5 months |
-| xxl, 337M | 19 GB | ~3 years |
-| 1b, 1.28B | 40 GB | ~44 years |
-| 1 trillion | ~16,000 GB | ~27 million years |
+**Build from source** (needs [Rust](https://rustup.rs)):
 
-Quantization shrinks a *trained* model (the 1b tier is 800 MB at int4); it
-doesn't speed up training, and an untrained giant model is just random
-numbers. Billion-parameter models are trained on thousands of GPUs. On a
-PC, the best results come from the size `train` picks plus lots of text.
-For short sessions a *smaller* size often wins, because it reads more text
-in the same time.
+```bash
+git clone https://github.com/CodeStuffed/Aegist
+cd Aegist
+cargo build --release
+./target/release/aegist            # or: cargo install --path .
+```
 
-**On an NVIDIA GPU** training should run on the order of 100 times faster
-than on the 4-core CPU above. That's an estimate from the hardware's speed;
-`council gpu-check` measures yours. It moves the sweet spot to a few hundred
-million parameters for a few days of training. See
-[GPU_TRAINING.md](GPU_TRAINING.md).
+**Or download a build** from the project's Releases page (Windows, macOS,
+Linux), make it runnable (`chmod +x` on macOS/Linux) and put it on your
+PATH.
+
+Aegist keeps its settings and trained model in its home folder: this repo
+when run from a build inside it, otherwise `~/.aegist`. The code you work on
+is wherever you run `aegist`. `aegist doctor` shows the paths.
+
+Optional tools make it more capable: `git` (for `learn` from URLs and
+packs), each language's own compiler or interpreter (for its syntax checks
+and `/run`), and Chrome, Chromium or Edge (for `/preview`; set
+`AEGIST_BROWSER` to use a specific one).
+
+## Teaching it
+
+```bash
+aegist learn --list                 # the packs, and what's learned so far
+aegist learn --pack python          # python, javascript, typescript, web, games, rust, go, c, cpp, java, os, ai, algorithms
+aegist learn ~/code                 # your own projects
+aegist learn https://github.com/owner/repo
+aegist train --hours 8              # longer is smarter; ctrl+c stops and saves
+aegist train --plan-hours 96 --hours 24   # several sessions on one schedule
+aegist eval                         # measure it
+```
+
+Packs are sets of well-known, openly licensed projects, downloaded with git
+straight from their repositories. `learn` keeps only real source code:
+nothing git ignores, no dependency folders, no generated or minified files,
+no exact duplicates.
+
+`train` sizes a **new** model for the time you give it: the biggest model
+that can still read about 20 tokens of code per parameter in that time.
+Bigger isn't smarter if it can't finish learning, and a small corpus limits
+the size too. `aegist doctor` lists every size with its memory and training
+time on your machine.
+
+**Have an NVIDIA GPU?** Training is on the order of 100 times faster.
+[docs/GPU.md](docs/GPU.md) covers setup and a multi-day plan.
 
 ## How it's built
 
-**The model** (`src/`), all from scratch:
+All of it is in `src/`, written from scratch:
 
-- `model.rs`: a decoder-only transformer in the style of current small
-  language models: RMSNorm, rotary position embeddings, a SwiGLU MLP, tied
-  embeddings, and dropout. The forward and backward passes are written by
-  hand, and every gradient is checked against finite differences in the tests.
-- `kernels.rs`: the math, forward and backward, parallelized.
-- `tokenizer.rs`: byte-level BPE trained on your corpus. Any text in any
-  language can be encoded.
-- `trainer.rs`, `optim.rs`: AdamW, warmup plus cosine learning rate,
-  gradient clipping, held-out evaluation (loss and bits per byte), and
-  checkpoints; Ctrl-C saves.
-- `brain.rs`: inference: batched probe scoring on a shared cached prompt,
-  and text generation with cached attention state.
-- `gpu/`: the same training step on an NVIDIA GPU. It uses hand-written
-  CUDA kernels (`kernels.cu`, compiled at run time with NVRTC) and cuBLAS
-  for matrix multiplies, both loaded only if present. It keeps only each
-  layer's input during the forward pass and recomputes one layer at a time
-  during the backward pass. A self-check against the CPU runs before any
-  training. `cargo test --features gpu-emulator` runs the kernels on a CPU
-  emulator and checks them against the CPU model.
-- `trainer.rs` also sizes a *new* model for its training time (above).
-  Without a time budget (`--steps`), `hardware.rs` picks from your RAM:
+- **The model** (`model.rs`, `kernels.rs`): a decoder-only transformer with
+  RMSNorm, rotary positions, a SwiGLU MLP and tied embeddings. The forward
+  and backward passes are written by hand, and every gradient is checked
+  against finite differences in the tests. Matrix multiplies use AVX2,
+  AVX-512 or NEON through the `gemm` crate, on every core.
+- **Long context**: attention runs a chunk of queries at a time and, during
+  training, keeps one number per row instead of the full attention matrix,
+  recomputing it in the backward pass (the idea behind FlashAttention). So
+  memory grows with the context, not its square, and contexts of 2,048 to
+  4,096 tokens train on ordinary machines. When writing code, the model
+  reads up to 4 times further than it trained on, by stretching its rotary
+  positions (NTK scaling) only when a prompt needs it. And it searches your
+  project for relevant code, so its memory reaches the whole repository.
+- **Speed**: prompts are read in one batched pass that computes the output
+  layer only where needed. Generation guesses ahead by copying from the
+  prompt (prompt-lookup decoding) and checks the guesses in the same pass:
+  every token is still exactly what the model would have written, but
+  repeated code comes out several tokens per step. Weights run as int8 (4x
+  smaller than f32, practically identical) or int4, with hand-written
+  integer kernels. Candidates share the prompt's cached keys and values and
+  are written in parallel.
+- **The tokenizer** (`tokenizer.rs`): byte-level BPE trained on your
+  corpus, so any code in any language can be encoded.
+- **Training** (`trainer.rs`, `optim.rs`, `corpus.rs`): AdamW, warmup plus
+  cosine learning rate, gradient clipping, held-out evaluation and
+  checkpoints. The corpus is memory-mapped from disk, so billions of tokens
+  cost disk space, not RAM. Each file is a document headed by its path, and
+  half of them are trained as fill-in-the-middle examples, which is what
+  lets the model complete code in the middle of a file.
+- **The GPU** (`gpu/`): hand-written CUDA kernels compiled at run time with
+  NVRTC, and cuBLAS for matrix multiplies, both loaded only if present. A
+  self-check against the CPU runs before any training.
+- **The honesty layer** (`verify.rs`, `assist.rs`, `bench.rs`): the checks,
+  the verdicts, the candidate search, and the benchmark.
+- **The workbench** (`app.rs`, `actions.rs`, `ide.rs`, `project.rs`,
+  `ui/`): the session, commands, background jobs, the web server, the
+  browser preview, the project index and undo journal, and the terminal
+  interface (colors, syntax highlighting, diffs, the live screen region and
+  the line editor).
 
-  | Tier | RAM | Layers × width | Context | Params |
-  |---|---|---|---|---|
-  | tiny | ≤ 8 GB | 4 × 192 | 128 | ~2.2M |
-  | small | ≤ 16 GB | 6 × 256 | 256 | ~5.9M |
-  | medium | ≤ 32 GB | 8 × 384 | 256 | ~17M |
-  | large | more | 12 × 512 | 512 | ~42M |
-- `corpus.rs`: all the training text's tokens in one file on disk that
-  training memory-maps, so billions of tokens cost disk space, not RAM.
+Understanding plain requests is done by simple, predictable rules, not by
+another model: a request it can't place gets "I don't know what you want",
+never a guess.
 
-**The council:**
+## Tests
 
-- `router.rs`: matches money words to decide whether the Investor runs.
-- `config/personas/*.yaml`: a small model can't follow written instructions,
-  so each persona is a *lead-in* the model continues ("This is true
-  because…") plus *probe phrases* it's scored on.
-- `knowledge.rs`: a BM25 search index, written from scratch, over passages in
-  `data/knowledge_base/`. The index lives on disk in segments that are
-  memory-mapped, so millions of passages open instantly (1M passages: 0.1 ms
-  to open, ~20 ms per search on 4 cores). Passages are linked like Obsidian notes (to their
-  neighbors in the same article, and to passages sharing their rarest
-  words). The best matches plus their strongest links go in front of the
-  claim, filling the model's context window with only what's relevant, so
-  they change what the model scores and writes. Each persona lists the
-  passages that moved the model toward its side.
-- `wikipedia.rs`: imports a whole Wikipedia dump: unpacks the multistream
-  `.bz2` on every core, turns wiki markup into plain paragraphs, and fills
-  both the corpus and the knowledge base.
-- `research.rs`: uses the plain Wikipedia search API. Topics are
-  `research.seed_topics` plus words that keep coming up in your past
-  questions. Fetches are capped per hour, and training fills the time in between.
-- `council.rs`: the personas, the Judge's rules, familiarity, and the repeat-run check.
+```bash
+cargo test                          # the whole suite, in seconds, without internet
+cargo test --features gpu-emulator  # plus the GPU kernels, on a CPU emulator
+```
 
-## How it decides
-
-1. **Signal.** For each persona, the signal is the average over its probe
-   phrases of `log P(probe | claim) − log P(probe | neutral lead-in)`. This
-   is pointwise mutual information, in nats per token. Believer probes
-   are "true / correct / right"; Skeptic probes are their negations; the
-   Investor compares "will make money" against "will lose money".
-2. **Negation test.** The claim's verb is flipped ("prices will rise" →
-   "prices will not rise"). With the knowledge-base evidence in front, the
-   model scores how likely the rest of the claim is after each version. The
-   cost of the word "not" itself is left out, so this measures which version
-   fits what the model has read. It's the strongest signal a model trained
-   on real text like Wikipedia has, and it's skipped for claims without a
-   verb it can flip ("is", "will", "can", "has"...).
-3. **Stance.** `margin = Believer − Skeptic`, averaged with the Investor's
-   signal when it runs, then blended with the negation test
-   (`council.negation_weight`, default half). Above `+mixed_margin` means
-   *yes*, below `−mixed_margin` means *no*, and anything between is
-   *undecided*. A flat "no" is as available as "yes".
-4. **Confidence** starts from the size of the margin, then can only go down:
-   - it's capped at the weakest confidence among the personas (and the
-     negation test) the verdict relied on;
-   - it's capped by **familiarity**, the model's loss on the claim compared
-     with its typical held-out loss. A claim unlike anything it has read
-     can't be rated confident;
-   - it's capped at Low until the model has trained on
-     `council.min_tokens_trained` tokens.
-5. **Repeat run.** The council runs a second time with dropout switched on
-   (Monte Carlo dropout), which samples a slightly different network. If
-   the stance flips or the confidence tier changes, the result becomes
-   "Low confidence: the council didn't agree with itself on a repeat run",
-   and both verdicts are shown.
-
-All the thresholds live in `config/settings.yaml` under `council:`.
+They cover gradient checks, chunked attention against plain attention,
+generation (guessing ahead never changes the output), the tokenizer, the
+corpus and fill-in-the-middle documents, training, the checks and verdicts,
+the benchmark's problems, the project index and undo, the web server, jobs,
+the browser preview (when a browser is installed), and the interface's
+pieces.
 
 ## Layout
 
 ```
-Cargo.toml, src/            the program (council) and library
-config/settings.yaml        every tunable number
-config/personas/*.yaml      lead-ins and probe phrases
-src/gpu/                    GPU training: CUDA kernels, cuBLAS/NVRTC bindings, CPU emulator
-examples/bench.rs           training speed per size on this machine
-examples/quant_eval.rs      what f32 / int8 / int4 cost and buy on your trained model
-examples/kb_bench.rs        knowledge-base speed at a million passages
-examples/tok_speed.rs       tokenizer training and encoding speed
-GPU_TRAINING.md             training on an NVIDIA GPU, and what to expect
-data/                       corpus, checkpoints, knowledge base (gitignored)
-.github/workflows/          CI (tests + builds on Linux/macOS/Windows) and releases
-docs/build-brief.md         the original plan (Claude/Ollama), kept for history
+src/                 the program (aegist) and its library
+config/aegist.yaml   every tunable number
+docs/GPU.md          training on an NVIDIA GPU
+examples/            training speed per size, quantization's cost, tokenizer speed
+data/                corpus, sources, names, model (gitignored)
 ```
-
-`cargo test` runs the whole suite in a few seconds, without internet:
-- gradient checks;
-- the tokenizer, checked against textbook BPE;
-- training;
-- inference;
-- the council rules;
-- the knowledge base (on disk and in memory);
-- the Wikipedia importer, on a small multistream dump;
-- the research loop, against a fake Wikipedia.
-
-`cargo test --features gpu-emulator` adds the GPU tests (a few minutes).
