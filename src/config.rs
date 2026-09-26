@@ -123,6 +123,7 @@ impl Default for InferenceSettings {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
 pub struct HonestySettings {
     pub samples: usize,
     pub min_confidence: f32,
@@ -130,12 +131,18 @@ pub struct HonestySettings {
     pub max_invented_names: usize,
     pub require_syntax_check: bool,
     pub check_timeout_s: u64,
+    /// Stop writing a candidate when a stretch of it averages below this.
+    pub give_up_below: f32,
+    /// Refuse when any stretch of the answer averages below this.
+    pub min_stretch: f32,
+    /// Mark untested code unverified when the candidates agree less than this.
+    pub min_agreement: f32,
 }
 
 impl Default for HonestySettings {
     fn default() -> Self {
         HonestySettings { samples: 4, min_confidence: 0.35, uncertain_below: 0.3, max_invented_names: 0, require_syntax_check: true,
-                          check_timeout_s: 20 }
+                          check_timeout_s: 20, give_up_below: 0.08, min_stretch: 0.12, min_agreement: 0.25 }
     }
 }
 

@@ -74,6 +74,10 @@ honesty:
   max_invented_names: 0      # names it can't find anywhere, allowed before it refuses
   require_syntax_check: true # never write code into your files that fails its language's own check
   check_timeout_s: 20
+  # A good average can hide one made-up line, so the weakest part counts too.
+  give_up_below: 0.08        # stop writing when 8 tokens in a row average below this (faster, no guessing on)
+  min_stretch: 0.12          # any 8 tokens in a row averaging below this => "I don't know"
+  min_agreement: 0.25        # candidates that barely agree => untested code is marked unverified
 
 decide:
   # Typed decisions (pick one of a fixed set of options, yes/no, a score),

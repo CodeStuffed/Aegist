@@ -102,6 +102,7 @@ impl Assistant<'_> {
         });
         let context = format!("{}{}{}", prompt.text, prompt.before, prompt.after);
         let n = gens.len();
+        let agreement = verify::agreement(&gens.iter().map(|g| g.text.as_str()).collect::<Vec<_>>());
         let mut seen = std::collections::HashSet::new();
         let mut out: Vec<Candidate> = Vec::new();
         for (i, g) in gens.into_iter().enumerate() {
@@ -112,16 +113,22 @@ impl Assistant<'_> {
                 continue; // nothing written, or an identical candidate was already checked
             }
             let file = assemble(&g.text);
-            progress(Progress::Checking { candidate: i + 1, of: n, what: "syntax" });
+            let confidence = Confidence { agreement: agreement[i], ..Confidence::of(&g, self.brain.typical_nll(), &self.settings.honesty) };
+            // the model's own doubt already rules it out: don't spend a
+            // compiler run on it
+            let doomed = confidence.refuses(&self.settings.honesty);
             let syntax = match lang {
-                Some(l) => verify::syntax(l, &file, shown, self.settings.honesty.check_timeout_s),
+                _ if doomed => Status::Skipped("not run: I already know I can't stand behind it".into()),
+                Some(l) => {
+                    progress(Progress::Checking { candidate: i + 1, of: n, what: "syntax" });
+                    verify::syntax(l, &file, shown, self.settings.honesty.check_timeout_s)
+                }
                 None => Status::Skipped("unknown language".into()),
             };
             progress(Progress::Checking { candidate: i + 1, of: n, what: "names" });
             // the partial line before the gap belongs to the code (a `def ` the prompt started)
             let lead = prompt.before.rsplit('\n').next().unwrap_or("");
             let invented = verify::invented_names(&format!("{lead}{}", g.text), lang, &context, &self.names);
-            let confidence = Confidence::of(&g, self.brain.typical_nll(), &self.settings.honesty);
             let tests_status = match tests {
                 Some(run) if syntax.passed() && invented.is_empty() => {
                     progress(Progress::Checking { candidate: i + 1, of: n, what: "tests" });
@@ -136,6 +143,8 @@ impl Assistant<'_> {
         out.sort_by(|a, b| {
             b.report.verdict.cmp(&a.report.verdict)
                 .then(a.report.invented.len().cmp(&b.report.invented.len()))
+                // the answer the other attempts also landed on, over a lone one
+                .then(b.report.confidence.agreement.unwrap_or(0.0).total_cmp(&a.report.confidence.agreement.unwrap_or(0.0)))
                 .then(b.generation.mean_logprob().total_cmp(&a.generation.mean_logprob()))
         });
         (out, tokens)

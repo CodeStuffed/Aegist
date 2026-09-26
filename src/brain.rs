@@ -47,12 +47,15 @@ pub struct GenOptions {
     pub top_p: f32,
     pub seed: u64,
     pub speculative: bool,
+    /// Stop early when the last few tokens' average probability falls below
+    /// this: the model has lost track and is guessing (0 = never).
+    pub give_up_below: f32,
 }
 
 impl GenOptions {
     pub fn from_settings(s: &Settings) -> Self {
         GenOptions { max_new: s.inference.max_new_tokens, temperature: s.inference.temperature, top_p: s.inference.top_p, seed: 0,
-                     speculative: s.inference.speculative }
+                     speculative: s.inference.speculative, give_up_below: s.honesty.give_up_below }
     }
 }
 
@@ -68,7 +71,13 @@ pub enum Stop {
     Context,
     /// The caller asked to stop.
     Cancelled,
+    /// The model lost track (a run of tokens it barely believed), so it
+    /// stopped instead of guessing on.
+    Unsure,
 }
+
+/// Tokens in the stretch that early give-up and `Generation::weakest` look at.
+pub const STRETCH: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Generation {
@@ -110,6 +119,23 @@ impl Generation {
     /// Tokens the model gave less than `below` probability.
     pub fn uncertain(&self, below: f32) -> usize {
         self.spans.iter().filter(|s| s.2 < below).count()
+    }
+
+    /// The lowest average probability over any `STRETCH` tokens in a row:
+    /// a short made-up stretch that a good average would hide (1.0 if empty).
+    pub fn weakest(&self) -> f32 {
+        let probs: Vec<f32> = self.spans.iter().map(|s| s.2).collect();
+        if probs.is_empty() {
+            return 1.0;
+        }
+        let k = probs.len().min(STRETCH);
+        let mut sum: f32 = probs[..k].iter().sum();
+        let mut low = sum;
+        for i in k..probs.len() {
+            sum += probs[i] - probs[i - k];
+            low = low.min(sum);
+        }
+        (low / k as f32).clamp(0.0, 1.0)
     }
 
     pub fn tokens_per_second(&self) -> f64 {
@@ -310,6 +336,10 @@ impl Brain {
             }
             if !on_text(&piece, p) {
                 return Some(Stop::Cancelled);
+            }
+            if opts.give_up_below > 0.0 && spans.len() >= STRETCH
+                && spans[spans.len() - STRETCH..].iter().map(|s| s.2).sum::<f32>() / (STRETCH as f32) < opts.give_up_below {
+                return Some(Stop::Unsure);
             }
             None
         };
@@ -521,7 +551,7 @@ mod tests {
     use crate::trainer::tests::{trained, CORPUS};
 
     fn opts(max_new: usize, temperature: f32, speculative: bool) -> GenOptions {
-        GenOptions { max_new, temperature, top_p: 0.95, seed: 7, speculative }
+        GenOptions { max_new, temperature, top_p: 0.95, seed: 7, speculative, give_up_below: 0.0 }
     }
 
     #[test]
@@ -611,6 +641,25 @@ mod tests {
         assert!(brain.count_tokens(&long) > block, "prompt should exceed the trained context");
         let g = brain.generate(&long, &opts(8, 0.0, true), &never_stop, &mut |_, _| true);
         assert!(g.prompt_tokens > block && g.prompt_tokens + g.tokens() <= brain.max_context());
+    }
+
+    #[test]
+    fn it_stops_when_it_loses_track_and_finds_weak_stretches() {
+        let (_tmp, s) = trained(10);
+        let brain = Brain::load_at(&s, Precision::F32).unwrap();
+        let prompt = format!("{FILE}m5.py\nzq xv wq qq zz");
+        let never = brain.generate(&prompt, &opts(40, 1.0, true), &never_stop, &mut |_, _| true);
+        assert_ne!(never.stop, Stop::Unsure);
+        let strict = brain.generate(&prompt, &GenOptions { give_up_below: 1.01, ..opts(40, 1.0, true) }, &never_stop, &mut |_, _| true);
+        assert_eq!((strict.stop, strict.tokens()), (Stop::Unsure, STRETCH));
+        let g = |ps: &[f32]| Generation { text: String::new(), spans: ps.iter().map(|&p| (0, 0, p)).collect(), stop: Stop::EndOfFile,
+                                           prompt_nll: 0.0, prompt_tokens: 0, guessed: 0, seconds: 0.0 };
+        let mut ps = vec![0.9f32; 30];
+        ps[12..20].fill(0.05);
+        let hidden = g(&ps);
+        assert!(hidden.mean_prob() > 0.6 && (hidden.weakest() - 0.05).abs() < 1e-4, "{}", hidden.weakest());
+        assert_eq!(g(&[]).weakest(), 1.0);
+        assert!((g(&[0.5, 0.7]).weakest() - 0.6).abs() < 1e-6);
     }
 
     #[test]

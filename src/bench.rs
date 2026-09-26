@@ -139,7 +139,7 @@ pub fn run(brain: &Brain, settings: &Settings, k: usize, names: &Names, log: &mu
         let prompt = format!("{FILE}eval/{}.py\n{}", p.name, p.prompt);
         let opts: Vec<GenOptions> = (0..k.max(1))
             .map(|j| GenOptions { max_new: 200, temperature: if j == 0 { 0.0 } else { 0.8 }, top_p: 0.95, seed: 1000 + j as u64,
-                                  speculative: true })
+                                  speculative: true, give_up_below: settings.honesty.give_up_below })
             .collect();
         let gens = brain.generate_many(&prompt, &opts, &end_of_function);
         let mut candidates = Vec::new();

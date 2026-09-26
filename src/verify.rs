@@ -13,7 +13,7 @@
 //!              the surrounding code was to it
 //! and the verdict can only go down from there.
 
-use crate::brain::Generation;
+use crate::brain::{Generation, Stop, STRETCH};
 use crate::config::HonestySettings;
 use crate::lang::{self, Lang};
 use crate::proc::{self, Output};
@@ -254,6 +254,39 @@ pub fn strip_strings_and_comments(code: &str, lang: Option<&Lang>) -> String {
     out
 }
 
+/// How alike two pieces of code are (0-1): the share of word pairs they
+/// have in common, ignoring spacing. Independent attempts that land on the
+/// same code are evidence; attempts that all differ mean the model is guessing.
+pub fn similarity(a: &str, b: &str) -> f32 {
+    fn pairs(code: &str) -> HashSet<(String, String)> {
+        let words: Vec<String> = regex::Regex::new(r"\w+|[^\w\s]").expect("valid regex").find_iter(code).map(|m| m.as_str().to_string()).collect();
+        if words.len() == 1 {
+            return std::iter::once((words[0].clone(), String::new())).collect();
+        }
+        words.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
+    }
+    let (x, y) = (pairs(a), pairs(b));
+    if x.is_empty() && y.is_empty() {
+        return 1.0;
+    }
+    x.intersection(&y).count() as f32 / x.union(&y).count() as f32
+}
+
+/// How much each of `texts` agrees with the others (mean similarity), or
+/// None for all of them when fewer than three have anything in them.
+pub fn agreement(texts: &[&str]) -> Vec<Option<f32>> {
+    let filled: Vec<usize> = (0..texts.len()).filter(|&i| !texts[i].trim().is_empty()).collect();
+    if filled.len() < 3 {
+        return vec![None; texts.len()];
+    }
+    (0..texts.len())
+        .map(|i| {
+            let others: Vec<usize> = filled.iter().copied().filter(|&j| j != i).collect();
+            Some(others.iter().map(|&j| similarity(texts[i], texts[j])).sum::<f32>() / others.len() as f32)
+        })
+        .collect()
+}
+
 /// How much the model believed its own answer.
 #[derive(Clone, Copy, Debug)]
 pub struct Confidence {
@@ -265,6 +298,13 @@ pub struct Confidence {
     /// The prompt's loss relative to the model's typical held-out loss:
     /// above ~1.3, the surrounding code is unlike what it learned from.
     pub unfamiliarity: Option<f32>,
+    /// The lowest average probability over any few tokens in a row.
+    pub weakest: f32,
+    /// It stopped partway because it had lost track.
+    pub gave_up: bool,
+    /// How much the other candidates wrote the same thing (0-1), when
+    /// there were enough of them to compare.
+    pub agreement: Option<f32>,
 }
 
 impl Confidence {
@@ -274,7 +314,16 @@ impl Confidence {
             uncertain: g.uncertain(honesty.uncertain_below),
             tokens: g.tokens(),
             unfamiliarity: typical_nll.filter(|t| *t > 0.0).map(|t| g.prompt_nll / t),
+            weakest: g.weakest(),
+            gave_up: g.stop == Stop::Unsure,
+            agreement: None,
         }
+    }
+
+    /// Already enough to refuse, whatever the slower checks would say.
+    pub fn refuses(&self, honesty: &HonestySettings) -> bool {
+        self.gave_up || (self.tokens > 0 && self.score() < honesty.min_confidence)
+            || (self.tokens >= STRETCH && self.weakest < honesty.min_stretch)
     }
 
     /// 0-1, what the report shows: the tokens' mean probability, pulled
@@ -333,10 +382,18 @@ pub fn judge(syntax: Status, invented: Vec<String>, tests: Status, confidence: C
         Status::Skipped(_) => cap(Verdict::Checked, String::new(), &mut Vec::new()),
         Status::Pass => {}
     }
+    if confidence.gave_up {
+        cap(Verdict::Refused, "I lost track partway through writing it, so I stopped instead of guessing".into(), &mut reasons);
+    }
     if confidence.tokens > 0 && confidence.score() < honesty.min_confidence {
         cap(Verdict::Refused, format!("I'm not confident in it ({:.0}% average certainty)", confidence.score() * 100.0), &mut reasons);
+    } else if confidence.tokens >= STRETCH && confidence.weakest < honesty.min_stretch {
+        cap(Verdict::Refused, format!("part of it is a guess (one stretch averages {:.0}% certainty)", confidence.weakest * 100.0), &mut reasons);
     } else if confidence.unfamiliarity.is_some_and(|u| u > 1.5) {
         cap(Verdict::Unverified, "the code around it is unlike anything I learned from".into(), &mut reasons);
+    }
+    if !tests.passed() && confidence.agreement.is_some_and(|a| a < honesty.min_agreement) {
+        cap(Verdict::Unverified, "my separate attempts at it disagreed with each other".into(), &mut reasons);
     }
     if verdict == Verdict::Checked && !syntax.passed() {
         verdict = Verdict::Unverified;
@@ -396,7 +453,7 @@ mod tests {
     #[test]
     fn the_verdict_only_goes_down() {
         let h = HonestySettings::default();
-        let sure = Confidence { mean_prob: 0.9, uncertain: 0, tokens: 20, unfamiliarity: Some(1.0) };
+        let sure = Confidence { mean_prob: 0.9, uncertain: 0, tokens: 20, unfamiliarity: Some(1.0), weakest: 0.8, gave_up: false, agreement: None };
         assert_eq!(judge(Status::Pass, vec![], Status::Pass, sure, &h).verdict, Verdict::Verified);
         assert_eq!(judge(Status::Pass, vec![], Status::Skipped("no tests".into()), sure, &h).verdict, Verdict::Checked);
         assert_eq!(judge(Status::Skipped("no tool".into()), vec![], Status::Skipped("".into()), sure, &h).verdict, Verdict::Unverified);
@@ -407,5 +464,26 @@ mod tests {
         let strange = Confidence { unfamiliarity: Some(2.5), ..sure };
         assert!(strange.score() < sure.score());
         assert_eq!(judge(Status::Fail("bad".into()), vec![], Status::Pass, sure, &h).verdict, Verdict::Refused);
+        // a good average doesn't hide one made-up stretch
+        let r = judge(Status::Pass, vec![], Status::Pass, Confidence { weakest: 0.05, ..sure }, &h);
+        assert!(r.verdict == Verdict::Refused && r.reasons[0].contains("guess"), "{:?}", r.reasons);
+        let r = judge(Status::Pass, vec![], Status::Pass, Confidence { gave_up: true, ..sure }, &h);
+        assert!(r.verdict == Verdict::Refused && r.reasons[0].contains("lost track"));
+        assert!(Confidence { gave_up: true, ..sure }.refuses(&h) && !sure.refuses(&h));
+        // attempts that disagree: untested code isn't vouched for, tested code is
+        let split = Confidence { agreement: Some(0.05), ..sure };
+        assert_eq!(judge(Status::Pass, vec![], Status::Skipped("no tests".into()), split, &h).verdict, Verdict::Unverified);
+        assert_eq!(judge(Status::Pass, vec![], Status::Pass, split, &h).verdict, Verdict::Verified);
+    }
+
+    #[test]
+    fn agreeing_attempts_are_told_apart_from_scattered_ones() {
+        assert_eq!(similarity("return a + b", "return  a+b"), 1.0);
+        assert!(similarity("return a + b", "while True: pass") < 0.1);
+        let same = agreement(&["x = f(1)\n", "x = f(1)\n", "x = f( 1 )\n", ""]);
+        assert!(same[0].unwrap() > 0.99 && same[3].is_some());
+        let scattered = agreement(&["x = f(1)", "print('hi')", "while y: z()"]);
+        assert!(scattered[0].unwrap() < 0.25);
+        assert_eq!(agreement(&["a", "b"]), vec![None, None]);
     }
 }

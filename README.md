@@ -38,7 +38,9 @@ aegist                              # open the session
   the language's own compiler or parser, a search for names it may have
   invented, the tests when there are any, and how sure the model was of each
   token. Unsure tokens are underlined. If the checks fail, nothing touches
-  your files.
+  your files. A good average can't hide one made-up line (the weakest
+  stretch counts too), it stops writing as soon as it loses track instead
+  of guessing on, and when its separate attempts all disagree it says so.
 - **It gets better the more it reads and trains.** `learn` adds code and
   `train` updates the model's weights: real self-training, on your machine.
 
