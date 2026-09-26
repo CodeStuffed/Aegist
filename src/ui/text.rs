@@ -71,7 +71,9 @@ pub fn truncate(s: &str, max: usize) -> String {
         let cw = char_width(c);
         if w + cw > max - 1 {
             out.push('…');
-            out.push_str(RESET);
+            if s.contains('\x1b') {
+                out.push_str(RESET);
+            }
             return out;
         }
         out.push(c);

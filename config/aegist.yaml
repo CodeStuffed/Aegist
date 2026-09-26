@@ -75,6 +75,25 @@ honesty:
   require_syntax_check: true # never write code into your files that fails its language's own check
   check_timeout_s: 20
 
+decide:
+  # Typed decisions (pick one of a fixed set of options, yes/no, a score),
+  # read straight from the model's probabilities instead of writing text.
+  abstain_below: 0.5         # best option less likely than this => "I don't know"
+  min_margin: 0.1            # ...or not this far ahead of the runner-up
+  contextual_calibration: true  # cancel the model's bias toward some options
+
+agent:
+  # Using apps on your screen (aegist agent ...). Every action is checked
+  # first: it stays inside the app's window, risky keys are refused, and
+  # moving the mouse yourself stops it at once.
+  max_actions: 300
+  action_delay_ms: 120
+  confirm: true              # ask before touching the real desktop
+  failsafe_px: 40            # you moved the mouse this far => stop
+
+voice:
+  enabled: false             # speak replies with the system's text-to-speech (/voice on)
+
 gpu:
   # Training on an NVIDIA GPU (RTX 20xx or newer, CUDA Toolkit 12.8+; see
   # docs/GPU.md). auto: use it if one works - a self-check against the CPU

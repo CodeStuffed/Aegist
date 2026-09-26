@@ -139,6 +139,49 @@ impl Default for HonestySettings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct DecideSettings {
+    /// Below this probability for its best option, a decision is "I don't know".
+    pub abstain_below: f32,
+    /// ...or when the best option isn't ahead of the next by at least this much.
+    pub min_margin: f32,
+    /// Subtract each option's bias (its score with the question blanked out).
+    pub contextual_calibration: bool,
+}
+
+impl Default for DecideSettings {
+    fn default() -> Self {
+        DecideSettings { abstain_below: 0.5, min_margin: 0.1, contextual_calibration: true }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    /// Most actions (clicks, drags, keys) in one run.
+    pub max_actions: usize,
+    /// Pause after each action, so the app can draw.
+    pub action_delay_ms: u64,
+    /// Ask before touching the real desktop.
+    pub confirm: bool,
+    /// Stop if you move the mouse this far from where Aegist put it.
+    pub failsafe_px: i32,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        AgentSettings { max_actions: 300, action_delay_ms: 120, confirm: true, failsafe_px: 40 }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct VoiceSettings {
+    /// Speak replies aloud with the system's own text-to-speech.
+    pub enabled: bool,
+}
+
 /// Where training runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -216,6 +259,12 @@ pub struct Settings {
     pub honesty: HonestySettings,
     #[serde(default)]
     pub gpu: GpuSettings,
+    #[serde(default)]
+    pub decide: DecideSettings,
+    #[serde(default)]
+    pub agent: AgentSettings,
+    #[serde(default)]
+    pub voice: VoiceSettings,
     pub paths: PathSettings,
     /// Aegist's home (holds config/).
     #[serde(skip)]

@@ -108,6 +108,59 @@ enum Command {
         #[arg(long, value_enum)]
         precision: Option<Precision>,
     },
+    /// Use an app on your screen: learn what its buttons do by trying them,
+    /// then reach goals ("draw a red rectangle"), checking the screen each
+    /// time and learning from how it went.
+    ///
+    ///   aegist agent learn --app paint        (open the app first)
+    ///   aegist agent do draw a blue circle --app paint
+    ///   aegist agent practice 30 --app paint
+    ///   aegist agent memory
+    ///   aegist agent learn --sim              (a practice paint app inside Aegist)
+    Agent {
+        /// learn | do <goal> | practice [n] | memory
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+        /// The app's window (part of its title).
+        #[arg(long)]
+        app: Option<String>,
+        /// Use the built-in practice paint app instead of the real screen.
+        #[arg(long)]
+        sim: bool,
+        /// Don't ask before touching the screen; allow risky goals like clearing.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Pick one of a fixed set of options, with each one's probability - or
+    /// say "I don't know" when none clearly wins. No options: is it true?
+    Decide {
+        question: String,
+        /// An option (repeat for each).
+        #[arg(long = "option", short = 'o')]
+        options: Vec<String>,
+    },
+    /// The next values of a series of numbers, with an 80% range, from the
+    /// method that best predicted the series' own past - or "I don't know".
+    Predict {
+        numbers: Vec<String>,
+        /// How many steps ahead.
+        #[arg(long, default_value_t = 1)]
+        steps: usize,
+    },
+    /// Estimate a quantity from similar ones you've told it; "<thing> = <number>" teaches it one.
+    Estimate {
+        #[arg(trailing_var_arg = true)]
+        what: Vec<String>,
+    },
+    /// The right answer to the last decision; it learns from it.
+    Answer {
+        option: String,
+    },
+    /// Say whether the last action or decision was right (good / bad); it learns from it.
+    Feedback {
+        /// good or bad
+        verdict: String,
+    },
     /// Hardware, model sizes, what's learned, and the model's state.
     Doctor,
     /// Test an NVIDIA GPU: compile the kernels, check them against the CPU, measure speed.
@@ -154,12 +207,19 @@ fn install_ctrl_c() {
 
 /// A worker context that prints straight to stdout.
 fn plain_ctx(settings: Settings, yes: bool) -> Result<Ctx> {
+    plain_ctx_with(settings, yes, true)
+}
+
+fn plain_ctx_with(settings: Settings, yes: bool, need_brain: bool) -> Result<Ctx> {
     let cwd = std::env::current_dir()?;
     let mut shared = session::new_shared(&settings, cwd.clone());
-    shared.project = Some(aegist::project::Project::open(&cwd));
+    if need_brain {
+        shared.project = Some(aegist::project::Project::open(&cwd));
+    }
     shared.brain = match Brain::load(&settings) {
         Ok(b) => BrainState::Ready(Arc::new(b)),
-        Err(e) => return Err(e),
+        Err(e) if need_brain => return Err(e),
+        Err(e) => BrainState::Missing(e.to_string()),
     };
     let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(100);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -302,6 +362,43 @@ fn run(command: Option<Command>) -> Result<ExitCode> {
             row("stood by", format!("{} candidates, {} of which passed their tests ({})", s.accepted.1, s.accepted.0, pct(s.accepted.0, s.accepted.1)));
             row("refused", format!("{} candidates, {} of which really did fail ({})", s.refused.1, s.refused.0, pct(s.refused.0, s.refused.1)));
             println!("    {}", style::faint("● passed · ○ failed · green/grey: its verdict agreed with the tests · red: it stood by code that failed · cyan: it refused code that passed"));
+        }
+        Command::Agent { words, app, sim, yes } => {
+            let mut args = words.join(" ");
+            if sim {
+                args.push_str(" --sim");
+            }
+            if yes {
+                args.push_str(" --yes");
+            }
+            let ctx = plain_ctx_with(settings, yes, false)?;
+            aegist::abilities::agent_command_for(&ctx, &args, app.as_deref())?;
+        }
+        Command::Decide { question, options } => {
+            let ctx = plain_ctx_with(settings, false, false)?;
+            if options.is_empty() {
+                aegist::abilities::decide(&ctx, &question)?;
+            } else {
+                let opts: Vec<&str> = options.iter().map(String::as_str).collect();
+                aegist::abilities::decide_question(&ctx, aegist::decide::Question::choose(&question, &opts))?;
+            }
+        }
+        Command::Predict { numbers, steps } => {
+            let ctx = plain_ctx_with(settings, false, false)?;
+            aegist::abilities::predict_series(&ctx, &format!("{} next {steps}", numbers.join(" ")))?;
+        }
+        Command::Estimate { what } => {
+            let ctx = plain_ctx_with(settings, false, false)?;
+            aegist::abilities::estimate(&ctx, &what.join(" "))?;
+        }
+        Command::Answer { option } => {
+            let ctx = plain_ctx_with(settings, false, false)?;
+            aegist::abilities::answer(&ctx, &option)?;
+        }
+        Command::Feedback { verdict } => {
+            let Some(good) = aegist::talk::feedback(&verdict) else { anyhow::bail!("say good or bad") };
+            let ctx = plain_ctx_with(settings, false, false)?;
+            aegist::abilities::feedback(&ctx, good)?;
         }
         Command::Doctor => doctor(&settings)?,
         Command::GpuCheck => return gpu_check(&settings),

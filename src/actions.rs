@@ -47,6 +47,13 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "diff", args: "", about: "Everything Aegist changed this session" },
     Command { name: "undo", args: "", about: "Undo Aegist's last change" },
     Command { name: "show", args: "", about: "The last code Aegist refused to stand behind" },
+    Command { name: "agent", args: "learn|do|practice [--app name | --sim]", about: "Learn an app on your screen by trying it, then use it" },
+    Command { name: "decide", args: "<question>: a | b | c", about: "Pick an option with its probability - or say I don't know" },
+    Command { name: "answer", args: "<option>", about: "The right answer to the last decision - it learns from it" },
+    Command { name: "predict", args: "<numbers> [next n]", about: "The next values of a series, with a range - or I don't know" },
+    Command { name: "estimate", args: "<thing> [= number]", about: "Estimate from similar things you've told it (= teaches it)" },
+    Command { name: "good", args: "/ bad", about: "Tell Aegist whether its last action or decision was right" },
+    Command { name: "voice", args: "[on|off]", about: "Speak answers aloud (the system's own speech)" },
     Command { name: "learn", args: "<folder | git URL | --pack name>", about: "Add code for the model to learn from" },
     Command { name: "train", args: "[hours]", about: "Train the model (ctrl+c stops and saves)" },
     Command { name: "model", args: "", about: "The model: size, training, and honest limits" },
@@ -193,7 +200,8 @@ pub fn help(ctx: &Ctx) {
     lines.push(String::new());
     lines.push(format!("  {}", style::gradient_styled("Or just say it", 0.3, true)));
     for ex in ["write a snake game as a web page", "write a python function that checks whether a number is prime",
-               "complete src/app.py:42", "fix `pytest -q`", "run main.py", "find parse_config"] {
+               "complete src/app.py:42", "fix `pytest -q`", "run main.py", "find parse_config", "learn to use paint",
+               "draw a red rectangle in paint", "good / bad"] {
         lines.push(format!("    {} {}", style::fg(pal::VIOLET, "❯"), ex));
     }
     lines.push(String::new());

@@ -529,6 +529,7 @@ pub fn dispatch(ctx: &Ctx, name: &str, args: &str) -> Result<()> {
         Ok(())
     };
     match name {
+        "" if crate::abilities::converse(ctx, args)? => Ok(()),
         "" => match actions::interpret(args) {
             Intent::Write { path, lang, description } => actions::write(ctx, path.as_deref(), lang, &description),
             Intent::Complete(t) => actions::complete(ctx, &t),
@@ -602,6 +603,14 @@ pub fn dispatch(ctx: &Ctx, name: &str, args: &str) -> Result<()> {
             Ok(())
         }
         "learn" => actions::learn(ctx, args),
+        "agent" | "app" | "use" => crate::abilities::agent_command(ctx, args),
+        "decide" | "choose" => crate::abilities::decide(ctx, args),
+        "voice" | "speak" => crate::abilities::voice(ctx, args),
+        "predict" | "forecast" => crate::abilities::predict_series(ctx, args),
+        "estimate" => crate::abilities::estimate(ctx, args),
+        "answer" => crate::abilities::answer(ctx, args),
+        "good" | "right" => crate::abilities::feedback(ctx, true),
+        "bad" | "wrong" => crate::abilities::feedback(ctx, false),
         "train" => actions::train(ctx, args),
         "model" | "doctor" | "about" => {
             actions::model(ctx);

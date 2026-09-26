@@ -35,6 +35,12 @@ pub struct Shared {
     /// The last code Aegist wouldn't stand behind (for /show).
     pub last_refused: Option<Answer>,
     pub cwd: PathBuf,
+    /// What "good" / "bad" would give feedback on.
+    pub last_act: Option<crate::abilities::LastAct>,
+    /// Speak replies aloud.
+    pub voice: bool,
+    /// The practice paint app, kept between requests.
+    pub sim: Option<crate::agent::sim::SimPaint>,
 }
 
 /// From the worker to the screen.
@@ -192,5 +198,8 @@ pub fn new_shared(settings: &Settings, cwd: PathBuf) -> Shared {
         last_output: Vec::new(),
         last_refused: None,
         cwd,
+        last_act: None,
+        voice: settings.voice.enabled,
+        sim: None,
     }
 }

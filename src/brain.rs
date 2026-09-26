@@ -370,6 +370,36 @@ impl Brain {
         Generation { text, spans, stop: stop_reason, prompt_nll: read.nll, prompt_tokens: read.ids.len(), guessed, seconds: 0.0 }
     }
 
+    /// How likely the model finds each of `options` as the text right after
+    /// `prompt`: (total log-probability, tokens). The prompt is read once and
+    /// every option continues its cached keys and values, in parallel, so
+    /// asking about ten options costs little more than asking about one.
+    pub fn score_continuations(&self, prompt: &str, options: &[String]) -> Vec<(f32, usize)> {
+        let encoded: Vec<Vec<u32>> = options.iter().map(|o| self.tokenizer.encode(o)).collect();
+        let longest = encoded.iter().map(|e| e.len()).max().unwrap_or(1).max(1);
+        let read = self.read(prompt, longest);
+        let v = self.model.cfg.vocab_size;
+        encoded
+            .par_iter()
+            .map(|ids| {
+                let ids = &ids[..ids.len().min(read.max_new)];
+                let Some(&first) = ids.first() else { return (0.0, 0) };
+                let mut total = read.logp[first as usize];
+                if ids.len() > 1 {
+                    let n = ids.len() - 1;
+                    let cache = KvCache::fork(&read.cache);
+                    let out = self.model.infer_with(&read.rope, &cache, &ids[..n], 1, n, n, None);
+                    for r in 0..n {
+                        let mut lp = out.logits[r * v..(r + 1) * v].to_vec();
+                        log_softmax(&mut lp);
+                        total += lp[ids[r + 1] as usize];
+                    }
+                }
+                (total, ids.len())
+            })
+            .collect()
+    }
+
     /// Mean negative log-likelihood per token of `text` (lower = more familiar).
     pub fn text_nll(&self, text: &str) -> f32 {
         let v = self.model.cfg.vocab_size;
@@ -545,6 +575,31 @@ mod tests {
         assert_eq!(pieces, streamed.text);
         let cancelled = brain.generate(&prompt, &opts(12, 0.0, true), &never_stop, &mut |_, _| false);
         assert_eq!((cancelled.stop, cancelled.spans.len()), (Stop::Cancelled, 1));
+    }
+
+    #[test]
+    fn scoring_options_matches_reading_them_whole() {
+        let (_tmp, s) = trained(40);
+        let brain = Brain::load_at(&s, Precision::F32).unwrap();
+        let prompt = format!("{FILE}m4.py\ndef add(a, b):\n");
+        let options = ["    return a + b\n".to_string(), "zzz qq".to_string(), String::new()];
+        let scores = brain.score_continuations(&prompt, &options);
+        let v = brain.model.cfg.vocab_size;
+        for (o, &(total, n)) in options.iter().zip(&scores) {
+            let (p, q) = (brain.tokenizer.encode(&prompt), brain.tokenizer.encode(o));
+            assert_eq!(n, q.len());
+            let ids: Vec<u32> = p.iter().chain(&q).copied().collect();
+            let out = brain.model.infer(&KvCache::empty(&brain.model.cfg), &ids, 1, ids.len(), None);
+            let want: f32 = (p.len()..ids.len())
+                .map(|t| {
+                    let mut lp = out.logits[(t - 1) * v..t * v].to_vec();
+                    log_softmax(&mut lp);
+                    lp[ids[t] as usize]
+                })
+                .sum();
+            assert!((total - want).abs() < 1e-2, "{o:?}: {total} vs {want}");
+        }
+        assert!(scores[0].0 / scores[0].1 as f32 > scores[1].0 / scores[1].1 as f32, "{scores:?}");
     }
 
     #[test]
