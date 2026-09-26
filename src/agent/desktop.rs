@@ -11,6 +11,8 @@ pub struct Window {
     pub id: u64,
     pub title: String,
     pub rect: Rect,
+    /// The program it belongs to, lowercase ("xterm", "chrome"), if known.
+    pub app: String,
 }
 
 pub trait Desktop {
@@ -30,6 +32,23 @@ pub trait Desktop {
     fn windows(&mut self) -> Vec<Window>;
     /// Bring a window to the front and give it the keyboard.
     fn activate(&mut self, w: &Window) -> Result<()>;
+    /// Any mouse button down or up: 1 left, 2 middle, 3 right.
+    fn mouse_button(&mut self, button: u8, down: bool) -> Result<()> {
+        if button == 1 {
+            return self.button(down);
+        }
+        bail!("{} can only use the left mouse button", self.name())
+    }
+    /// Turn the mouse wheel: positive notches scroll up, negative down.
+    fn scroll(&mut self, notches: i32) -> Result<()> {
+        let _ = notches;
+        bail!("{} can't scroll", self.name())
+    }
+    /// The whole screen's size.
+    fn screen_size(&mut self) -> Result<(i32, i32)> {
+        let shot = self.capture()?;
+        Ok((shot.w as i32, shot.h as i32))
+    }
     fn wait(&mut self, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
@@ -228,6 +247,24 @@ pub mod x11 {
             None
         }
 
+        /// The program a window belongs to: the class in WM_CLASS ("XTerm" -> "xterm").
+        fn class_of(&self, w: XWindow) -> String {
+            // SAFETY: atom by name; the property buffer is copied, then freed with XFree.
+            unsafe {
+                let atom = (self.api.intern_atom)(self.dpy, c"WM_CLASS".as_ptr(), 0);
+                let (mut ty, mut fmt, mut n, mut after, mut prop) = (0, 0, 0, 0, std::ptr::null_mut());
+                // XA_STRING = 31
+                if (self.api.get_property)(self.dpy, w, atom, 0, 256, 0, 31, &mut ty, &mut fmt, &mut n, &mut after, &mut prop) != 0 || prop.is_null() {
+                    return String::new();
+                }
+                let raw = std::slice::from_raw_parts(prop, n as usize).to_vec();
+                (self.api.free)(prop as *mut c_void);
+                // "instance\0Class\0": the class is the program's name
+                let parts: Vec<String> = raw.split(|&b| b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).to_lowercase()).collect();
+                parts.last().cloned().unwrap_or_default()
+            }
+        }
+
         /// (parent, children)
         fn tree(&self, w: XWindow) -> Option<(XWindow, Vec<XWindow>)> {
             let (mut root, mut parent, mut kids, mut n) = (0, 0, std::ptr::null_mut(), 0);
@@ -267,6 +304,12 @@ pub mod x11 {
                 "right" => "Right",
                 "home" => "Home",
                 "end" => "End",
+                "pageup" | "pgup" => "Prior",
+                "pagedown" | "pgdn" => "Next",
+                "insert" | "ins" => "Insert",
+                "capslock" => "Caps_Lock",
+                "f1" => "F1", "f2" => "F2", "f3" => "F3", "f4" => "F4", "f5" => "F5", "f6" => "F6",
+                "f7" => "F7", "f8" => "F8", "f9" => "F9", "f10" => "F10", "f11" => "F11", "f12" => "F12",
                 other => other,
             };
             let c = CString::new(name).ok()?;
@@ -334,12 +377,39 @@ pub mod x11 {
         }
 
         fn button(&mut self, down: bool) -> Result<()> {
+            self.mouse_button(1, down)
+        }
+
+        fn mouse_button(&mut self, button: u8, down: bool) -> Result<()> {
+            if !(1..=3).contains(&button) {
+                bail!("there's no mouse button {button}");
+            }
             // SAFETY: XTest on a live display.
             unsafe {
-                (self.api.fake_button)(self.dpy, 1, down as c_int, 0);
+                (self.api.fake_button)(self.dpy, button as c_uint, down as c_int, 0);
                 (self.api.sync)(self.dpy, 0);
             }
             Ok(())
+        }
+
+        fn scroll(&mut self, notches: i32) -> Result<()> {
+            // X11 has no wheel: buttons 4 (up) and 5 (down), one click per notch
+            let b = if notches > 0 { 4 } else { 5 };
+            for _ in 0..notches.unsigned_abs().min(100) {
+                // SAFETY: XTest on a live display.
+                unsafe {
+                    (self.api.fake_button)(self.dpy, b, 1, 0);
+                    (self.api.fake_button)(self.dpy, b, 0, 0);
+                    (self.api.sync)(self.dpy, 0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Ok(())
+        }
+
+        fn screen_size(&mut self) -> Result<(i32, i32)> {
+            let r = self.geometry(self.root).ok_or_else(|| anyhow::anyhow!("couldn't read the screen's size"))?;
+            Ok((r.w, r.h))
         }
 
         fn key(&mut self, combo: &str) -> Result<()> {
@@ -410,7 +480,7 @@ pub mod x11 {
                 if let Some(title) = self.name_of(w) {
                     // the top-level window (the frame's child) holds the title
                     let rect = self.geometry(w)?;
-                    return Some(Window { id: w as u64, title, rect });
+                    return Some(Window { id: w as u64, title, rect, app: self.class_of(w) });
                 }
                 w = self.parent(w)?;
             }
@@ -426,7 +496,7 @@ pub mod x11 {
                     match self.name_of(k) {
                         Some(title) if !title.is_empty() => {
                             if let Some(rect) = self.geometry(k).filter(|r| r.w > 1 && r.h > 1) {
-                                out.push(Window { id: k as u64, title, rect });
+                                out.push(Window { id: k as u64, title, rect, app: self.class_of(k) });
                             }
                         }
                         _ if depth < 2 => todo.push((k, depth + 1)),
@@ -539,6 +609,13 @@ pub mod win {
         fn IsIconic(h: Hwnd) -> i32;
         fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
         fn SetForegroundWindow(h: Hwnd) -> i32;
+        fn GetWindowThreadProcessId(h: Hwnd, pid: *mut u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn QueryFullProcessImageNameW(h: *mut c_void, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
     }
     #[link(name = "gdi32")]
     extern "system" {
@@ -555,6 +632,11 @@ pub mod win {
     const INPUT_KEYBOARD: u32 = 1;
     const MOUSEEVENTF_LEFTDOWN: u32 = 0x2;
     const MOUSEEVENTF_LEFTUP: u32 = 0x4;
+    const MOUSEEVENTF_RIGHTDOWN: u32 = 0x8;
+    const MOUSEEVENTF_RIGHTUP: u32 = 0x10;
+    const MOUSEEVENTF_MIDDLEDOWN: u32 = 0x20;
+    const MOUSEEVENTF_MIDDLEUP: u32 = 0x40;
+    const MOUSEEVENTF_WHEEL: u32 = 0x0800;
     const KEYEVENTF_KEYUP: u32 = 0x2;
     const KEYEVENTF_UNICODE: u32 = 0x4;
     const SRCCOPY: u32 = 0x00CC0020;
@@ -607,6 +689,10 @@ pub mod win {
                 "down" => 0x28,
                 "home" => 0x24,
                 "end" => 0x23,
+                "pageup" | "pgup" => 0x21,
+                "pagedown" | "pgdn" => 0x22,
+                "insert" | "ins" => 0x2D,
+                "capslock" => 0x14,
                 k if k.len() == 1 => {
                     let c = k.chars().next()?;
                     // SAFETY: plain call.
@@ -633,6 +719,30 @@ pub mod win {
                 id: h as u64,
                 title: String::from_utf16_lossy(&buf[..n.max(0) as usize]),
                 rect: Rect::new(r.left - self.origin.0, r.top - self.origin.1, r.right - r.left, r.bottom - r.top),
+                app: Self::program_of(h),
+            }
+        }
+
+        /// The program that owns a window: its .exe name, lowercase ("chrome").
+        fn program_of(h: Hwnd) -> String {
+            let mut pid = 0u32;
+            // SAFETY: out-pointer to a local; the process handle is closed below; the buffer's length is passed.
+            unsafe {
+                GetWindowThreadProcessId(h, &mut pid);
+                // PROCESS_QUERY_LIMITED_INFORMATION
+                let p = OpenProcess(0x1000, 0, pid);
+                if p.is_null() {
+                    return String::new();
+                }
+                let mut buf = [0u16; 520];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut len);
+                CloseHandle(p);
+                if ok == 0 {
+                    return String::new();
+                }
+                let path = String::from_utf16_lossy(&buf[..len as usize]);
+                std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()
             }
         }
 
@@ -684,8 +794,31 @@ pub mod win {
         }
 
         fn button(&mut self, down: bool) -> Result<()> {
-            let flags = if down { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP };
+            self.mouse_button(1, down)
+        }
+
+        fn mouse_button(&mut self, button: u8, down: bool) -> Result<()> {
+            let flags = match (button, down) {
+                (1, true) => MOUSEEVENTF_LEFTDOWN,
+                (1, false) => MOUSEEVENTF_LEFTUP,
+                (2, true) => MOUSEEVENTF_MIDDLEDOWN,
+                (2, false) => MOUSEEVENTF_MIDDLEUP,
+                (3, true) => MOUSEEVENTF_RIGHTDOWN,
+                (3, false) => MOUSEEVENTF_RIGHTUP,
+                _ => bail!("there's no mouse button {button}"),
+            };
             self.send(&[Input { kind: INPUT_MOUSE, u: InputUnion { mi: MouseInput { dx: 0, dy: 0, mouse_data: 0, flags, time: 0, extra: 0 } } }])
+        }
+
+        fn scroll(&mut self, notches: i32) -> Result<()> {
+            // one notch is 120 units; up is positive
+            let data = (notches.clamp(-100, 100) * 120) as u32;
+            self.send(&[Input { kind: INPUT_MOUSE, u: InputUnion { mi: MouseInput { dx: 0, dy: 0, mouse_data: data, flags: MOUSEEVENTF_WHEEL, time: 0,
+                                                                                   extra: 0 } } }])
+        }
+
+        fn screen_size(&mut self) -> Result<(i32, i32)> {
+            Ok(self.size)
         }
 
         fn key(&mut self, combo: &str) -> Result<()> {

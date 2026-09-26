@@ -463,6 +463,14 @@ pub fn load_png(path: &Path) -> Result<(usize, usize, Vec<crate::ui::style::Rgb>
 /// pixels, one above the other. `cols` wide; height follows the image.
 pub fn render_png(path: &Path, cols: usize, max_rows: usize) -> Result<Vec<String>> {
     let (w, h, pixels) = load_png(path)?;
+    Ok(render_pixels(w, h, &pixels, cols, max_rows))
+}
+
+/// `w`×`h` pixels (row by row) drawn with half-block characters.
+pub fn render_pixels(w: usize, h: usize, pixels: &[crate::ui::style::Rgb], cols: usize, max_rows: usize) -> Vec<String> {
+    if w == 0 || h == 0 || pixels.len() < w * h {
+        return Vec::new();
+    }
     let cols = cols.min(w).max(1);
     let scale = w as f32 / cols as f32;
     let rows = ((h as f32 / scale / 2.0).ceil() as usize).min(max_rows).max(1);
@@ -492,7 +500,7 @@ pub fn render_png(path: &Path, cols: usize, max_rows: usize) -> Result<Vec<Strin
         }
         out.push(line);
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]

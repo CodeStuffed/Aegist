@@ -26,40 +26,81 @@ pub struct Command {
     pub name: &'static str,
     pub args: &'static str,
     pub about: &'static str,
+    pub group: &'static str,
 }
 
+const fn cmd(group: &'static str, name: &'static str, args: &'static str, about: &'static str) -> Command {
+    Command { name, args, about, group }
+}
+
+/// Command groups, in the order /help shows them.
+pub const GROUPS: &[(&str, &str)] = &[
+    ("code", "Code"),
+    ("run", "Run things"),
+    ("look", "Look around"),
+    ("screen", "Your screen: be the mouse and keyboard"),
+    ("auto", "Autopilot"),
+    ("think", "Decide and predict"),
+    ("model", "The model"),
+    ("session", "Session"),
+];
+
 pub const COMMANDS: &[Command] = &[
-    Command { name: "write", args: "<file> <what it should do>", about: "Write a new file - checked before it's saved" },
-    Command { name: "complete", args: "<file>[:line]", about: "Fill in code at a line (a TODO, or the file's end)" },
-    Command { name: "fix", args: "[command]", about: "Make a failing command pass (default: the tests)" },
-    Command { name: "run", args: "<command or file>", about: "Run a program and show its output" },
-    Command { name: "test", args: "", about: "Run the project's tests" },
-    Command { name: "start", args: "<command>", about: "Start a program in the background (servers, games)" },
-    Command { name: "jobs", args: "", about: "Background programs and how they're doing" },
-    Command { name: "logs", args: "<job>", about: "A background program's latest output" },
-    Command { name: "stop", args: "<job|all>", about: "Stop a background program" },
-    Command { name: "serve", args: "[folder]", about: "Serve a website folder on localhost" },
-    Command { name: "preview", args: "<url, file or job>", about: "Look at a web page, drawn right here" },
-    Command { name: "open", args: "<file>[:from-to]", about: "Show a file, highlighted" },
-    Command { name: "find", args: "<name pattern>", about: "Find files by name (* and ? work)" },
-    Command { name: "grep", args: "<text or regex>", about: "Search the project's code" },
-    Command { name: "tree", args: "[folder]", about: "The project's layout" },
-    Command { name: "diff", args: "", about: "Everything Aegist changed this session" },
-    Command { name: "undo", args: "", about: "Undo Aegist's last change" },
-    Command { name: "show", args: "", about: "The last code Aegist refused to stand behind" },
-    Command { name: "agent", args: "learn|do|practice [--app name | --sim]", about: "Learn an app on your screen by trying it, then use it" },
-    Command { name: "decide", args: "<question>: a | b | c", about: "Pick an option with its probability - or say I don't know" },
-    Command { name: "answer", args: "<option>", about: "The right answer to the last decision - it learns from it" },
-    Command { name: "predict", args: "<numbers> [next n]", about: "The next values of a series, with a range - or I don't know" },
-    Command { name: "estimate", args: "<thing> [= number]", about: "Estimate from similar things you've told it (= teaches it)" },
-    Command { name: "good", args: "/ bad", about: "Tell Aegist whether its last action or decision was right" },
-    Command { name: "voice", args: "[on|off]", about: "Speak answers aloud (the system's own speech)" },
-    Command { name: "learn", args: "<folder | git URL | --pack name>", about: "Add code for the model to learn from" },
-    Command { name: "train", args: "[hours]", about: "Train the model (ctrl+c stops and saves)" },
-    Command { name: "model", args: "", about: "The model: size, training, and honest limits" },
-    Command { name: "clear", args: "", about: "Clear the screen" },
-    Command { name: "help", args: "", about: "All of this" },
-    Command { name: "exit", args: "", about: "Leave (background programs are stopped)" },
+    cmd("code", "write", "<file> <what it should do>", "Write a new file - checked before it's saved"),
+    cmd("code", "complete", "<file>[:line]", "Fill in code at a line (a TODO, or the file's end)"),
+    cmd("code", "fix", "[command]", "Make a failing command pass (default: the tests)"),
+    cmd("code", "show", "", "The last code Aegist refused to stand behind"),
+    cmd("code", "diff", "", "Everything Aegist changed this session"),
+    cmd("code", "undo", "", "Undo Aegist's last change"),
+    cmd("code", "copy", "[text]", "Copy the last code it wrote (or the last output) to the clipboard"),
+    cmd("run", "run", "<command or file>", "Run a program and show its output"),
+    cmd("run", "test", "", "Run the project's tests"),
+    cmd("run", "start", "<command>", "Start a program in the background (servers, games)"),
+    cmd("run", "jobs", "", "Background programs and how they're doing"),
+    cmd("run", "logs", "<job>", "A background program's latest output"),
+    cmd("run", "stop", "<job|all>", "Stop a background program"),
+    cmd("run", "serve", "[folder]", "Serve a website folder on localhost"),
+    cmd("run", "preview", "<url, file or job>", "Look at a web page, drawn right here"),
+    cmd("run", "git", "[status|log|diff|any git command]", "Git, asking before anything that can't be undone"),
+    cmd("look", "open", "<file>[:from-to]", "Show a file, highlighted"),
+    cmd("look", "find", "<name pattern>", "Find files by name (* and ? work)"),
+    cmd("look", "grep", "<text or regex>", "Search the project's code"),
+    cmd("look", "tree", "[folder]", "The project's layout"),
+    cmd("look", "cd", "<folder>", "Work in another folder"),
+    cmd("screen", "screen", "", "Screenshot, drawn here with coordinates to click by"),
+    cmd("screen", "windows", "", "The open windows (● is in front)"),
+    cmd("screen", "focus", "<window title>", "Bring a window to the front"),
+    cmd("screen", "launch", "<app or web address>", "Open an app (notepad, calculator, paint...) or a website"),
+    cmd("screen", "click", "[right|double] [x y | 50% 20% | center]", "Click - where you say, or where the pointer is"),
+    cmd("screen", "rclick", "[x y]", "Right-click"),
+    cmd("screen", "dclick", "[x y]", "Double-click"),
+    cmd("screen", "mouse", "[x y]", "Move the pointer there (or say where it is)"),
+    cmd("screen", "drag", "<x1 y1> <x2 y2>", "Drag from one place to another"),
+    cmd("screen", "scroll", "<up|down> [n]", "Turn the mouse wheel"),
+    cmd("screen", "type", "<text>", "Type text into the window in front"),
+    cmd("screen", "key", "<key or combo> [n times]", "Press keys: enter, ctrl+c, alt+tab, tab 3 times..."),
+    cmd("screen", "wait", "<seconds>", "Wait (for an app to catch up)"),
+    cmd("screen", "agent", "learn|do|practice [--app name | --sim]", "Learn an app on your screen by trying it, then use it"),
+    cmd("auto", "auto", "<steps in plain words>", "Plan several steps, show the plan, then do them all"),
+    cmd("auto", "do", "<steps in plain words>", "Same as /auto"),
+    cmd("auto", "safety", "", "What Aegist will and won't do on your computer"),
+    cmd("think", "decide", "<question>: a | b | c", "Pick an option with its probability - or say I don't know"),
+    cmd("think", "answer", "<option>", "The right answer to the last decision - it learns from it"),
+    cmd("think", "predict", "<numbers> [next n]", "The next values of a series, with a range - or I don't know"),
+    cmd("think", "estimate", "<thing> [= number]", "Estimate from similar things you've told it (= teaches it)"),
+    cmd("think", "good", "/ bad", "Tell Aegist whether its last action or decision was right"),
+    cmd("model", "learn", "<folder | git URL | --pack name>", "Add code for the model to learn from"),
+    cmd("model", "train", "[hours]", "Train the model (ctrl+c stops and saves)"),
+    cmd("model", "model", "", "The model: size, training, and honest limits"),
+    cmd("model", "config", "[setting [value]]", "See or change settings (certainty limits, agent, voice...)"),
+    cmd("session", "status", "", "Everything about this session at a glance"),
+    cmd("session", "history", "[n]", "What you've asked this session"),
+    cmd("session", "export", "[file]", "Save this session's transcript to a file"),
+    cmd("session", "voice", "[on|off]", "Speak answers aloud (the system's own speech)"),
+    cmd("session", "install", "", "Add Aegist to your apps menu, to open like any app"),
+    cmd("session", "clear", "", "Clear the screen"),
+    cmd("session", "help", "[group]", "All of this"),
+    cmd("session", "exit", "", "Leave (background programs are stopped)"),
 ];
 
 /// What a plain-words request is asking for.
@@ -189,28 +230,40 @@ pub fn language_in(lower: &str) -> Option<&'static Lang> {
 
 // ------------------------------------------------------------------ help
 
-pub fn help(ctx: &Ctx) {
+pub fn help(ctx: &Ctx, args: &str) {
     let w = ctx.width();
-    let mut lines = vec![String::new(), format!("  {}", style::gradient_styled("Commands", 0.1, true)), String::new()];
-    let name_w = COMMANDS.iter().map(|c| c.name.len() + c.args.len() + 2).max().unwrap_or(20).min(40);
-    for c in COMMANDS {
-        let left = format!("{} {}", Style::new().fg(pal::VIOLET).bold().paint(&format!("/{}", c.name)), style::faint(c.args));
-        lines.push(text::truncate(&format!("    {}  {}", text::pad(&left, name_w + 1), style::dim(c.about)), w));
+    let only = args.trim().trim_start_matches('/').to_lowercase();
+    let mut lines = vec![String::new()];
+    let name_w = COMMANDS.iter().map(|c| c.name.len() + c.args.len() + 2).max().unwrap_or(20).min(34);
+    for (i, (group, title)) in GROUPS.iter().enumerate() {
+        if !only.is_empty() && !group.starts_with(&only) && !title.to_lowercase().contains(&only) {
+            continue;
+        }
+        lines.push(format!("  {}", style::gradient_styled(title, i as f32 / GROUPS.len() as f32, true)));
+        for c in COMMANDS.iter().filter(|c| c.group == *group) {
+            let left = format!("{} {}", Style::new().fg(pal::VIOLET).bold().paint(&format!("/{}", c.name)), style::faint(c.args));
+            lines.push(text::truncate(&format!("    {}  {}", text::pad(&text::truncate(&left, name_w + 1), name_w + 1), style::dim(c.about)), w));
+        }
+        lines.push(String::new());
     }
-    lines.push(String::new());
+    if !only.is_empty() {
+        ctx.print(lines);
+        return;
+    }
     lines.push(format!("  {}", style::gradient_styled("Or just say it", 0.3, true)));
-    for ex in ["write a snake game as a web page", "write a python function that checks whether a number is prime",
-               "complete src/app.py:42", "fix `pytest -q`", "run main.py", "find parse_config", "learn to use paint",
-               "draw a red rectangle in paint", "good / bad"] {
+    for ex in ["write a snake game as a web page", "complete src/app.py:42", "fix `pytest -q`", "run main.py",
+               "open notepad, type hello world and press enter", "switch to firefox then scroll down 5", "take a screenshot",
+               "click 640 400", "fix the tests then run main.py", "draw a red rectangle in paint", "good / bad"] {
         lines.push(format!("    {} {}", style::fg(pal::VIOLET, "❯"), ex));
     }
     lines.push(String::new());
     lines.push(format!("  {}", style::gradient_styled("Keys", 0.5, true)));
     for (k, what) in [("enter", "send"), ("shift/alt+enter  \\+enter", "new line"), ("tab", "complete a command or path"),
-                      ("↑ ↓", "history"), ("esc / ctrl+c", "stop the work in progress"), ("!command", "run a shell command"),
+                      ("↑ ↓", "history"), ("esc / ctrl+c", "stop the work in progress (and take the mouse back)"), ("!command", "run a shell command"),
                       ("ctrl+l", "clear the screen"), ("ctrl+d", "leave")] {
         lines.push(format!("    {}  {}", Style::new().fg(pal::SKY).paint(&text::pad(k, 26)), style::dim(what)));
     }
+    lines.push(format!("    {}", style::faint("/help <group> shows one group: /help screen, /help auto, /help code ...")));
     lines.push(String::new());
     ctx.print(lines);
 }
@@ -342,6 +395,9 @@ fn present(ctx: &Ctx, answer: &Answer, what: &str) -> Option<usize> {
     }
     lines.extend(widgets::report(&best.report, lang_name, w));
     ctx.print(lines);
+    if best.report.verdict > Verdict::Refused {
+        ctx.shared.lock().expect("lock").last_code = Some(best.code.clone());
+    }
     if best.report.verdict == Verdict::Refused {
         let others = answer.candidates.len().saturating_sub(1);
         ctx.print(vec![format!("    {}", style::dim(&format!(
@@ -630,7 +686,11 @@ pub fn run(ctx: &Ctx, command: &str) -> Result<()> {
         style::fg(pal::RED, &format!("✗ exit {}", out.code.map_or("?".into(), |c| c.to_string())))
     };
     ctx.print(vec![format!("    {status} {}", style::faint(&format!("· {:.2}s · {} lines", out.seconds, all.len())))]);
-    ctx.shared.lock().expect("lock").last_output = all;
+    {
+        let mut s = ctx.shared.lock().expect("lock");
+        s.last_output = all;
+        s.last_exit_ok = Some(out.ok() && !out.cancelled);
+    }
     Ok(())
 }
 
@@ -1102,9 +1162,24 @@ pub fn welcome(ctx: &Ctx) -> Vec<String> {
                                ("3", "write a function that ...", "ask for code; everything is checked before you get it")] {
             lines.push(format!("    {}  {}  {}", style::fg(pal::VIOLET, n), Style::new().fg(pal::SKY).paint(&text::pad(cmd, 28)), style::dim(what)));
         }
-    } else {
-        lines.push(format!("  {}", style::faint("try: write a snake game as a web page · complete app.py:12 · fix · /help")));
     }
+    lines.push(String::new());
+    // what it can do, at a glance
+    let chip = |icon: &str, color: style::Rgb, name: &str, ex: &str| {
+        format!("{} {} {}", style::fg(color, icon), Style::new().fg(color).bold().paint(name), style::faint(ex))
+    };
+    let chips = [chip("⌨", pal::CYAN, "code", "write · complete · fix · run"), chip("◉", pal::PINK, "screen", "click · type · keys · apps"),
+                 chip("✦", pal::VIOLET, "autopilot", "many steps, planned first")];
+    if w >= 100 {
+        lines.push(format!("  {}", chips.join(&style::faint("   │   "))));
+    } else {
+        lines.extend(chips.iter().map(|c| format!("  {c}")));
+    }
+    lines.push(String::new());
+    let tries = ["write a snake game as a web page", "open notepad, type hello and press enter", "take a screenshot", "fix the tests then run main.py"];
+    lines.push(format!("  {} {}", style::faint("try"), tries.iter().map(|t| Style::new().fg(pal::SKY).paint(t)).collect::<Vec<_>>()
+        .join(&style::faint(" · "))));
+    lines.push(format!("  {}", style::faint("/help for everything · /help screen · /safety for what it will and won't do on your computer")));
     lines.push(String::new());
     lines
 }

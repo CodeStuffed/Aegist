@@ -78,6 +78,14 @@ Or use a command (`/` shows the menu, tab completes):
 | `/diff` · `/undo` | Everything Aegist changed this session; put the last change back |
 | `/show` | The last code Aegist refused to stand behind, marked unverified |
 | `/learn` · `/train [hours]` · `/model` | Teach it more, train it, see its state and limits |
+| `/screen` · `/windows` · `/focus` · `/launch` | See the screen (with coordinates), list windows, switch to one, open an app or website |
+| `/click` · `/rclick` · `/dclick` · `/mouse` · `/drag` · `/scroll` | Be the mouse |
+| `/type <text>` · `/key <combo>` · `/wait` | Be the keyboard |
+| `/auto <steps>` (or `/do`) | Plan several steps, show the plan, then do them all |
+| `/status` · `/config` · `/history` · `/export` · `/cd` · `/copy` · `/git` | Session state, settings, what you asked, save the transcript, change folder, clipboard, git |
+| `/safety` · `/install` | What it will and won't do on your computer; add Aegist to your apps menu |
+
+`/help` groups them all; `/help screen` shows one group.
 
 Keys: **enter** sends, **shift/alt+enter** (or `\` then enter) adds a line,
 **↑ ↓** history, **tab** completes commands and paths, **esc** or
@@ -113,6 +121,49 @@ verdict can only go down:
 code Aegist stood behind, how much passed its tests, and of the code it
 refused, how much really did fail.
 
+## Your screen: Aegist as the mouse and keyboard
+
+Aegist can use your computer the way you do. Say what to do:
+
+```
+❯ open notepad, type hello world and press enter
+❯ switch to firefox then scroll down 5
+❯ take a screenshot
+❯ click 640 400
+❯ right click the center
+❯ press ctrl+shift+t
+❯ open github.com
+```
+
+One action runs straight away. Several steps become a **plan**: Aegist
+reads the whole request first, shows you every step, and runs them only
+when you say go. Each step is checked as it runs (did the app's window
+appear? did the window come to the front? did the program exit cleanly?),
+and the first one that fails stops the rest. Plans can mix the screen and
+code: `fix the tests then run main.py`, `open paint then draw a red circle
+in paint`. From a script: `aegist do "open calculator" --yes`.
+
+It **can't read the text on your screen**, so it doesn't guess where
+things are. "Click the OK button" gets "I don't know where that is", not a
+click somewhere that looks likely. Tell it where instead: `/screen` draws
+the screen in the terminal with pixel coordinates along the edges, and
+`click 640 400` or `click 50% 20%` clicks there. Windows are found by their
+title or by the program they belong to (`switch to xterm`).
+
+Staying safe (`/safety` shows this too):
+
+- It asks once per session before touching your mouse and keyboard
+  (`agent.confirm`).
+- Keys that close, save, print, lock or delete ask first, and so does typed
+  text with line breaks. It never presses ctrl+alt+delete.
+- It won't open anything to do with passwords, sign-ins, payments or
+  banking, or anything that sends messages in your name.
+- **Move the mouse and it lets go.** Esc stops it too, and one run stops
+  after `agent.max_actions` actions.
+
+It works on Windows and on Linux under X11. Wayland doesn't let programs
+see or control the screen, and macOS isn't supported yet.
+
 ## Install
 
 **Build from source** (needs [Rust](https://rustup.rs)):
@@ -127,6 +178,11 @@ cargo build --release
 **Or download a build** from the project's Releases page (Windows, macOS,
 Linux), make it runnable (`chmod +x` on macOS/Linux) and put it on your
 PATH.
+
+**Open it like an app**: `aegist install` (or `/install` in the session)
+adds Aegist to your apps menu and desktop, so it opens in its own window
+with its own title. That's Windows Terminal when it's installed on Windows,
+your usual terminal on Linux, and Terminal on macOS.
 
 Aegist keeps its settings and trained model in its home folder: this repo
 when run from a build inside it, otherwise `~/.aegist`. The code you work on
@@ -229,6 +285,9 @@ pieces.
 
 ```
 src/                 the program (aegist) and its library
+  computer.rs        the mouse and keyboard: plain words to checked actions
+  autopilot.rs       plans of several steps, all understood before any runs
+  extras.rs          /status, /config, /history, /export, /git, `aegist install`
 config/aegist.yaml   every tunable number
 docs/GPU.md          training on an NVIDIA GPU
 examples/            training speed per size, quantization's cost, tokenizer speed

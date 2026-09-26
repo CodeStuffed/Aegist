@@ -161,6 +161,19 @@ enum Command {
         /// good or bad
         verdict: String,
     },
+    /// Do several things in a row, on your screen and in code: "open notepad,
+    /// type hello and press enter". Plans every step first; runs none if one
+    /// isn't understood.
+    Do {
+        /// The steps, in plain words.
+        #[arg(trailing_var_arg = true, required = true)]
+        request: Vec<String>,
+        /// Go without asking: approves the plan, risky keys in it included.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Put Aegist in your apps menu (and on the desktop), to open in its own window.
+    Install,
     /// Hardware, model sizes, what's learned, and the model's state.
     Doctor,
     /// Test an NVIDIA GPU: compile the kernels, check them against the CPU, measure speed.
@@ -336,6 +349,18 @@ fn run(command: Option<Command>) -> Result<ExitCode> {
         Command::Complete { target, yes } => {
             let ctx = plain_ctx(settings, yes)?;
             actions::complete(&ctx, &target)?;
+        }
+        Command::Do { request, yes } => {
+            let ctx = plain_ctx_with(settings, yes, false)?;
+            aegist::autopilot::run(&ctx, &request.join(" "))?;
+        }
+        Command::Install => {
+            let made = aegist::extras::install()?;
+            heading("Aegist is in your apps now");
+            for p in made {
+                row("made", p.display());
+            }
+            println!("    {}", style::dim("open it from the apps menu (or the desktop) and it starts in its own window"));
         }
         Command::Fix { command } => {
             let ctx = plain_ctx(settings, true)?;

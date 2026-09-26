@@ -41,6 +41,17 @@ pub struct Shared {
     pub voice: bool,
     /// The practice paint app, kept between requests.
     pub sim: Option<crate::agent::sim::SimPaint>,
+    /// You said Aegist may use your mouse and keyboard this session.
+    pub desktop_ok: bool,
+    /// Whether the last program run (/run, /test) exited cleanly.
+    pub last_exit_ok: Option<bool>,
+    /// The last code Aegist wrote (for /copy).
+    pub last_code: Option<String>,
+    /// What you've sent this session, oldest first.
+    pub history: Vec<String>,
+    /// Everything shown this session, without colors (for /export).
+    pub transcript: Vec<String>,
+    pub started: std::time::Instant,
 }
 
 /// From the worker to the screen.
@@ -201,5 +212,11 @@ pub fn new_shared(settings: &Settings, cwd: PathBuf) -> Shared {
         last_act: None,
         voice: settings.voice.enabled,
         sim: None,
+        desktop_ok: false,
+        last_exit_ok: None,
+        last_code: None,
+        history: Vec::new(),
+        transcript: Vec::new(),
+        started: std::time::Instant::now(),
     }
 }

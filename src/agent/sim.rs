@@ -283,7 +283,7 @@ impl Desktop for SimPaint {
     }
 
     fn focused(&mut self) -> Option<Window> {
-        Some(Window { id: 1, title: "Untitled - Practice Paint".into(), rect: WINDOW })
+        Some(Window { id: 1, title: "Untitled - Practice Paint".into(), rect: WINDOW, app: "practice-paint".into() })
     }
 
     fn windows(&mut self) -> Vec<Window> {

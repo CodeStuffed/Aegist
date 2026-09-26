@@ -163,6 +163,7 @@ pub fn run(settings: Settings) -> Result<()> {
     };
     let guard = TermGuard::enter()?;
     crossterm::execute!(std::io::stdout(), crossterm::style::ResetColor)?; // (turns on escape codes on Windows)
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("✦ Aegist"));
     app.pending.extend(actions::welcome(&app.ctx));
     let result = app.run_loop();
     let mut out = std::io::stdout();
@@ -225,6 +226,11 @@ impl App {
     fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Print(lines) => {
+                if let Ok(mut sh) = self.ctx.shared.lock() {
+                    sh.transcript.extend(lines.iter().flat_map(|l| l.split('\n').map(|x| text::strip_ansi(x).trim_end().to_string())));
+                    let over = sh.transcript.len().saturating_sub(50_000);
+                    sh.transcript.drain(..over);
+                }
                 for l in lines {
                     self.pending.extend(l.split('\n').map(str::to_string));
                 }
@@ -343,6 +349,12 @@ impl App {
         let t = text.trim().to_string();
         if t.is_empty() {
             return;
+        }
+        {
+            let mut sh = self.ctx.shared.lock().expect("lock");
+            sh.history.push(t.clone());
+            sh.transcript.push(String::new());
+            sh.transcript.extend(t.lines().map(|l| format!("> {l}")));
         }
         self.pending.push(String::new());
         for (i, l) in t.lines().enumerate() {
@@ -529,25 +541,90 @@ pub fn dispatch(ctx: &Ctx, name: &str, args: &str) -> Result<()> {
         Ok(())
     };
     match name {
-        "" if crate::abilities::converse(ctx, args)? => Ok(()),
-        "" => match actions::interpret(args) {
-            Intent::Write { path, lang, description } => actions::write(ctx, path.as_deref(), lang, &description),
-            Intent::Complete(t) => actions::complete(ctx, &t),
-            Intent::Fix(cmd) => actions::fix(ctx, cmd.as_deref()),
-            Intent::Run(c) => actions::run(ctx, &c),
-            Intent::Test => actions::test(ctx),
-            Intent::Grep(t) => actions::grep(ctx, &t),
-            Intent::Open(p) => actions::open(ctx, &p),
-            Intent::Undo => actions::undo(ctx),
-            other => {
-                actions::decline(ctx, &other);
+        "" => match crate::autopilot::route(args) {
+            crate::autopilot::Route::Plan => crate::autopilot::run(ctx, args),
+            crate::autopilot::Route::One(act) => crate::computer::run_one(ctx, act),
+            crate::autopilot::Route::CantDo(why) => {
+                crate::autopilot::dont_know(ctx, &why);
                 Ok(())
             }
+            crate::autopilot::Route::NotMine => plain(ctx, args),
         },
         "help" | "h" | "?" => {
-            actions::help(ctx);
+            actions::help(ctx, args);
             Ok(())
         }
+        "screen" | "screenshot" | "shot" | "windows" | "wins" | "where" | "cursor" | "pointer" | "focus" | "switch" | "launch" | "app-open"
+        | "browse" | "type" | "key" | "press" | "keys" | "mouse" | "move" | "click" | "rclick" | "right-click" | "rightclick" | "dclick"
+        | "double-click" | "doubleclick" | "drag" | "scroll" | "wait" => crate::computer::command(ctx, name, args),
+        "auto" | "do" | "autopilot" => {
+            need("/auto <steps in plain words>, e.g. /auto open notepad, type hello and press enter")?;
+            crate::autopilot::run(ctx, args)
+        }
+        "safety" | "permissions" | "rules" => {
+            crate::extras::safety(ctx);
+            Ok(())
+        }
+        "status" | "st" => {
+            crate::extras::status(ctx);
+            Ok(())
+        }
+        "config" | "settings" | "set" => crate::extras::config(ctx, args),
+        "history" => {
+            crate::extras::history(ctx, args);
+            Ok(())
+        }
+        "export" | "save-session" => crate::extras::export(ctx, args),
+        "cd" | "chdir" => crate::extras::cd(ctx, args),
+        "copy" | "yank" => crate::extras::copy(ctx, args),
+        "git" => crate::extras::git(ctx, args),
+        "install" => {
+            let made = crate::extras::install()?;
+            let mut lines = vec![String::new(), format!("  {} {}", style::fg(pal::GREEN, "✓"), Style::new().bold().paint("Aegist is in your apps now"))];
+            for p in made {
+                lines.push(format!("    {} {}", style::faint("·"), style::dim(&p.display().to_string())));
+            }
+            lines.push(format!("    {}", style::faint("open it from the apps menu (or the desktop) and it starts in its own window")));
+            ctx.print(lines);
+            Ok(())
+        }
+        _ => older(ctx, name, args),
+    }
+}
+
+/// A plain-words request that isn't about the screen.
+fn plain(ctx: &Ctx, args: &str) -> Result<()> {
+    if matches!(args.trim().to_lowercase().as_str(), "copy" | "copy it" | "copy that" | "copy the code") {
+        return crate::extras::copy(ctx, "");
+    }
+    if crate::abilities::converse(ctx, args)? {
+        return Ok(());
+    }
+    match actions::interpret(args) {
+        Intent::Write { path, lang, description } => actions::write(ctx, path.as_deref(), lang, &description),
+        Intent::Complete(t) => actions::complete(ctx, &t),
+        Intent::Fix(cmd) => actions::fix(ctx, cmd.as_deref()),
+        Intent::Run(c) => actions::run(ctx, &c),
+        Intent::Test => actions::test(ctx),
+        Intent::Grep(t) => actions::grep(ctx, &t),
+        Intent::Open(p) => actions::open(ctx, &p),
+        Intent::Undo => actions::undo(ctx),
+        other => {
+            actions::decline(ctx, &other);
+            Ok(())
+        }
+    }
+}
+
+/// The commands that were here first.
+fn older(ctx: &Ctx, name: &str, args: &str) -> Result<()> {
+    let need = |what: &str| -> Result<()> {
+        if args.trim().is_empty() {
+            anyhow::bail!("{what}");
+        }
+        Ok(())
+    };
+    match name {
         "write" | "new" => {
             need("/write <file> <what it should do>")?;
             let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
