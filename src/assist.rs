@@ -118,7 +118,9 @@ impl Assistant<'_> {
                 None => Status::Skipped("unknown language".into()),
             };
             progress(Progress::Checking { candidate: i + 1, of: n, what: "names" });
-            let invented = verify::invented_names(&g.text, lang, &context, &self.names);
+            // the partial line before the gap belongs to the code (a `def ` the prompt started)
+            let lead = prompt.before.rsplit('\n').next().unwrap_or("");
+            let invented = verify::invented_names(&format!("{lead}{}", g.text), lang, &context, &self.names);
             let confidence = Confidence::of(&g, self.brain.typical_nll(), &self.settings.honesty);
             let tests_status = match tests {
                 Some(run) if syntax.passed() && invented.is_empty() => {

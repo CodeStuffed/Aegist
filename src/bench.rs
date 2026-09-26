@@ -132,8 +132,7 @@ pub fn summarize(outcomes: &[Outcome], k: usize) -> Summary {
 
 /// Run every problem: `k` candidates each (the first careful, the rest sampled).
 pub fn run(brain: &Brain, settings: &Settings, k: usize, names: &Names, log: &mut dyn FnMut(&Outcome, usize)) -> Result<Vec<Outcome>> {
-    let python = ["python3", "python"].into_iter().find(|p| proc::which(p).is_some());
-    let Some(python) = python else { bail!("the benchmark runs Python tests, and Python isn't installed") };
+    let Some(python) = proc::python() else { bail!("the benchmark runs Python tests, and Python isn't installed") };
     let py = crate::lang::by_name("python");
     let mut outcomes = Vec::new();
     for (i, p) in PROBLEMS.iter().enumerate() {
@@ -186,7 +185,7 @@ mod tests {
     #[test]
     fn every_problem_is_solvable_and_its_tests_are_real() {
         // reference solutions: the tests must pass with them and fail without
-        let Some(python) = ["python3", "python"].into_iter().find(|p| proc::which(p).is_some()) else { return };
+        let Some(python) = proc::python() else { return };
         let solutions = [
             "    return a + b\n", "    return n % 2 == 0\n", "    r = 1\n    for i in range(2, n + 1):\n        r *= i\n    return r\n",
             "    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n", "    return s[::-1]\n", "    return s == s[::-1]\n",

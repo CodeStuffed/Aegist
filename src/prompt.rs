@@ -93,12 +93,54 @@ pub fn infill(brain: &Brain, project: Option<&Project>, path: &str, before: &str
     Prompt { text: format!("{related}{}", corpus::fim_prompt(path, b, a)), sources, before: b.to_string(), after: a.to_string() }
 }
 
-/// Start a new file at `path` whose first lines are a comment describing it.
+/// How code for `description` in `lang` starts: a function request starts
+/// with the language's function keyword, a class request with its class
+/// keyword, a web page with the HTML skeleton. It keeps a small model on
+/// the kind of code that was asked for.
+pub fn starter(lang: Option<&Lang>, description: &str) -> &'static str {
+    let d = description.to_lowercase();
+    let wants = |w: &str| d.split(|c: char| !c.is_alphanumeric()).any(|x| x == w || x == format!("{w}s"));
+    let Some(lang) = lang else { return "" };
+    if lang.id == "html" {
+        return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n";
+    }
+    if wants("class") {
+        return match lang.id {
+            "python" | "ruby" | "javascript" | "typescript" | "java" | "cs" | "cpp" | "kotlin" | "swift" | "scala" | "php" | "dart" => "class ",
+            "rust" => "pub struct ",
+            "go" => "type ",
+            _ => "",
+        };
+    }
+    if wants("function") || wants("method") || wants("func") || wants("def") {
+        return match lang.id {
+            "python" | "ruby" => "def ",
+            "javascript" | "typescript" | "php" | "lua" => "function ",
+            "rust" => "pub fn ",
+            "go" | "swift" => "func ",
+            "kotlin" => "fun ",
+            "bash" => "function ",
+            _ => "",
+        };
+    }
+    ""
+}
+
+/// Start a new file at `path` whose first lines are a comment describing
+/// it, then how that kind of code starts (`starter`).
 pub fn new_file(brain: &Brain, project: Option<&Project>, path: &str, lang: Option<&Lang>, description: &str, max_new: usize) -> Prompt {
-    let header = match lang {
+    let comment = match lang {
         Some(l) => l.comment(description.trim()),
         None => description.trim().to_string(),
-    } + "\n";
+    };
+    let start = starter(lang, description);
+    let header = if lang.is_some_and(|l| l.id == "html") {
+        format!("{start}{comment}\n")
+    } else if start.is_empty() {
+        format!("{comment}\n")
+    } else {
+        format!("{comment}\n{start}")
+    };
     let budget = brain.max_context().saturating_sub(max_new + MARGIN + brain.count_tokens(&header) + brain.count_tokens(path) + 4);
     let (related, sources) = related_code(brain, project, description, Some(path), budget);
     Prompt { text: format!("{related}{FILE}{path}\n{header}"), sources, before: header, after: String::new() }
@@ -165,6 +207,15 @@ mod tests {
         assert_eq!(suggest_path("snake game", by_name("js").unwrap()), "snake-game.js");
         assert_eq!(suggest_path("write python code", py), "main.py");
         assert_eq!(suggest_path("a website", by_name("html").unwrap()), "index.html");
+    }
+
+    #[test]
+    fn requests_start_the_kind_of_code_asked_for() {
+        assert_eq!(starter(by_name("python"), "a function that adds numbers"), "def ");
+        assert_eq!(starter(by_name("rust"), "write functions to parse dates"), "pub fn ");
+        assert_eq!(starter(by_name("python"), "a Stack class"), "class ");
+        assert_eq!(starter(by_name("python"), "a script that prints hello"), "");
+        assert!(starter(by_name("html"), "a snake game").starts_with("<!DOCTYPE html>"));
     }
 
     #[test]

@@ -62,6 +62,22 @@ fn is_executable(_: &Path) -> bool {
     true
 }
 
+/// A Python that really runs (on Windows, `python3` is often a stub that
+/// offers to install Python from the Store), found once.
+pub fn python() -> Option<&'static str> {
+    static FOUND: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let names: &[&'static str] = if cfg!(windows) { &["python", "python3", "py"] } else { &["python3", "python"] };
+        names.iter().copied().find(|name| {
+            which(name).is_some() && {
+                let mut c = Command::new(name);
+                c.args(["-c", "import sys; sys.exit(0)"]);
+                run(c, Some(Duration::from_secs(15)), None).is_ok_and(|o| o.ok())
+            }
+        })
+    })
+}
+
 /// A command line run by the system shell (sh, or cmd on Windows).
 pub fn shell(line: &str) -> Command {
     if cfg!(windows) {

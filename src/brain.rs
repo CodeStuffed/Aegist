@@ -298,7 +298,8 @@ impl Brain {
             let begin = text.len();
             text.push_str(&piece);
             spans.push((begin, text.len(), p));
-            if let Some(cut) = stop(text) {
+            let cut = stop(text).or_else(|| if piece.contains('\n') { looping(text) } else { None });
+            if let Some(cut) = cut {
                 let cut = cut.min(text.len());
                 text.truncate(cut);
                 spans.retain(|s| s.0 < cut);
@@ -388,6 +389,33 @@ impl Brain {
             .sum();
         total / n as f32
     }
+}
+
+/// Where generated text starts going round in circles, if it does: the
+/// same block of lines (one line three times over, or two to four lines
+/// twice) right after itself. Returns where the repeat begins. Real code
+/// repeats short lines like `}` or `pass`, so only substantial lines count.
+pub fn looping(text: &str) -> Option<usize> {
+    let body = text.strip_suffix('\n')?;
+    let mut starts = vec![0];
+    starts.extend(body.match_indices('\n').map(|(i, _)| i + 1));
+    let lines: Vec<&str> = body.split('\n').collect();
+    let n = lines.len();
+    let solid = |l: &str| l.trim().len() > 3;
+    for k in 1..=4 {
+        let times = if k == 1 { 3 } else { 2 };
+        if n < k * times {
+            continue;
+        }
+        let block = &lines[n - k..];
+        if !block.iter().any(|l| solid(l)) {
+            continue;
+        }
+        if (1..times).all(|t| &lines[n - k * (t + 1)..n - k * t] == block) {
+            return Some(starts[n - k * (times - 1)]);
+        }
+    }
+    None
 }
 
 /// Prompt-lookup guess: find the most recent earlier place where the last
@@ -538,6 +566,11 @@ mod tests {
         assert!((0..300).all(|_| matches!(sample(&logp, 1.0, 0.85, &mut rng), 1 | 3)));
         assert!((0..300).any(|_| sample(&logp, 1.0, 1.0, &mut rng) == 0));
         assert_eq!(guess(&[1, 2, 3, 4, 9, 2, 3], 3), vec![4, 9, 2]);
+        assert_eq!(looping("x = 1\nfrom a import b\nfrom a import b\nfrom a import b\n"), Some(22));
+        assert_eq!(looping("a = f(1)\nb = g(2)\na = f(1)\nb = g(2)\n"), Some(18));
+        assert_eq!(looping("    }\n    }\n    }\n"), None);
+        assert_eq!(looping("a = 1\nb = 2\nc = 3\n"), None);
+        assert_eq!(looping("a = 1\na = 1"), None);
         assert_eq!(guess(&[5, 6, 7], 4), Vec::<u32>::new());
     }
 }

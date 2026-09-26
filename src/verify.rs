@@ -69,7 +69,19 @@ pub fn syntax(lang: &Lang, code: &str, file_name: &str, timeout_s: u64) -> Statu
         }
         _ => {}
     }
-    let Some(template) = lang.check.iter().find(|t| proc::which(t[0]).is_some()) else {
+    let python_template: Vec<&str>;
+    let template: Option<&[&str]> = if lang.id == "python" {
+        match proc::python() {
+            Some(py) => {
+                python_template = std::iter::once(py).chain(lang.check[0][1..].iter().copied()).collect();
+                Some(&python_template)
+            }
+            None => None,
+        }
+    } else {
+        lang.check.iter().find(|t| proc::which(t[0]).is_some()).map(|t| &t[..])
+    };
+    let Some(template) = template else {
         return Status::Skipped(if lang.check.is_empty() {
             format!("no syntax checker for {}", lang.name)
         } else {
@@ -91,6 +103,8 @@ pub fn syntax(lang: &Lang, code: &str, file_name: &str, timeout_s: u64) -> Statu
     let result = match proc::run(cmd, Some(Duration::from_secs(timeout_s)), None) {
         Ok(out) if out.ok() => Status::Pass,
         Ok(out) if out.timed_out => Status::Skipped(format!("{} took too long", template[0])),
+        // Windows' "not recognized as a command"
+        Ok(out) if out.code == Some(9009) => Status::Skipped(format!("{} isn't installed", template[0])),
         Ok(out) => Status::Fail(summarize(&out, &file, file_name)),
         Err(e) => Status::Skipped(e.to_string()),
     };
@@ -348,6 +362,8 @@ mod tests {
         let js = lang::by_name("javascript");
         let code = "const sum = (a, b) => a + b;\nfunction go(list) { return list.map(x => sum(x, 1)).quantumSort(); }\n";
         assert_eq!(invented_names(code, js, "", &names(&[])), vec!["quantumSort"]);
+        // a definition that starts before the generated part still counts
+        assert!(invented_names("def is_prime(n):\n    return n > 1 and all(n % d for d in range(2, n))\n", py, "", &names(&[])).is_empty());
         let rs = lang::by_name("rust");
         let code = "fn twice(v: &[i32]) -> Vec<i32> { v.iter().map(|x| x * 2).collect() }\n";
         assert!(invented_names(code, rs, "", &names(&[])).is_empty());
@@ -365,7 +381,7 @@ mod tests {
         let json = lang::by_name("json").unwrap();
         assert!(syntax(json, "{\"a\": [1, 2]}", "x.json", 5).passed());
         assert!(syntax(json, "{\"a\": [1, 2}", "x.json", 5).failed());
-        if proc::which("python3").is_some() {
+        if proc::python().is_some() {
             let py = lang::by_name("python").unwrap();
             assert!(syntax(py, "def f(x):\n    return x + 1\n", "m.py", 20).passed());
             match syntax(py, "def f(x)\n    return x +\n", "m.py", 20) {

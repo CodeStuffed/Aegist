@@ -337,7 +337,7 @@ fn present(ctx: &Ctx, answer: &Answer, what: &str) -> Option<usize> {
     if best.report.verdict == Verdict::Refused {
         let others = answer.candidates.len().saturating_sub(1);
         ctx.print(vec![format!("    {}", style::dim(&format!(
-            "Nothing was written. I tried {} candidate{}; none passed. /show shows the best attempt.",
+            "Nothing was written. I wrote {} different candidate{}; none passed. /show shows the best attempt.",
             others + 1, if others == 0 { "" } else { "s" })))]);
         ctx.shared.lock().expect("lock").last_refused = Some(answer.clone());
         return None;

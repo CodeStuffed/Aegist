@@ -250,7 +250,12 @@ pub fn change_summary(old: &str, new: &str) -> String {
 fn status_row(label: &str, status: &Status, pass: &str) -> String {
     let (icon, color, msg) = match status {
         Status::Pass => ("✓", pal::GREEN, pass.to_string()),
-        Status::Fail(e) => ("✗", pal::RED, e.lines().next().unwrap_or("failed").to_string()),
+        Status::Fail(e) => {
+            // the line that names the problem, not the traceback around it
+            let lines: Vec<&str> = e.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            let key = lines.iter().rev().find(|l| l.contains("Error") || l.contains("error")).or(lines.first()).copied().unwrap_or("failed");
+            ("✗", pal::RED, key.to_string())
+        }
         Status::Skipped(why) => ("·", pal::FAINT, why.clone()),
     };
     format!("    {} {} {}", style::fg(color, icon), Style::new().bold().paint(&text::pad(label, 11)), style::dim(&msg))

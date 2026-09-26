@@ -41,7 +41,7 @@ pub fn test_command(root: &Path) -> Option<String> {
             (n.starts_with("test_") || n.ends_with("_test.py")) && n.ends_with(".py")
         })).unwrap_or(false);
     if python_tests {
-        let py = if proc::which("python3").is_some() { "python3" } else { "python" };
+        let py = proc::python().unwrap_or(if cfg!(windows) { "python" } else { "python3" });
         let has_pytest = proc::run(
             { let mut c = Command::new(py); c.args(["-c", "import pytest"]); c },
             Some(Duration::from_secs(10)), None,
@@ -69,7 +69,13 @@ pub fn test_command(root: &Path) -> Option<String> {
 /// run that way (compiled languages are built to a temporary program first).
 pub fn run_file_command(path: &Path) -> Option<String> {
     let lang = lang::for_path(path)?;
-    let template = lang.run.iter().find(|t| proc::which(t[0]).is_some())?;
+    let python: [&str; 2];
+    let template: &[&str] = if lang.id == "python" {
+        python = [proc::python()?, "{}"];
+        &python
+    } else {
+        lang.run.iter().find(|t| proc::which(t[0]).is_some())?
+    };
     let out = std::env::temp_dir().join(format!("aegist-run-{}", std::process::id()));
     let out = if cfg!(windows) { out.with_extension("exe") } else { out };
     let file = path.to_string_lossy();
