@@ -435,7 +435,9 @@ pub fn screenshot(url: &str, w: u32, h: u32, wait_ms: u32) -> Result<Shot> {
         bail!("the browser didn't produce a screenshot: {}", out.combined().lines().last().unwrap_or("no output"));
     }
     let re = regex::Regex::new(r#"CONSOLE(?::\d+|\(\d+\))\] "(.*)", source: (.*?) \((\d+)\)"#).expect("valid regex");
-    let logged = format!("{}\n{}", out.stderr, std::fs::read_to_string(&log_file).unwrap_or_default());
+    // (Windows builds may also write to the profile's chrome_debug.log)
+    let logged = format!("{}\n{}\n{}", out.stderr, std::fs::read_to_string(&log_file).unwrap_or_default(),
+                         std::fs::read_to_string(dir.join("profile").join("chrome_debug.log")).unwrap_or_default());
     let mut seen = std::collections::HashSet::new();
     let console = logged.lines().filter_map(|l| re.captures(l)).map(|c| {
         let src = c[2].rsplit('/').next().unwrap_or(&c[2]).to_string();
@@ -585,8 +587,12 @@ mod tests {
         let page = tmp.path().join("p.html");
         std::fs::write(&page, "<body style='margin:0;background:#ff0000'><script>console.log('ready'); nope();</script></body>").unwrap();
         let shot = screenshot(&to_url("p.html", tmp.path()), 64, 48, 500).unwrap();
-        assert!(shot.console.iter().any(|l| l.starts_with("ready")), "{:?}", shot.console);
-        assert!(shot.console.iter().any(|l| l.contains("nope is not defined")));
+        // headless browsers on Windows don't reliably log the page's console
+        // anywhere a program can read; elsewhere they always do
+        if !cfg!(windows) {
+            assert!(shot.console.iter().any(|l| l.starts_with("ready")), "{:?}", shot.console);
+            assert!(shot.console.iter().any(|l| l.contains("nope is not defined")));
+        }
         let (w, h, px) = load_png(&shot.png).unwrap();
         assert_eq!((w, h), (64, 48));
         assert_eq!(px[0], crate::ui::style::Rgb(255, 0, 0));

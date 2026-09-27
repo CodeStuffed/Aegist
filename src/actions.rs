@@ -810,7 +810,9 @@ pub fn preview(ctx: &Ctx, arg: &str) -> Result<()> {
     let w = ctx.width().saturating_sub(4).min(120);
     let mut lines = vec![String::new(), format!("  {} {}", style::fg(pal::VIOLET, "◳"), Style::new().fg(pal::CYAN).underline().paint(&url))];
     lines.extend(ide::render_png(&shot.png, w, 40)?.into_iter().map(|l| format!("  {l}")));
-    if shot.console.is_empty() {
+    if shot.console.is_empty() && cfg!(windows) {
+        lines.push(format!("  {}", style::faint("console: not available on Windows (the browser doesn't hand it over)")));
+    } else if shot.console.is_empty() {
         lines.push(format!("  {}", style::faint("console: quiet")));
     } else {
         lines.push(format!("  {}", style::dim("console:")));
