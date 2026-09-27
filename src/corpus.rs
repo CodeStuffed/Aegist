@@ -1,15 +1,22 @@
-//! The training corpus: every .txt / .md file under data/corpus/ - text you
-//! import, Wikipedia dumps, articles the research loop collects - and its
-//! tokens, cached per file so a growing corpus stays cheap to reload.
+//! The training corpus: source files `aegist learn` collected under
+//! data/corpus/<source>/, and their tokens, cached per file so a growing
+//! corpus stays cheap to reload.
+//!
+//! Each file becomes one document: a file marker, its path (the model
+//! learns which language and project it's in from that), the code, and an
+//! end marker. Some files instead become fill-in-the-middle examples - the
+//! code before a gap, the code after it, then the gap itself - which is how
+//! the model learns to complete code in the middle of a file.
 //!
 //! All the tokens are joined into one file on disk (brain/token_cache/all-*.bin)
 //! that training memory-maps instead of loading: billions of tokens cost
 //! disk space, not RAM, and the operating system keeps the hot parts cached.
 
 use crate::config::Settings;
+use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
 use crate::util::{fnv1a, write_atomic};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -17,12 +24,19 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Start of a file: followed by its path and a newline.
+pub const FILE: char = '\u{1c}';
+/// Fill-in-the-middle: the code before the gap follows.
+pub const PRE: char = '\u{1}';
+/// Fill-in-the-middle: the code after the gap follows.
+pub const SUF: char = '\u{2}';
+/// Fill-in-the-middle: the gap's code follows.
+pub const MID: char = '\u{3}';
+/// End of a file (or of a gap's code).
+pub const EOT: char = '\u{4}';
+
 pub fn corpus_dir(settings: &Settings) -> PathBuf {
     settings.data_path("corpus")
-}
-
-fn is_text(p: &Path) -> bool {
-    matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("txt" | "md"))
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -31,24 +45,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             walk(&p, out);
-        } else if p.is_file() && is_text(&p) {
+        } else if p.is_file() && crate::lang::is_code(&p) {
             out.push(p);
         }
     }
-}
-
-/// Every .txt/.md file in `path` (a file or a folder, searched recursively), sorted.
-pub fn text_files(path: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if path.is_file() {
-        if is_text(path) {
-            files.push(path.to_path_buf());
-        }
-    } else {
-        walk(path, &mut files);
-    }
-    files.sort();
-    files
 }
 
 pub fn corpus_files(settings: &Settings) -> Vec<PathBuf> {
@@ -58,63 +58,120 @@ pub fn corpus_files(settings: &Settings) -> Vec<PathBuf> {
     files
 }
 
-/// Copy .txt/.md files from `src` (a file or folder) into the corpus.
-pub fn import_texts(src: &Path, settings: &Settings) -> Result<usize> {
-    if !src.exists() {
-        bail!("{} doesn't exist", src.display());
-    }
-    let dest_root = corpus_dir(settings).join("imported");
-    let pairs: Vec<(PathBuf, PathBuf)> = if src.is_file() {
-        vec![(src.to_path_buf(), dest_root.join(src.file_name().unwrap_or_default()))]
-    } else {
-        let mut files = Vec::new();
-        walk(src, &mut files);
-        let name = src.canonicalize()?.file_name().map(|n| n.to_owned()).unwrap_or_default();
-        files.into_iter().map(|f| {
-            let rel = f.strip_prefix(src).unwrap_or(&f).to_path_buf();
-            (f, dest_root.join(&name).join(rel))
-        }).collect()
-    };
-    let mut count = 0;
-    for (from, to) in pairs.into_iter().filter(|(f, _)| is_text(f)) {
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(&from, &to)?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// Unwrap hard-wrapped lines (a single newline is just a space) so the model
-/// learns sentences, not line lengths. Paragraph breaks survive.
-pub fn normalize_text(text: &str) -> String {
-    let text = text.replace("\r\n", "\n");
-    let chars: Vec<char> = text.chars().collect();
+/// Code as the model sees it: UTF-8, `\n` line ends, no marker characters.
+pub fn clean_code(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
     let mut out = String::with_capacity(text.len());
-    for (i, &ch) in chars.iter().enumerate() {
-        let ch = if ch == '\n' && chars.get(i.wrapping_sub(1)) != Some(&'\n') && chars.get(i + 1) != Some(&'\n') {
-            ' '
-        } else if ch == '\t' {
-            ' '
-        } else {
-            ch
-        };
-        if ch == ' ' && out.ends_with(' ') {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() != Some(&'\n') {
+                out.push('\n');
+            }
+        } else if c.is_control() && !c.is_whitespace() {
             continue;
+        } else {
+            out.push(c);
         }
-        out.push(ch);
     }
-    out.trim().to_string()
+    out
 }
 
 fn read(path: &Path) -> String {
-    let bytes = std::fs::read(path).unwrap_or_default();
-    normalize_text(&String::from_utf8_lossy(&bytes))
+    clean_code(&std::fs::read(path).unwrap_or_default())
 }
 
-/// Up to `max_chars` of the corpus as one string (paragraph break between
-/// files). If the corpus is bigger, every file gives the same share of its
+/// A whole file as a training document.
+pub fn document(path: &str, code: &str) -> String {
+    format!("{FILE}{path}\n{code}{EOT}")
+}
+
+/// A fill-in-the-middle document: `prefix` + gap + `suffix` is the file.
+pub fn fim_document(path: &str, prefix: &str, suffix: &str, middle: &str) -> String {
+    format!("{FILE}{path}\n{PRE}{prefix}{SUF}{suffix}{MID}{middle}{EOT}")
+}
+
+/// The prompt that asks for the gap between `prefix` and `suffix`: the model
+/// continues it with the gap's code, then EOT.
+pub fn fim_prompt(path: &str, prefix: &str, suffix: &str) -> String {
+    format!("{FILE}{path}\n{PRE}{prefix}{SUF}{suffix}{MID}")
+}
+
+/// How files become fill-in-the-middle examples.
+#[derive(Clone, Copy, Debug)]
+pub struct Fim {
+    /// Share of files trained this way.
+    pub rate: f64,
+    /// Longest piece of a file per example, in characters (about what fits
+    /// in the model's context); longer files are split into pieces.
+    pub window_chars: usize,
+}
+
+fn floor_char(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Split at line ends into pieces of at most `max` bytes (a single longer
+/// line becomes its own piece).
+fn pieces(code: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < code.len() {
+        if code.len() - start <= max {
+            out.push(&code[start..]);
+            break;
+        }
+        let limit = floor_char(code, start + max);
+        let end = code[start..limit].rfind('\n').map(|i| start + i + 1).filter(|&e| e > start).unwrap_or_else(|| {
+            code[limit..].find('\n').map(|i| limit + i + 1).unwrap_or(code.len())
+        });
+        out.push(&code[start..end]);
+        start = end;
+    }
+    out
+}
+
+/// A file's training documents. Deterministic in the path, so re-encoding
+/// an unchanged file gives the same tokens.
+pub fn file_documents(path: &str, code: &str, fim: Fim) -> Vec<String> {
+    let mut rng = Rng::new(fnv1a(path.as_bytes()) ^ 0xf1f1);
+    if code.trim().is_empty() {
+        return Vec::new();
+    }
+    if rng.uniform() as f64 >= fim.rate {
+        return vec![document(path, code)];
+    }
+    pieces(code, fim.window_chars.max(64))
+        .into_iter()
+        .map(|piece| {
+            let len = piece.len();
+            let (mut a, mut b) = (rng.below(len + 1), rng.below(len + 1));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if rng.below(2) == 0 {
+                // gap on whole lines: what completing a line or a block looks like
+                a = piece[..a].rfind('\n').map_or(0, |i| i + 1);
+                b = piece[b..].find('\n').map_or(len, |i| b + i + 1);
+            }
+            let (a, b) = (floor_char(piece, a), floor_char(piece, b));
+            fim_document(path, &piece[..a], &piece[b..], &piece[a..b])
+        })
+        .collect()
+}
+
+/// A corpus file's path as the model sees it: without the source folder
+/// (data/corpus/<source>/src/x.py is "src/x.py").
+pub fn display_path(rel: &str) -> &str {
+    rel.split_once('/').map_or(rel, |(_, rest)| rest)
+}
+
+/// Up to `max_chars` of the corpus as one string, to learn the vocabulary
+/// from. If the corpus is bigger, every file gives the same share of its
 /// size, so the sample looks like the whole corpus, not just its first files.
 pub fn read_corpus(settings: &Settings, max_chars: usize) -> String {
     let files = corpus_files(settings);
@@ -131,31 +188,29 @@ pub fn read_corpus(settings: &Settings, max_chars: usize) -> String {
                 continue;
             }
             if (share as usize) < size as usize {
-                // end on a whole word
-                let cut = bytes.iter().rposition(|b| b.is_ascii_whitespace()).unwrap_or(0);
-                bytes.truncate(cut);
+                // end on a whole line
+                let cut = bytes.iter().rposition(|&b| b == b'\n').unwrap_or(0);
+                bytes.truncate(cut + 1);
             }
-            normalize_text(&String::from_utf8_lossy(&bytes))
+            clean_code(&bytes)
         };
-        if text.is_empty() {
+        if text.trim().is_empty() {
             continue;
         }
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
         out.push_str(&text);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
     }
-    let mut end = max_chars.min(out.len());
-    while !out.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = floor_char(&out, max_chars);
     out.truncate(end);
     out
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Manifest {
-    merges_hash: u64,
+    /// merges + document format: tokens cached under another are stale
+    format_hash: u64,
     /// file -> (size, modified) when its tokens were cached
     files: BTreeMap<String, (u64, u128)>,
     /// the files whose tokens are in the joined file, in order, with their token counts
@@ -204,21 +259,22 @@ fn stamp(p: &Path) -> (u64, u128) {
 }
 
 /// Token ids for the whole corpus, re-encoding only files that changed.
-pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
+pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings, fim: Fim) -> Result<Tokens> {
     assert!(tok.vocab_size() <= u16::MAX as usize + 1);
     let root = corpus_dir(settings);
     let cache = settings.data_path("brain/token_cache");
     std::fs::create_dir_all(&cache)?;
-    // one process at a time (e.g. `research` and `train` in two terminals)
+    // one process at a time (e.g. `learn` and `train` in two terminals)
     let lock = File::create(cache.join(".lock"))?;
     lock.lock()?;
     let manifest_path = cache.join("manifest.json");
-    let merges_hash = fnv1a(serde_json::to_string(&tok.merges)?.as_bytes());
+    let format = format!("code-docs-1 {} {}", fim.rate, fim.window_chars);
+    let format_hash = fnv1a(serde_json::to_string(&tok.merges)?.as_bytes()) ^ fnv1a(format.as_bytes());
     let manifest: Manifest = std::fs::read(&manifest_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .filter(|m: &Manifest| m.merges_hash == merges_hash)
-        .unwrap_or(Manifest { merges_hash, ..Default::default() });
+        .filter(|m: &Manifest| m.format_hash == format_hash)
+        .unwrap_or(Manifest { format_hash, ..Default::default() });
 
     let files = corpus_files(settings);
     let entries: Vec<(String, PathBuf, (u64, u128), PathBuf)> = files
@@ -238,7 +294,8 @@ pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
                     return Ok(m.len() / 2);
                 }
             }
-            let ids: Vec<u16> = tok.encode(&read(path)).into_iter().map(|i| i as u16).collect();
+            let docs = file_documents(display_path(rel), &read(path), fim);
+            let ids: Vec<u16> = docs.iter().flat_map(|d| tok.encode(d)).map(|i| i as u16).collect();
             write_atomic(bin, &u16_bytes(&ids))?;
             Ok(ids.len() as u64)
         })
@@ -248,13 +305,13 @@ pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
         current.insert(rel.as_str(), (*st, n?, bin.as_path()));
     }
 
-    // The joined file: every file's tokens plus a paragraph break. If the
-    // files already in it are unchanged, new files are appended (a mapping
-    // made earlier keeps seeing its own length); otherwise a new file is
-    // written under a new name, so no mapped file is ever replaced.
-    let sep = u16_bytes(&tok.encode("\n\n").into_iter().map(|i| i as u16).collect::<Vec<_>>());
+    // The joined file: every file's tokens in path order (a project's files
+    // stay next to each other). If the files already in it are unchanged,
+    // new files are appended (a mapping made earlier keeps seeing its own
+    // length); otherwise a new file is written under a new name, so no
+    // mapped file is ever replaced.
     let joined = if manifest.joined.is_empty() { "all.bin".to_string() } else { manifest.joined.clone() };
-    let expected: u64 = manifest.order.iter().map(|(_, _, n)| 2 * n + sep.len() as u64).sum();
+    let expected: u64 = manifest.order.iter().map(|(_, _, n)| 2 * n).sum();
     let reusable = std::fs::metadata(cache.join(&joined)).is_ok_and(|m| m.len() == expected)
         && manifest.order.iter().all(|(rel, st, n)| current.get(rel.as_str()).is_some_and(|c| (c.0, c.1) == (*st, *n)));
     let (joined, mut order, file) = if reusable {
@@ -277,13 +334,12 @@ pub fn corpus_tokens(tok: &Tokenizer, settings: &Settings) -> Result<Tokens> {
         }
         let bytes = std::fs::read(bin)?;
         out.write_all(&bytes)?;
-        out.write_all(&sep)?;
         order.push((rel.clone(), *st, bytes.len() as u64 / 2));
     }
     out.flush()?;
     drop(out);
     let files = entries.iter().map(|(rel, _, st, _)| (rel.clone(), *st)).collect();
-    let manifest = Manifest { merges_hash, files, order, joined: joined.clone() };
+    let manifest = Manifest { format_hash, files, order, joined: joined.clone() };
     write_atomic(&manifest_path, &serde_json::to_vec(&manifest)?)?;
     // Older joined files go once nothing maps them (on Windows a mapped one
     // can't be deleted yet; it is tried again next time).
@@ -304,60 +360,86 @@ mod tests {
     use super::*;
     use crate::config::testing;
 
+    const NO_FIM: Fim = Fim { rate: 0.0, window_chars: 1000 };
+
+    #[test]
+    fn code_keeps_its_lines_and_loses_marker_characters() {
+        assert_eq!(clean_code(b"a\r\n    b\x01\tc\rd"), "a\n    b\tc\nd");
+    }
+
     #[test]
     fn a_big_corpus_is_sampled_evenly() {
         let tmp = tempfile::tempdir().unwrap();
         let s = testing::settings(tmp.path());
-        std::fs::create_dir_all(corpus_dir(&s)).unwrap();
-        std::fs::write(corpus_dir(&s).join("a.txt"), "apple ".repeat(1000)).unwrap();
-        std::fs::write(corpus_dir(&s).join("b.txt"), "banana ".repeat(3000)).unwrap();
-        let sample = read_corpus(&s, 2000);
+        let dir = corpus_dir(&s).join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "apple = 1\n".repeat(1000)).unwrap();
+        std::fs::write(dir.join("b.py"), "banana = 2\n".repeat(3000)).unwrap();
+        std::fs::write(dir.join("notes.txt"), "not code").unwrap();
+        let sample = read_corpus(&s, 20_000);
         let (a, b) = (sample.matches("apple").count(), sample.matches("banana").count());
-        assert!(a > 50 && b > 150 && sample.len() <= 2000, "{a} {b} {}", sample.len());
-        assert!(!sample.contains("appl ") && !sample.ends_with("banan"));
-        assert_eq!(read_corpus(&s, 1_000_000).matches("banana").count(), 3000);
+        assert!(a > 300 && b > 1000 && sample.len() <= 20_000, "{a} {b} {}", sample.len());
+        assert!(sample.lines().all(|l| l == "apple = 1" || l == "banana = 2" || l.is_empty()));
+        assert_eq!(read_corpus(&s, 10_000_000).matches("banana").count(), 3000);
+        assert!(!read_corpus(&s, 10_000_000).contains("not code"));
     }
 
     #[test]
-    fn normalize_unwraps_hard_wrapped_lines() {
-        assert_eq!(normalize_text("one\ntwo  three\n\nfour\r\nfive\tsix"), "one two three\n\nfour five six");
+    fn fill_in_the_middle_documents_hold_the_whole_file() {
+        let code = (0..200).map(|i| format!("line_{i} = {i}\n")).collect::<String>();
+        let mut fims = 0;
+        for i in 0..40 {
+            let path = format!("pkg/m{i}.py");
+            let docs = file_documents(&path, &code, Fim { rate: 0.5, window_chars: 700 });
+            assert_eq!(docs, file_documents(&path, &code, Fim { rate: 0.5, window_chars: 700 }), "deterministic");
+            let mut rebuilt = String::new();
+            for d in &docs {
+                let body = d.strip_prefix(&format!("{FILE}{path}\n")).unwrap().strip_suffix(EOT).unwrap();
+                if let Some(rest) = body.strip_prefix(PRE) {
+                    fims += 1;
+                    let (pre, rest) = rest.split_once(SUF).unwrap();
+                    let (suf, mid) = rest.split_once(MID).unwrap();
+                    rebuilt += &format!("{pre}{mid}{suf}");
+                } else {
+                    rebuilt += body;
+                }
+            }
+            assert_eq!(rebuilt, code);
+        }
+        assert!(fims > 20, "{fims}");
     }
 
     #[test]
-    fn import_copies_only_text_and_tokens_are_cached() {
+    fn tokens_are_cached_and_follow_file_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = testing::settings(&tmp.path().join("data"));
-        let src = tmp.path().join("src");
-        std::fs::create_dir_all(src.join("sub")).unwrap();
-        std::fs::write(src.join("a.txt"), "alpha beta gamma").unwrap();
-        std::fs::write(src.join("sub/b.md"), "delta\nepsilon").unwrap();
-        std::fs::write(src.join("c.pdf"), b"%PDF").unwrap();
-        assert_eq!(import_texts(&src, &s).unwrap(), 2);
-        let names: Vec<_> = corpus_files(&s).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
-        assert_eq!(names, vec!["a.txt", "b.md"]);
+        let s = testing::settings(tmp.path());
+        let dir = corpus_dir(&s).join("proj");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.py"), "alpha = 1\n").unwrap();
+        std::fs::write(dir.join("sub/b.rs"), "fn delta() {}\n").unwrap();
 
         let tok = Tokenizer::train(&read_corpus(&s, 10_000), 280);
         let text = |t: &Tokens| tok.decode(&t.iter().map(|&i| i as u32).collect::<Vec<_>>());
-        let first = corpus_tokens(&tok, &s).unwrap();
-        assert_eq!(text(&first), "alpha beta gamma\n\ndelta epsilon\n\n");
-        let bin = std::fs::read_dir(s.data_path("brain/token_cache")).unwrap().count();
-        assert_eq!(&*corpus_tokens(&tok, &s).unwrap(), &*first);
-        assert_eq!(std::fs::read_dir(s.data_path("brain/token_cache")).unwrap().count(), bin);
+        let first = corpus_tokens(&tok, &s, NO_FIM).unwrap();
+        let (a, b) = (document("a.py", "alpha = 1\n"), document("sub/b.rs", "fn delta() {}\n"));
+        assert_eq!(text(&first), format!("{a}{b}"));
+        let bins = std::fs::read_dir(s.data_path("brain/token_cache")).unwrap().count();
+        assert_eq!(&*corpus_tokens(&tok, &s, NO_FIM).unwrap(), &*first);
+        assert_eq!(std::fs::read_dir(s.data_path("brain/token_cache")).unwrap().count(), bins);
 
         // a new file is appended; a changed one rebuilds everything in order
-        std::fs::write(corpus_dir(&s).join("zeta.txt"), "zeta").unwrap();
-        assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha beta gamma\n\ndelta epsilon\n\nzeta\n\n");
-        std::fs::write(corpus_dir(&s).join("imported/src/a.txt"), "alpha").unwrap();
-        assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha\n\ndelta epsilon\n\nzeta\n\n");
-        std::fs::remove_file(corpus_dir(&s).join("zeta.txt")).unwrap();
-        assert_eq!(text(&corpus_tokens(&tok, &s).unwrap()), "alpha\n\ndelta epsilon\n\n");
+        std::fs::write(dir.join("z.py"), "zeta = 3\n").unwrap();
+        let z = document("z.py", "zeta = 3\n");
+        assert_eq!(text(&corpus_tokens(&tok, &s, NO_FIM).unwrap()), format!("{a}{b}{z}"));
+        std::fs::write(dir.join("a.py"), "alpha = 22\n").unwrap();
+        let a2 = document("a.py", "alpha = 22\n");
+        assert_eq!(text(&corpus_tokens(&tok, &s, NO_FIM).unwrap()), format!("{a2}{b}{z}"));
         // a rebuild never touches a file still mapped; old ones go once released
-        assert_eq!(text(&first), "alpha beta gamma\n\ndelta epsilon\n\n");
+        assert_eq!(text(&first), format!("{a}{b}"));
         drop(first);
-        corpus_tokens(&tok, &s).unwrap();
+        corpus_tokens(&tok, &s, NO_FIM).unwrap();
         let joined = std::fs::read_dir(s.data_path("brain/token_cache")).unwrap()
             .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("all")).count();
         assert_eq!(joined, 1);
-        assert!(import_texts(&tmp.path().join("missing"), &s).is_err());
     }
 }

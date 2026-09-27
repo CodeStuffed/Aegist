@@ -13,16 +13,22 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest,  asset: council-linux-x86_64,       bin: council }
-          - { os: macos-latest,   asset: council-macos-arm64,        bin: council }
-          - { os: windows-latest, asset: council-windows-x86_64.exe, bin: council.exe }
+          - { os: ubuntu-latest,  target: linux-x86_64,   ext: "" }
+          - { os: macos-latest,   target: macos-arm64,    ext: "" }
+          - { os: windows-latest, target: windows-x86_64, ext: ".exe" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      # aegist, and aegist-app: Aegist in a window of its own. Keep the two
+      # side by side; the app finds aegist next to it.
+      - run: cargo build --release --workspace
       - shell: bash
-        run: cp target/release/${{ matrix.bin }} ${{ matrix.asset }}
+        run: |
+          cp target/release/aegist${{ matrix.ext }} aegist-${{ matrix.target }}${{ matrix.ext }}
+          cp target/release/aegist-app${{ matrix.ext }} aegist-app-${{ matrix.target }}${{ matrix.ext }}
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            aegist-${{ matrix.target }}${{ matrix.ext }}
+            aegist-app-${{ matrix.target }}${{ matrix.ext }}

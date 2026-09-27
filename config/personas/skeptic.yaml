@@ -1,7 +1,0 @@
-name: Skeptic
-role: Attacks the claim; its signal is how damaging the case against it is.
-lead_in: "This is false because"
-probes:
-  - " This is false."
-  - " This is wrong."
-  - " That is not right."

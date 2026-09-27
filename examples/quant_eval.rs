@@ -1,12 +1,12 @@
 //! What quantization costs and buys on YOUR trained model:
 //!     cargo run --release --example quant_eval
 //! For f32, int8 and int4: weight memory, held-out bits per byte (how well
-//! it still predicts text it never trained on), and generation speed.
-use council::brain::Brain;
-use council::config::Settings;
-use council::corpus;
-use council::model::KvCache;
-use council::quant::Precision;
+//! it still predicts code it never trained on), and generation speed.
+use aegist::brain::Brain;
+use aegist::config::Settings;
+use aegist::corpus;
+use aegist::model::KvCache;
+use aegist::quant::Precision;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
@@ -19,7 +19,8 @@ fn run() -> anyhow::Result<()> {
     // Held-out text: the tail of the corpus, which training never sees.
     let chunks: Vec<String> = {
         let brain = Brain::load(&settings)?;
-        let tokens = corpus::corpus_tokens(&brain.tokenizer, &settings)?;
+        let fim = aegist::trainer::fim_for(&brain.model.cfg, &settings);
+        let tokens = corpus::corpus_tokens(&brain.tokenizer, &settings, fim)?;
         let n_val = ((tokens.len() as f64 * settings.training.val_fraction) as usize).max(brain.model.cfg.block_size + 2);
         let val: Vec<u32> = tokens[tokens.len() - n_val..].iter().map(|&t| t as u32).collect();
         val.chunks(brain.model.cfg.block_size - 2).take(40).map(|c| brain.tokenizer.decode(c)).collect()

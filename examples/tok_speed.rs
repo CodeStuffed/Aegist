@@ -1,6 +1,6 @@
 //! Tokenizer speed on a text file:
 //!     cargo run --release --example tok_speed -- <file> <train MB> <vocab>
-use council::tokenizer::Tokenizer;
+use aegist::tokenizer::Tokenizer;
 use rayon::prelude::*;
 use std::time::Instant;
 

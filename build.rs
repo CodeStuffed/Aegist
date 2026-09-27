@@ -13,6 +13,6 @@ fn main() {
             .flag_if_supported("/std:c++20")
             .flag_if_supported("-pthread")
             .flag_if_supported("-Wno-unused-parameter")
-            .compile("council_gpu_emulator");
+            .compile("aegist_gpu_emulator");
     }
 }

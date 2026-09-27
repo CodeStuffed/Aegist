@@ -5,7 +5,7 @@
 //! cores with ~10-bit mantissas, fp32 range and accumulation), everything
 //! else by the hand-written kernels in kernels.cu, compiled when training
 //! starts by NVRTC. The CUDA libraries are loaded at run time, so the same
-//! `council` program runs on machines without them (it just trains on the CPU).
+//! `aegist` program runs on machines without them (it just trains on the CPU).
 //!
 //! To fit big models in 16 GB, only each layer's input is kept during the
 //! forward pass; the backward pass recomputes one layer at a time from it

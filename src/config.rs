@@ -1,13 +1,14 @@
-//! Settings (config/settings.yaml) and personas (config/personas/*.yaml).
+//! Settings (config/aegist.yaml).
 //!
-//! The project root is found by walking up from the current directory (then
-//! from the executable) until config/settings.yaml turns up, so `council`
-//! works from anywhere inside the project. Run anywhere else, it uses
-//! ~/.council, writing the built-in default config there on first run so
-//! a downloaded binary works on its own. Overrides:
-//!   COUNCIL_HOME      project root
-//!   COUNCIL_SETTINGS  an alternate settings.yaml
-//!   COUNCIL_DATA_DIR  where runtime data is written
+//! Aegist's home - where its settings and trained model live - is found by
+//! walking up from the executable (a build inside this repo uses the repo),
+//! else ~/.aegist, where the built-in default settings are written on first
+//! run so a downloaded binary works on its own. The code you work on is
+//! wherever you run `aegist`; it is never mixed up with Aegist's home.
+//! Overrides:
+//!   AEGIST_HOME      Aegist's home folder
+//!   AEGIST_SETTINGS  an alternate aegist.yaml
+//!   AEGIST_DATA_DIR  where the corpus and model are written
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -22,7 +23,7 @@ pub struct Tier {
     pub d_model: usize,
     pub block_size: usize,
     pub vocab_size: usize,
-    /// Only used when asked for by name (`council train --tier NAME`).
+    /// Only used when asked for by name (`aegist train --tier NAME`).
     #[serde(default)]
     pub manual: bool,
 }
@@ -54,59 +55,21 @@ pub struct TrainingSettings {
     pub min_new_model_chars: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct GenerateSettings {
-    pub max_new_tokens: usize,
-    pub temperature: f32,
-    pub top_k: usize,
+fn default_max_val() -> usize {
+    20_000_000
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct Thresholds {
-    pub high: f32,
-    pub medium: f32,
+pub struct CodeSettings {
+    pub fim_rate: f64,
+    pub max_file_kb: u64,
+    pub max_line_chars: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Familiarity {
-    pub medium_above: f32,
-    pub low_above: f32,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CouncilSettings {
-    pub generate: GenerateSettings,
-    pub neutral_prompt: String,
-    pub confidence_thresholds: Thresholds,
-    pub mixed_margin: f32,
-    pub familiarity: Familiarity,
-    pub min_tokens_trained: u64,
-    /// Share of the verdict's margin that comes from the negation test (0..1).
-    #[serde(default = "half")]
-    pub negation_weight: f32,
-}
-
-fn half() -> f32 {
-    0.5
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct RouterSettings {
-    pub money_keywords: Vec<String>,
-}
-
-fn yes() -> bool {
-    true
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct MemorySettings {
-    pub top_k: usize,
-    pub min_relevance: f64,
-    /// Also pull in passages linked to the best matches (same article,
-    /// shared rare words), within the model's context budget.
-    #[serde(default = "yes")]
-    pub follow_links: bool,
+impl Default for CodeSettings {
+    fn default() -> Self {
+        CodeSettings { fim_rate: 0.5, max_file_kb: 512, max_line_chars: 1000 }
+    }
 }
 
 fn default_precision() -> crate::quant::Precision {
@@ -115,19 +78,115 @@ fn default_precision() -> crate::quant::Precision {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct InferenceSettings {
-    /// Weights used to answer questions: f32 (exact), int8 or int4 (smaller, faster).
+    /// Weights used to write code: f32 (exact), int8 or int4 (smaller, faster).
     #[serde(default = "default_precision")]
     pub precision: crate::quant::Precision,
+    #[serde(default = "default_context_scale")]
+    pub context_scale: usize,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default = "default_max_new")]
+    pub max_new_tokens: usize,
+    #[serde(default = "yes")]
+    pub speculative: bool,
+}
+
+fn default_context_scale() -> usize {
+    4
+}
+fn default_temperature() -> f32 {
+    0.2
+}
+fn default_top_p() -> f32 {
+    0.95
+}
+fn default_max_new() -> usize {
+    400
+}
+fn yes() -> bool {
+    true
 }
 
 impl Default for InferenceSettings {
     fn default() -> Self {
-        InferenceSettings { precision: default_precision() }
+        InferenceSettings {
+            precision: default_precision(),
+            context_scale: default_context_scale(),
+            temperature: default_temperature(),
+            top_p: default_top_p(),
+            max_new_tokens: default_max_new(),
+            speculative: true,
+        }
     }
 }
 
-fn default_max_val() -> usize {
-    20_000_000
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct HonestySettings {
+    pub samples: usize,
+    pub min_confidence: f32,
+    pub uncertain_below: f32,
+    pub max_invented_names: usize,
+    pub require_syntax_check: bool,
+    pub check_timeout_s: u64,
+    /// Stop writing a candidate when a stretch of it averages below this.
+    pub give_up_below: f32,
+    /// Refuse when any stretch of the answer averages below this.
+    pub min_stretch: f32,
+    /// Mark untested code unverified when the candidates agree less than this.
+    pub min_agreement: f32,
+}
+
+impl Default for HonestySettings {
+    fn default() -> Self {
+        HonestySettings { samples: 4, min_confidence: 0.35, uncertain_below: 0.3, max_invented_names: 0, require_syntax_check: true,
+                          check_timeout_s: 20, give_up_below: 0.08, min_stretch: 0.12, min_agreement: 0.25 }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct DecideSettings {
+    /// Below this probability for its best option, a decision is "I don't know".
+    pub abstain_below: f32,
+    /// ...or when the best option isn't ahead of the next by at least this much.
+    pub min_margin: f32,
+    /// Subtract each option's bias (its score with the question blanked out).
+    pub contextual_calibration: bool,
+}
+
+impl Default for DecideSettings {
+    fn default() -> Self {
+        DecideSettings { abstain_below: 0.5, min_margin: 0.1, contextual_calibration: true }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    /// Most actions (clicks, drags, keys) in one run.
+    pub max_actions: usize,
+    /// Pause after each action, so the app can draw.
+    pub action_delay_ms: u64,
+    /// Ask before touching the real desktop.
+    pub confirm: bool,
+    /// Stop if you move the mouse this far from where Aegist put it.
+    pub failsafe_px: i32,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        AgentSettings { max_actions: 300, action_delay_ms: 120, confirm: true, failsafe_px: 40 }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct VoiceSettings {
+    /// Speak replies aloud with the system's own text-to-speech.
+    pub enabled: bool,
 }
 
 /// Where training runs.
@@ -185,25 +244,9 @@ pub struct GpuSettings {
 
 impl Default for GpuSettings {
     fn default() -> Self {
-        GpuSettings { device: Device::Auto, precision: GpuPrecision::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(), warmup_steps: default_gpu_warmup(),
-                      checkpoint_every_s: default_gpu_checkpoint() }
+        GpuSettings { device: Device::Auto, precision: GpuPrecision::Auto, tokens_per_step: default_gpu_tokens(), learning_rate: default_gpu_lr(),
+                      warmup_steps: default_gpu_warmup(), checkpoint_every_s: default_gpu_checkpoint() }
     }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct UncertaintySettings {
-    pub enabled: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ResearchSettings {
-    pub wikipedia_api: String,
-    pub articles_per_topic: usize,
-    pub max_topics_per_hour: usize,
-    pub refresh_hours: f64,
-    pub train_minutes_per_topic: f64,
-    pub min_passage_chars: usize,
-    pub seed_topics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -215,83 +258,78 @@ pub struct PathSettings {
 pub struct Settings {
     pub model: ModelSettings,
     pub training: TrainingSettings,
-    pub council: CouncilSettings,
-    pub router: RouterSettings,
-    pub memory: MemorySettings,
+    #[serde(default)]
+    pub code: CodeSettings,
     #[serde(default)]
     pub inference: InferenceSettings,
     #[serde(default)]
+    pub honesty: HonestySettings,
+    #[serde(default)]
     pub gpu: GpuSettings,
-    pub uncertainty: UncertaintySettings,
-    pub research: ResearchSettings,
+    #[serde(default)]
+    pub decide: DecideSettings,
+    #[serde(default)]
+    pub agent: AgentSettings,
+    #[serde(default)]
+    pub voice: VoiceSettings,
     pub paths: PathSettings,
-    /// Project root (holds config/).
+    /// Aegist's home (holds config/).
     #[serde(skip)]
     pub root: PathBuf,
-    /// Resolved data directory (paths.data_dir, or COUNCIL_DATA_DIR).
+    /// Resolved data directory (paths.data_dir, or AEGIST_DATA_DIR).
     #[serde(skip)]
     pub data_dir: PathBuf,
 }
 
+const SETTINGS_FILE: &str = "aegist.yaml";
+
 fn has_config(dir: &Path) -> bool {
-    dir.join("config").join("settings.yaml").is_file()
+    dir.join("config").join(SETTINGS_FILE).is_file()
 }
 
-/// The default config, built into the binary.
-const DEFAULT_FILES: &[(&str, &str)] = &[
-    ("settings.yaml", include_str!("../config/settings.yaml")),
-    ("personas/README.md", include_str!("../config/personas/README.md")),
-    ("personas/believer.yaml", include_str!("../config/personas/believer.yaml")),
-    ("personas/skeptic.yaml", include_str!("../config/personas/skeptic.yaml")),
-    ("personas/investor.yaml", include_str!("../config/personas/investor.yaml")),
-    ("personas/judge.yaml", include_str!("../config/personas/judge.yaml")),
-];
+/// The default settings, built into the binary.
+pub const DEFAULT_SETTINGS: &str = include_str!("../config/aegist.yaml");
 
-/// Write the built-in config under `root/config/` unless one is already there.
+/// Write the built-in settings under `root/config/` unless some are already there.
 pub fn ensure_default_config(root: &Path) -> Result<()> {
     if has_config(root) {
         return Ok(());
     }
-    for (name, text) in DEFAULT_FILES {
-        let path = root.join("config").join(name);
-        std::fs::create_dir_all(path.parent().expect("has a parent"))?;
-        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(())
+    let path = root.join("config").join(SETTINGS_FILE);
+    std::fs::create_dir_all(path.parent().expect("has a parent"))?;
+    std::fs::write(&path, DEFAULT_SETTINGS).with_context(|| format!("writing {}", path.display()))
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
 pub fn find_root() -> Result<PathBuf> {
-    if let Ok(home) = std::env::var("COUNCIL_HOME") {
+    if let Ok(home) = std::env::var("AEGIST_HOME") {
         let root = PathBuf::from(home);
         ensure_default_config(&root)?;
         return Ok(root);
     }
-    let mut starts = vec![std::env::current_dir()?];
     if let Ok(exe) = std::env::current_exe() {
-        starts.push(exe);
-    }
-    for start in starts {
-        if let Some(dir) = start.ancestors().find(|d| has_config(d)) {
+        if let Some(dir) = exe.ancestors().find(|d| has_config(d)) {
             return Ok(dir.to_path_buf());
         }
     }
-    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
-        bail!("Couldn't find config/settings.yaml or a home folder. Set COUNCIL_HOME to a folder for council to use.");
+    let Some(home) = home_dir() else {
+        bail!("Couldn't find a home folder. Set AEGIST_HOME to a folder for Aegist to keep its model in.");
     };
-    let root = PathBuf::from(home).join(".council");
+    let root = home.join(".aegist");
     ensure_default_config(&root)?;
     Ok(root)
 }
 
 impl Settings {
-    /// Load from the project found by `find_root`, honoring the env overrides.
+    /// Load from Aegist's home (`find_root`), honoring the env overrides.
     pub fn load() -> Result<Settings> {
         let root = find_root()?;
-        let path = std::env::var("COUNCIL_SETTINGS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("config").join("settings.yaml"));
+        let path = std::env::var("AEGIST_SETTINGS").map(PathBuf::from).unwrap_or_else(|_| root.join("config").join(SETTINGS_FILE));
         let mut s = Settings::from_file(&path, &root)?;
-        if let Ok(dir) = std::env::var("COUNCIL_DATA_DIR") {
+        if let Ok(dir) = std::env::var("AEGIST_DATA_DIR") {
             s.data_dir = PathBuf::from(dir);
         }
         Ok(s)
@@ -299,7 +337,11 @@ impl Settings {
 
     pub fn from_file(path: &Path, root: &Path) -> Result<Settings> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut s: Settings = serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Settings::from_str(&text, root).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    pub fn from_str(text: &str, root: &Path) -> Result<Settings> {
+        let mut s: Settings = serde_yaml::from_str(text)?;
         s.root = root.to_path_buf();
         s.data_dir = root.join(&s.paths.data_dir);
         Ok(s)
@@ -312,39 +354,9 @@ impl Settings {
         p
     }
 
-    pub fn persona_dir(&self) -> PathBuf {
-        self.root.join("config").join("personas")
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join("config").join(SETTINGS_FILE)
     }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Persona {
-    pub name: String,
-    pub role: String,
-    pub lead_in: String,
-    #[serde(default)]
-    pub probes: Vec<String>,
-    #[serde(default)]
-    pub counter_probes: Vec<String>,
-}
-
-pub fn load_persona(settings: &Settings, name: &str) -> Result<Persona> {
-    let dir = settings.persona_dir();
-    let path = dir.join(format!("{name}.yaml"));
-    if !path.is_file() {
-        let mut available: Vec<String> = std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
-                    .filter(|s| s != "README")
-                    .collect()
-            })
-            .unwrap_or_default();
-        available.sort();
-        bail!("No persona {name:?}; available: {available:?}");
-    }
-    let text = std::fs::read_to_string(&path)?;
-    serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -352,28 +364,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_config_is_written_once_and_loads() {
+    fn default_settings_parse_and_are_written_once() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_default_config(tmp.path()).unwrap();
-        let s = Settings::from_file(&tmp.path().join("config/settings.yaml"), tmp.path()).unwrap();
-        assert!(!s.model.tiers.is_empty());
-        assert_eq!(load_persona(&s, "investor").unwrap().counter_probes.len(), 3);
-        std::fs::write(tmp.path().join("config/settings.yaml"), "edited").unwrap();
+        let s = Settings::from_file(&tmp.path().join("config/aegist.yaml"), tmp.path()).unwrap();
+        assert!(s.model.tiers.contains_key("tiny") && s.honesty.samples >= 1 && s.inference.context_scale >= 1);
+        std::fs::write(tmp.path().join("config/aegist.yaml"), "edited").unwrap();
         ensure_default_config(tmp.path()).unwrap(); // never overwrites your edits
-        assert_eq!(std::fs::read_to_string(tmp.path().join("config/settings.yaml")).unwrap(), "edited");
-        assert!(load_persona(&s, "oracle").unwrap_err().to_string().contains("believer"));
+        assert_eq!(std::fs::read_to_string(tmp.path().join("config/aegist.yaml")).unwrap(), "edited");
     }
 }
 
 #[cfg(test)]
 pub mod testing {
-    //! Settings for tests: the real settings.yaml, shrunk so a model trains
+    //! Settings for tests: the real aegist.yaml, shrunk so a model trains
     //! in a moment, writing into a throwaway directory.
     use super::*;
 
     pub fn settings(data_dir: &Path) -> Settings {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let mut s = Settings::from_file(&root.join("config/settings.yaml"), &root).unwrap();
+        let mut s = Settings::from_str(DEFAULT_SETTINGS, &root).unwrap();
         s.data_dir = data_dir.to_path_buf();
         s.model.tiers = BTreeMap::from([(
             "test".to_string(),
@@ -388,8 +398,6 @@ pub mod testing {
         t.eval_every_s = 3600.0;
         t.log_every_s = 3600.0;
         t.checkpoint_every_s = 3600.0;
-        s.council.generate.max_new_tokens = 12;
-        s.council.min_tokens_trained = 0;
         s.gpu.device = Device::Cpu; // tests are the same on machines with and without a GPU
         s
     }

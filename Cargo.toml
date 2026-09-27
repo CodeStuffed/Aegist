@@ -1,28 +1,38 @@
 [package]
-name = "council"
-version = "0.2.0"
+name = "aegist"
+version = "0.3.0"
 edition = "2021"
-description = "A transformer written and trained from scratch that argues about your claims."
+description = "A coding AI written and trained from scratch in Rust: its own transformer, its own tokenizer, no outside models."
 license = "MIT"
-default-run = "council"
+default-run = "aegist"
+
+[workspace]
+# `cargo build` here builds the aegist program; the app window is `cargo build -p aegist-app`
+members = [".", "app"]
+default-members = ["."]
 
 [dependencies]
 anyhow = "1"
-bzip2 = "0.6"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"       # terminal: raw mode, keys, colors, cursor
 ctrlc = "3"
-gemm = "0.18"            # matrix multiply (the BLAS role NumPy played): plain math, no AI
+gemm = "0.18"            # matrix multiply (the BLAS role): plain math, no AI
+ignore = "0.4"           # walks folders the way git sees them (.gitignore aware)
 libloading = "0.8"       # opens NVIDIA's CUDA libraries at run time, if the machine has them
 memmap2 = "0.9"
+png = "0.17"             # reads the headless browser's screenshots for /preview
 rayon = "1"              # multithreading
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+similar = "2"            # diffs for edits
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy", "parsing"] }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
-ureq = { version = "2", features = ["json", "native-certs"] }   # HTTP for the Wikipedia research loop
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"               # only to exit quietly when output is piped into e.g. `head`
+libc = "0.2"               # process groups for jobs; quiet exit when output is piped into e.g. `head`
 
 [dev-dependencies]
 tempfile = "3"

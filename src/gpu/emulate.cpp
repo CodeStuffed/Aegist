@@ -66,7 +66,7 @@ static std::mutex emu_launch_lock;
 
 // Returns 0 on success, 1 for an unknown kernel name. One launch at a time:
 // like a GPU stream, and because the emulated shared memory is global.
-extern "C" int council_emu_launch(const char* name, unsigned gx, unsigned gy, unsigned bx, void** params) {
+extern "C" int aegist_emu_launch(const char* name, unsigned gx, unsigned gy, unsigned bx, void** params) {
     Runner run = find(name);
     if (!run) return 1;
     std::lock_guard<std::mutex> one_at_a_time(emu_launch_lock);

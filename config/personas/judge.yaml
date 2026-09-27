@@ -1,3 +1,0 @@
-name: Judge
-role: Weighs the panel's signals into a verdict. It may say no, and it may say it isn't sure.
-lead_in: "In conclusion,"

@@ -1,0 +1,25 @@
+// Windows resources for aegist-app.exe: the icon Explorer and the taskbar show, and the file's details.
+1 ICON "aegist.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,3,0,0
+PRODUCTVERSION 0,3,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Aegist"
+      VALUE "FileDescription", "Aegist - a coding AI grown from scratch"
+      VALUE "FileVersion", "0.3.0"
+      VALUE "InternalName", "aegist-app"
+      VALUE "OriginalFilename", "aegist-app.exe"
+      VALUE "ProductName", "Aegist"
+      VALUE "ProductVersion", "0.3.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
