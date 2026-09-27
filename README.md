@@ -19,7 +19,10 @@ right and isn't.
 aegist learn --pack python          # code to learn from (or: aegist learn ~/code)
 aegist train --hours 1              # train it on your CPU or NVIDIA GPU
 aegist                              # open the session
+aegist-app                          # ...or open it as an app, in its own window
 ```
+
+![The Aegist app](docs/app.png)
 
 ## Read this first: what to expect
 
@@ -164,6 +167,37 @@ Staying safe (`/safety` shows this too):
 It works on Windows and on Linux under X11. Wayland doesn't let programs
 see or control the screen, and macOS isn't supported yet.
 
+## The Aegist app
+
+`aegist-app` is Aegist in a window of its own. It has its own icon, a dark
+title bar, a header with the aurora line, Aegist's colors and a crisp font,
+so you don't need a terminal. Inside is the same session, so every command
+and plain-words request works exactly as in a terminal.
+
+- **Copy and paste**: select text with the mouse to copy it, and
+  right-click to paste. **ctrl+shift+c** and **ctrl+shift+v** work too, as
+  does **shift+insert**.
+- **Text size**: **ctrl +** / **ctrl -** changes it, **ctrl 0** resets it.
+- **Scrolling back**: use the mouse wheel or **shift+page up / page down**.
+- **Opening it**: `aegist install` puts it in your Start menu (or apps
+  menu) and on your desktop, with the Aegist icon. Keep `aegist-app` next to
+  `aegist`, since the app finds `aegist` beside it (under a downloaded
+  release's name too) or on your PATH.
+- **One-off commands**: `aegist-app doctor`, `aegist-app train --hours 1`
+  and the like run that command in the window and leave its output on
+  screen until you press a key.
+
+It runs `aegist` in a pseudo-terminal, which is ConPTY on Windows, and draws
+what it writes itself. The terminal emulation, the box and block characters
+that make boxes join and `/screen` pictures fill their cells, and the icon
+are all in `app/`. Fonts are the system's own: Cascadia Mono or Consolas on
+Windows, Menlo on macOS, and DejaVu Sans Mono on Linux. Set `AEGIST_FONT`
+to any `.ttf` to use another. On Linux it needs `libxkbcommon-x11`, which
+desktops already have.
+
+Build it with `cargo build --release -p aegist-app`, or use
+`cargo build --release --workspace` to build both programs.
+
 ## Install
 
 **Build from source** (needs [Rust](https://rustup.rs)):
@@ -173,16 +207,20 @@ git clone https://github.com/CodeStuffed/Aegist
 cd Aegist
 cargo build --release
 ./target/release/aegist            # or: cargo install --path .
+cargo build --release -p aegist-app # the app window (target/release/aegist-app)
 ```
 
 **Or download a build** from the project's Releases page (Windows, macOS,
-Linux), make it runnable (`chmod +x` on macOS/Linux) and put it on your
-PATH.
+Linux). There are two files per system: `aegist-…` and `aegist-app-…`. Put
+both in the same folder, make them runnable (`chmod +x` on macOS/Linux) and
+put that folder on your PATH.
 
-**Open it like an app**: `aegist install` (or `/install` in the session)
-adds Aegist to your apps menu and desktop, so it opens in its own window
-with its own title. That's Windows Terminal when it's installed on Windows,
-your usual terminal on Linux, and Terminal on macOS.
+**Open it like an app**: put `aegist-app` next to `aegist` and run
+`aegist install` (or `/install` in the session). That adds Aegist, with its
+icon, to your apps menu and desktop, and it opens in the Aegist app window.
+Without `aegist-app` beside it, the shortcut opens Aegist in Windows
+Terminal (titled Aegist), your usual terminal on Linux, or Terminal on
+macOS.
 
 Aegist keeps its settings and trained model in its home folder: this repo
 when run from a build inside it, otherwise `~/.aegist`. The code you work on
@@ -272,14 +310,16 @@ never a guess.
 ```bash
 cargo test                          # the whole suite, in seconds, without internet
 cargo test --features gpu-emulator  # plus the GPU kernels, on a CPU emulator
+cargo test -p aegist-app            # the app window: terminal emulation, keys, drawing
 ```
 
 They cover gradient checks, chunked attention against plain attention,
 generation (guessing ahead never changes the output), the tokenizer, the
 corpus and fill-in-the-middle documents, training, the checks and verdicts,
 the benchmark's problems, the project index and undo, the web server, jobs,
-the browser preview (when a browser is installed), and the interface's
-pieces.
+the browser preview (when a browser is installed), the interface's
+pieces, the mouse and keyboard (against a stand-in screen that records
+every action), plans, and the app's terminal emulator and drawing.
 
 ## Layout
 
@@ -288,6 +328,12 @@ src/                 the program (aegist) and its library
   computer.rs        the mouse and keyboard: plain words to checked actions
   autopilot.rs       plans of several steps, all understood before any runs
   extras.rs          /status, /config, /history, /export, /git, `aegist install`
+  icon.rs            the icon, drawn in code (window, shortcuts, .ico)
+app/                 aegist-app: Aegist in its own window
+  src/term.rs        the terminal emulator (escape codes, scrollback, wide characters)
+  src/draw.rs        fonts, box and block characters, colors, cursor, header
+  src/keys.rs        keys to terminal bytes; safe bracketed paste
+  src/main.rs        the window, the pseudo-terminal, mouse, clipboard, zoom
 config/aegist.yaml   every tunable number
 docs/GPU.md          training on an NVIDIA GPU
 examples/            training speed per size, quantization's cost, tokenizer speed

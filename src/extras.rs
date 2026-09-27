@@ -377,21 +377,46 @@ pub fn safety(ctx: &Ctx) {
 
 // ---------------------------------------------------------------- the app
 
-/// A Linux desktop entry that opens Aegist in a terminal window.
-pub fn desktop_entry(exe: &Path) -> String {
+/// The Aegist app window (aegist-app) next to `exe`, if it was built or downloaded there.
+pub fn app_beside(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let direct = dir.join(format!("aegist-app{ext}"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path())
+        .filter(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase().starts_with("aegist-app") && n.ends_with(ext)))
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// A Linux desktop entry: the Aegist app window when there is one, else
+/// Aegist in a terminal.
+pub fn desktop_entry(exe: &Path, app: Option<&Path>, icon: Option<&Path>) -> String {
+    let (run, terminal) = match app {
+        Some(a) => (a, "false"),
+        None => (exe, "true"),
+    };
+    let icon = icon.map_or("utilities-terminal".to_string(), |p| p.display().to_string());
     format!("[Desktop Entry]\nType=Application\nName=Aegist\nGenericName=Coding AI\nComment=A coding AI grown from scratch - write, fix and run code, and use your screen\n\
-             Exec=\"{}\"\nTerminal=true\nIcon=utilities-terminal\nCategories=Development;Utility;\nKeywords=ai;code;terminal;agent;\nStartupNotify=true\n",
-            exe.display())
+             Exec=\"{}\"\nTerminal={terminal}\nIcon={icon}\nCategories=Development;Utility;\nKeywords=ai;code;terminal;agent;\nStartupNotify=true\n\
+             StartupWMClass=aegist-app\n",
+            run.display())
 }
 
 /// A PowerShell script that makes Start menu and desktop shortcuts on
-/// Windows (in Windows Terminal, titled Aegist, when it's installed).
-pub fn windows_shortcut_script(exe: &Path, wt: Option<&Path>) -> String {
+/// Windows: to the Aegist app window when there is one, else to Aegist in
+/// Windows Terminal (titled Aegist) or a console.
+pub fn windows_shortcut_script(exe: &Path, app: Option<&Path>, wt: Option<&Path>, icon: Option<&Path>) -> String {
     let q = |p: &Path| p.display().to_string().replace('\'', "''");
-    let (target, args) = match wt {
-        Some(wt) => (q(wt), format!("--title Aegist \"{}\"", exe.display()).replace('\'', "''")),
-        None => (q(exe), String::new()),
+    let (target, args) = match (app, wt) {
+        (Some(a), _) => (q(a), String::new()),
+        (None, Some(wt)) => (q(wt), format!("--title Aegist \"{}\"", exe.display()).replace('\'', "''")),
+        (None, None) => (q(exe), String::new()),
     };
+    let icon = icon.map_or_else(|| format!("{},0", q(app.unwrap_or(exe))), q);
     format!(
         "$ws = New-Object -ComObject WScript.Shell\n\
          foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {{\n\
@@ -400,42 +425,55 @@ pub fn windows_shortcut_script(exe: &Path, wt: Option<&Path>) -> String {
          \x20 $s.TargetPath = '{target}'\n\
          \x20 $s.Arguments = '{args}'\n\
          \x20 $s.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')\n\
-         \x20 $s.IconLocation = '{icon},0'\n\
+         \x20 $s.IconLocation = '{icon}'\n\
          \x20 $s.Description = 'Aegist - a coding AI grown from scratch'\n\
          \x20 $s.Save()\n\
          \x20 Write-Output $lnk\n\
-         }}\n",
-        icon = q(exe)
+         }}\n"
     )
 }
 
-/// `aegist install`: add Aegist to the apps menu (and desktop). Returns what was made.
+/// `aegist install`: add Aegist to the apps menu (and desktop), opening the
+/// Aegist app window when it's next to this program. Returns what was made.
 pub fn install() -> Result<Vec<PathBuf>> {
     let exe = std::env::current_exe()?.canonicalize()?;
+    let app = app_beside(&exe);
     let home = crate::config::home_dir().ok_or_else(|| anyhow::anyhow!("couldn't find your home folder"))?;
     if cfg!(windows) {
+        // the icon, for the shortcuts
+        let dir = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home.join("AppData").join("Local")).join("Aegist");
+        std::fs::create_dir_all(&dir)?;
+        let ico = dir.join("aegist.ico");
+        std::fs::write(&ico, crate::icon::ico())?;
         let wt = crate::proc::which("wt");
-        let script = windows_shortcut_script(&exe, wt.as_deref());
+        let script = windows_shortcut_script(&exe, app.as_deref(), wt.as_deref(), Some(&ico));
         let out = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output()
             .context("running PowerShell to make the shortcuts")?;
         if !out.status.success() {
             bail!("PowerShell couldn't make the shortcuts: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        return Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect());
+        let mut made: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect();
+        made.push(ico);
+        return Ok(made);
     }
     if cfg!(target_os = "macos") {
         let dir = home.join("Applications");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("Aegist.command");
-        std::fs::write(&path, format!("#!/bin/sh\nprintf '\\033]0;Aegist\\007'\ncd \"$HOME\"\nexec \"{}\"\n", exe.display()))?;
+        let run = app.as_deref().unwrap_or(&exe);
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '\\033]0;Aegist\\007'\ncd \"$HOME\"\nexec \"{}\"\n", run.display()))?;
         make_executable(&path)?;
         return Ok(vec![path]);
     }
     // (an empty or relative XDG_DATA_HOME is to be ignored, per the spec)
-    let apps = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".local/share"))
-        .join("applications");
+    let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".local/share"));
+    let apps = data.join("applications");
     std::fs::create_dir_all(&apps)?;
-    let entry = desktop_entry(&exe);
+    let icons = data.join("icons/hicolor/256x256/apps");
+    std::fs::create_dir_all(&icons)?;
+    let icon = icons.join("aegist.png");
+    std::fs::write(&icon, crate::icon::png(256))?;
+    let entry = desktop_entry(&exe, app.as_deref(), Some(&icon));
     let mut made = vec![apps.join("aegist.desktop")];
     std::fs::write(&made[0], &entry)?;
     let desktop = home.join("Desktop");
@@ -445,6 +483,7 @@ pub fn install() -> Result<Vec<PathBuf>> {
         make_executable(&p)?;
         made.push(p);
     }
+    made.push(icon);
     Ok(made)
 }
 
@@ -494,11 +533,25 @@ mod tests {
     #[test]
     fn launchers_point_at_this_program() {
         let exe = Path::new("/opt/aegist/aegist");
-        let e = desktop_entry(exe);
+        let e = desktop_entry(exe, None, None);
         assert!(e.starts_with("[Desktop Entry]") && e.contains("Exec=\"/opt/aegist/aegist\"") && e.contains("Terminal=true"));
-        let s = windows_shortcut_script(Path::new(r"C:\Tools\it's\aegist.exe"), Some(Path::new(r"C:\wt.exe")));
+        let e = desktop_entry(exe, Some(Path::new("/opt/aegist/aegist-app")), Some(Path::new("/i/aegist.png")));
+        assert!(e.contains("Exec=\"/opt/aegist/aegist-app\"") && e.contains("Terminal=false") && e.contains("Icon=/i/aegist.png"));
+        let s = windows_shortcut_script(Path::new(r"C:\Tools\it's\aegist.exe"), None, Some(Path::new(r"C:\wt.exe")), None);
         assert!(s.contains(r"TargetPath = 'C:\wt.exe'") && s.contains(r#"--title Aegist "C:\Tools\it''s\aegist.exe""#), "{s}");
-        let s = windows_shortcut_script(Path::new(r"C:\a.exe"), None);
-        assert!(s.contains(r"TargetPath = 'C:\a.exe'") && s.contains("Arguments = ''"));
+        let s = windows_shortcut_script(Path::new(r"C:\a.exe"), None, None, None);
+        assert!(s.contains(r"TargetPath = 'C:\a.exe'") && s.contains("Arguments = ''") && s.contains(r"IconLocation = 'C:\a.exe,0'"));
+        // the app window wins, with the Aegist icon
+        let s = windows_shortcut_script(Path::new(r"C:\a.exe"), Some(Path::new(r"C:\aegist-app.exe")), Some(Path::new(r"C:\wt.exe")),
+                                        Some(Path::new(r"C:\Aegist\aegist.ico")));
+        assert!(s.contains(r"TargetPath = 'C:\aegist-app.exe'") && s.contains("Arguments = ''") && s.contains(r"IconLocation = 'C:\Aegist\aegist.ico'"), "{s}");
+        // found next to the program, under a downloaded name too
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("aegist");
+        std::fs::write(&main, "").unwrap();
+        assert!(app_beside(&main).is_none());
+        let name = if cfg!(windows) { "aegist-app-windows-x86_64.exe" } else { "aegist-app-linux-x86_64" };
+        std::fs::write(tmp.path().join(name), "").unwrap();
+        assert_eq!(app_beside(&main).unwrap().file_name().unwrap(), name);
     }
 }

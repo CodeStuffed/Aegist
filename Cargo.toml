@@ -6,6 +6,11 @@ description = "A coding AI written and trained from scratch in Rust: its own tra
 license = "MIT"
 default-run = "aegist"
 
+[workspace]
+# `cargo build` here builds the aegist program; the app window is `cargo build -p aegist-app`
+members = [".", "app"]
+default-members = ["."]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

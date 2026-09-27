@@ -18,6 +18,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      # the app window: its terminal, keys and drawing
+      - run: cargo test -p aegist-app
 
   gpu-emulated:
     # The GPU kernels and the GPU training step, run on a CPU emulator and
@@ -36,16 +38,19 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest,  name: aegist-linux-x86_64,       bin: aegist }
-          - { os: macos-latest,   name: aegist-macos-arm64,        bin: aegist }
-          - { os: windows-latest, name: aegist-windows-x86_64.exe, bin: aegist.exe }
+          - { os: ubuntu-latest,  name: aegist-linux-x86_64,   ext: "" }
+          - { os: macos-latest,   name: aegist-macos-arm64,    ext: "" }
+          - { os: windows-latest, name: aegist-windows-x86_64, ext: ".exe" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+      # aegist, and aegist-app: Aegist in a window of its own
+      - run: cargo build --release --workspace
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: target/release/${{ matrix.bin }}
+          path: |
+            target/release/aegist${{ matrix.ext }}
+            target/release/aegist-app${{ matrix.ext }}

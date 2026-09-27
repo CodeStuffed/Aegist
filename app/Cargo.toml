@@ -1,0 +1,20 @@
+[package]
+name = "aegist-app"
+version = "0.3.0"
+edition = "2021"
+description = "Aegist's own window: the Aegist session in an app with its own icon, colors and font."
+license = "MIT"
+
+[[bin]]
+name = "aegist-app"
+path = "src/main.rs"
+
+[dependencies]
+aegist = { path = ".." }  # for the icon
+winit = "0.30"            # the window and its events
+softbuffer = "0.4"        # putting pixels in the window
+fontdue = "0.9"           # turning the system font's letters into pixels
+portable-pty = "0.9"      # running the session in a pseudo-terminal (ConPTY on Windows)
+vte = "0.15"              # reading the escape codes the session writes
+unicode-width = "0.2"
+arboard = { version = "3", default-features = false }  # the clipboard

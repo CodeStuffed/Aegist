@@ -17,6 +17,7 @@ pub mod corpus;
 pub mod decide;
 pub mod extras;
 pub mod gpu;
+pub mod icon;
 pub mod ide;
 pub mod hardware;
 pub mod kernels;
