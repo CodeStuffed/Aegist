@@ -1,5 +1,5 @@
-//! Aegist's icon, drawn in code: a four-point star in the session's aurora
-//! colors (cyan, violet, pink) on a dark rounded square. Used for the app
+//! Aegist's icon, drawn in code: a four-point star in the session's neon
+//! violet colors (indigo, violet, fuchsia) on a dark rounded square. Used for the app
 //! window and for the shortcuts `aegist install` makes.
 
 /// The icon, `size`×`size`, as RGBA bytes row by row.
@@ -8,7 +8,7 @@ pub fn rgba(size: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((size * size * 4) as usize);
     const SS: u32 = 4; // samples per pixel side, for smooth edges
     let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-    let (cyan, violet, pink) = ([94.0, 234.0, 212.0], [167.0, 139.0, 250.0], [244.0, 114.0, 182.0]);
+    let (cyan, violet, pink) = ([129.0, 140.0, 248.0], [168.0, 85.0, 247.0], [232.0, 121.0, 249.0]);
     for py in 0..size {
         for px in 0..size {
             let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
@@ -24,7 +24,7 @@ pub fn rgba(size: u32) -> Vec<u8> {
                         continue;
                     }
                     let t = (y + 1.0) / 2.0;
-                    let mut c = lerp([30.0, 34.0, 56.0], [12.0, 13.0, 22.0], t);
+                    let mut c = lerp([36.0, 22.0, 64.0], [13.0, 9.0, 24.0], t);
                     // the star: an astroid, |x|^(2/3) + |y|^(2/3) <= r^(2/3)
                     let star = x.abs().powf(2.0 / 3.0) + y.abs().powf(2.0 / 3.0);
                     let r0 = 0.72f32.powf(2.0 / 3.0);

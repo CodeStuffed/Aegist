@@ -18,3 +18,6 @@ portable-pty = "0.9"      # running the session in a pseudo-terminal (ConPTY on 
 vte = "0.15"              # reading the escape codes the session writes
 unicode-width = "0.2"
 arboard = { version = "3", default-features = false }  # the clipboard
+
+[build-dependencies]
+embed-resource = "3"      # the icon inside aegist-app.exe

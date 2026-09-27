@@ -282,7 +282,7 @@ pub fn run(ctx: &Ctx, text: &str) -> Result<()> {
         card.push(style::faint("move the mouse or press esc to take over at any time"));
     }
     let mut lines = vec![String::new()];
-    let title = style::gradient_styled(&format!("✦ plan · {n} step{}", if n == 1 { "" } else { "s" }), 0.1, true);
+    let title = format!("{} {}", style::gradient_styled(&style::spaced("plan"), 0.1, true), style::faint(&format!("// {n} step{}", if n == 1 { "" } else { "s" })));
     lines.extend(widgets::boxed(Some(&title), &card, w.saturating_sub(4).min(96), pal::BORDER).into_iter().map(|l| format!("  {l}")));
     ctx.print(lines);
 

@@ -163,7 +163,7 @@ pub fn run(settings: Settings) -> Result<()> {
     };
     let guard = TermGuard::enter()?;
     crossterm::execute!(std::io::stdout(), crossterm::style::ResetColor)?; // (turns on escape codes on Windows)
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("✦ Aegist"));
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("Aegist"));
     app.pending.extend(actions::welcome(&app.ctx));
     let result = app.run_loop();
     let mut out = std::io::stdout();
@@ -174,7 +174,7 @@ pub fn run(settings: Settings) -> Result<()> {
         let s = shared.lock().expect("lock");
         s.jobs.stop_all();
     }
-    println!("  {}", style::gradient_styled("✦ until next time", 0.2, true));
+    println!("  {}", style::gradient_styled("◆ session closed // until next time", 0.2, true));
     result
 }
 
@@ -441,8 +441,9 @@ impl App {
                 Err(_) => String::new(),
             }
         };
-        let gap = w.saturating_sub(text::width(&hint) + text::width(&right) + 4);
-        text::truncate(&format!("  {hint}{}{right}", " ".repeat(gap.max(1))), w)
+        let badge = style::badge("AEGIST");
+        let gap = w.saturating_sub(text::width(&badge) + text::width(&hint) + text::width(&right) + 5);
+        text::truncate(&format!("  {badge} {hint}{}{right}", " ".repeat(gap.max(1))), w)
     }
 
     fn live(&self) -> (Vec<String>, Option<(usize, usize)>) {
@@ -470,13 +471,14 @@ impl App {
         if let Some(a) = &self.ask {
             lines.push(String::new());
             lines.push(format!("  {} {}", style::fg(pal::VIOLET, "?"), Style::new().bold().paint(&a.question)));
+            // the choices as buttons: the chosen one lit violet
             let mut row = String::from("    ");
             for (i, (k, label)) in a.choices.iter().enumerate() {
-                let body = format!("{label} ({k})");
+                let body = format!(" {} {} ", label.to_uppercase(), k);
                 if i == a.sel {
-                    row.push_str(&format!("{} {}   ", Style::new().fg(pal::VIOLET).bold().paint("❯"), Style::new().fg(pal::VIOLET).bold().underline().paint(&body)));
+                    row.push_str(&format!("{}  ", Style::new().fg(pal::INK).bg(pal::VIOLET).bold().paint(&format!("▸{body}"))));
                 } else {
-                    row.push_str(&format!("  {}   ", style::dim(&body)));
+                    row.push_str(&format!("{}  ", Style::new().fg(pal::DIM).bg(pal::BORDER.shade(0.55)).paint(&format!(" {body}"))));
                 }
             }
             lines.push(row);

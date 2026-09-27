@@ -25,32 +25,36 @@ impl Rgb {
     }
 }
 
-/// The palette: "aurora" - cool cyans and violets warming into pink, on
-/// whatever background the terminal has.
+/// The palette: "neon violet" - everything in one purple family, from
+/// electric indigo through violet to fuchsia, with plain green, amber and
+/// red kept for yes / careful / no. (The names are the roles they play:
+/// CYAN is the cool accent, PINK the warm one.)
 pub mod pal {
     use super::Rgb;
-    pub const CYAN: Rgb = Rgb::hex(0x5EEAD4);
-    pub const SKY: Rgb = Rgb::hex(0x7DD3FC);
-    pub const BLUE: Rgb = Rgb::hex(0x7AA2F7);
-    pub const VIOLET: Rgb = Rgb::hex(0xA78BFA);
-    pub const PINK: Rgb = Rgb::hex(0xF472B6);
-    pub const GREEN: Rgb = Rgb::hex(0x34D399);
+    pub const CYAN: Rgb = Rgb::hex(0x8B9DFF);
+    pub const SKY: Rgb = Rgb::hex(0xC4B5FD);
+    pub const BLUE: Rgb = Rgb::hex(0x818CF8);
+    pub const VIOLET: Rgb = Rgb::hex(0xA855F7);
+    pub const PINK: Rgb = Rgb::hex(0xE879F9);
+    pub const GREEN: Rgb = Rgb::hex(0x4ADE80);
     pub const YELLOW: Rgb = Rgb::hex(0xFBBF24);
     pub const ORANGE: Rgb = Rgb::hex(0xFB923C);
-    pub const RED: Rgb = Rgb::hex(0xF87171);
-    pub const DIM: Rgb = Rgb::hex(0x9AA0B4);
-    pub const FAINT: Rgb = Rgb::hex(0x646A80);
-    pub const BORDER: Rgb = Rgb::hex(0x4B5068);
+    pub const RED: Rgb = Rgb::hex(0xFB7185);
+    pub const DIM: Rgb = Rgb::hex(0xA99FC7);
+    pub const FAINT: Rgb = Rgb::hex(0x6E6390);
+    pub const BORDER: Rgb = Rgb::hex(0x4C3B7A);
     pub const ADD_BG: Rgb = Rgb::hex(0x0E2A20);
-    pub const DEL_BG: Rgb = Rgb::hex(0x3A1520);
-    pub const ADD_FG: Rgb = Rgb::hex(0x6EE7B7);
+    pub const DEL_BG: Rgb = Rgb::hex(0x3A1528);
+    pub const ADD_FG: Rgb = Rgb::hex(0x86EFAC);
     pub const DEL_FG: Rgb = Rgb::hex(0xFDA4AF);
     pub const UNSURE_BG: Rgb = Rgb::hex(0x3B2A0F);
+    /// Text on a violet badge.
+    pub const INK: Rgb = Rgb::hex(0x12091F);
 
-    /// The signature gradient, 0 = cyan, 1 = pink.
+    /// The signature gradient: 0 = indigo, 0.5 = violet, 1 = fuchsia.
     pub fn aurora(t: f32) -> Rgb {
         let t = t.clamp(0.0, 1.0);
-        if t < 0.5 { CYAN.lerp(VIOLET, t * 2.0) } else { VIOLET.lerp(PINK, (t - 0.5) * 2.0) }
+        if t < 0.5 { BLUE.lerp(VIOLET, t * 2.0) } else { VIOLET.lerp(PINK, (t - 0.5) * 2.0) }
     }
 }
 
@@ -258,6 +262,16 @@ pub fn accent(text: &str) -> String {
     Style::new().fg(pal::VIOLET).bold().paint(text)
 }
 
+/// "Status" -> "S T A T U S": the letter-spaced capitals of headings.
+pub fn spaced(text: &str) -> String {
+    text.to_uppercase().chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// A label on a solid violet badge: ` AEGIST `.
+pub fn badge(text: &str) -> String {
+    Style::new().fg(pal::INK).bg(pal::VIOLET).bold().paint(&format!(" {text} "))
+}
+
 /// Text painted along the aurora gradient, one step per character;
 /// `phase` shifts it (for animation).
 pub fn gradient(text: &str, phase: f32) -> String {
@@ -302,7 +316,7 @@ mod tests {
         set_depth(Depth::None);
         assert_eq!(gradient("hello", 0.0), "hello");
         assert_eq!(Style::new().fg(pal::RED).paint("plain"), "plain");
-        assert_eq!(pal::aurora(0.0), pal::CYAN);
+        assert_eq!(pal::aurora(0.0), pal::BLUE);
         assert_eq!(pal::aurora(1.0), pal::PINK);
     }
 }

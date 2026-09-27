@@ -522,14 +522,22 @@ pub fn launch_argv(target: &str, os: Os, installed: &dyn Fn(&str) -> bool) -> Re
     if is_url(t) {
         let url = url_of(t);
         return Ok(match os {
-            Os::Windows => v(&["cmd", "/C", "start", "", &url]),
+            // no shell: a URL's & or | must never reach cmd
+            Os::Windows => v(&["rundll32", "url.dll,FileProtocolHandler", &url]),
             Os::Mac => v(&["open", &url]),
             Os::Linux if installed("xdg-open") => v(&["xdg-open", &url]),
             Os::Linux => return Err("nothing here opens web pages (xdg-open isn't installed)".into()),
         });
     }
     match os {
-        Os::Windows => Ok(v(&["cmd", "/C", "start", "", known.map_or(t, |k| k.1)])),
+        Os::Windows => {
+            let name = known.map_or(t, |k| k.1);
+            // `start` needs cmd, which treats these as commands of their own
+            if name.chars().any(|c| "&|<>^%\"()!\n\r".contains(c)) {
+                return Err(format!("{name:?} has characters I won't pass to the system's command line; say just the app's name"));
+            }
+            Ok(v(&["cmd", "/C", "start", "", name]))
+        }
         Os::Mac => Ok(v(&["open", "-a", known.map_or(t, |k| k.2)])),
         Os::Linux => {
             let candidates: Vec<&str> = match known {
@@ -1201,6 +1209,10 @@ pub mod tests {
         assert!(launch_argv("paint", Os::Linux, &has).unwrap_err().contains("couldn't find a paint app"));
         assert_eq!(launch_argv("paint", Os::Windows, &has).unwrap(), vec!["cmd", "/C", "start", "", "mspaint"]);
         assert_eq!(launch_argv("spotify", Os::Windows, &has).unwrap().last().unwrap(), "spotify");
+        // nothing reaches cmd that it would run as a command of its own
+        assert_eq!(launch_argv("youtube.com/watch?v=x&t=1", Os::Windows, &has).unwrap(),
+                   vec!["rundll32", "url.dll,FileProtocolHandler", "https://youtube.com/watch?v=x&t=1"]);
+        assert!(launch_argv("notepad & calc", Os::Windows, &has).is_err());
         assert_eq!(launch_argv("notepad", Os::Mac, &has).unwrap(), vec!["open", "-a", "TextEdit"]);
         assert!(is_url("https://x.dev/a b") && is_url("www.example.org") && !is_url("notepad") && !is_url("main.py"));
     }

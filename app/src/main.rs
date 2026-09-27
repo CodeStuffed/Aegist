@@ -33,7 +33,7 @@ use winit::window::{Icon, Theme, Window, WindowId};
 
 const FONT_PT: f32 = 14.0;
 const BLINK: Duration = Duration::from_millis(530);
-const HINT: &str = "ctrl+shift+c/v copy·paste   ctrl +/- size";
+const HINT: &str = "ctrl+shift+c/v copy·paste · ctrl +/- zoom";
 
 enum UserEvent {
     Output(Vec<u8>),
@@ -154,6 +154,15 @@ impl App {
             let _ = s.writer.write_all(bytes);
             let _ = s.writer.flush();
         }
+    }
+
+    /// Typed text straight to the session (what a key press does).
+    fn send_typed(&mut self, bytes: &[u8]) {
+        self.view.offset = 0;
+        self.view.selection = None;
+        self.view.cursor_on = true;
+        self.blink_at = Instant::now() + BLINK;
+        self.send(bytes);
     }
 
     fn redraw(&self) {
@@ -304,6 +313,12 @@ impl App {
                 NamedKey::F12 => Key::F(12),
                 _ => return,
             },
+            // AltGr (reported as ctrl+alt on Windows) types a character: send it as typed
+            WKey::Character(_) if m.ctrl && m.alt && event.text.as_ref().is_some_and(|t| t.chars().all(|c| !c.is_control())) => {
+                let t = event.text.as_ref().map(|t| t.to_string()).unwrap_or_default();
+                self.send_typed(t.as_bytes());
+                return;
+            }
             WKey::Character(c) if m.ctrl || m.alt => Key::Text(c.to_string()),
             WKey::Character(c) => Key::Text(event.text.as_ref().map_or_else(|| c.to_string(), |t| t.to_string())),
             _ => match &event.text {
@@ -312,11 +327,7 @@ impl App {
             },
         };
         if let Some(bytes) = keys::encode(&key, m, self.emu.term.app_cursor) {
-            self.view.offset = 0;
-            self.view.selection = None;
-            self.view.cursor_on = true;
-            self.blink_at = Instant::now() + BLINK;
-            self.send(&bytes);
+            self.send_typed(&bytes);
         }
     }
 }
@@ -380,14 +391,16 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Output(bytes) => {
+                let before = self.emu.term.scrollback.len();
                 self.emu.feed(&bytes);
                 let replies = self.emu.take_replies();
                 if !replies.is_empty() {
                     self.send(&replies);
                 }
                 if self.view.offset > 0 {
-                    // keep the same lines in view while output arrives below
-                    self.view.offset = self.view.offset.min(self.emu.term.scrollback.len());
+                    // scrolled back: keep the same lines in view while output arrives below
+                    let added = self.emu.term.scrollback.len().saturating_sub(before);
+                    self.view.offset = (self.view.offset + added).min(self.emu.term.scrollback.len());
                 }
                 self.redraw();
             }

@@ -59,7 +59,7 @@ pub fn status(ctx: &Ctx) {
                           h.min_confidence * 100.0, h.min_stretch * 100.0));
     }
     let mut lines = vec![String::new()];
-    lines.extend(widgets::boxed(Some(&style::gradient_styled("✦ status", 0.2, true)), &card, w.saturating_sub(4).min(100), pal::BORDER)
+    lines.extend(widgets::boxed(Some(&style::gradient_styled(&style::spaced("status"), 0.2, true)), &card, w.saturating_sub(4).min(100), pal::BORDER)
         .into_iter().map(|l| format!("  {l}")));
     ctx.print(lines);
 }
@@ -148,7 +148,7 @@ pub fn config(ctx: &Ctx, args: &str) -> Result<()> {
     let words: Vec<&str> = args.split_whitespace().collect();
     match words.as_slice() {
         [] => {
-            let mut lines = vec![String::new(), format!("  {} {}", style::gradient_styled("✦ settings", 0.2, true), style::faint(&path.display().to_string()))];
+            let mut lines = vec![String::new(), format!("  {} {}", widgets::heading("Settings", 0.2, 24), style::faint(&path.display().to_string()))];
             let kw = TUNABLE.iter().map(|(k, _)| k.len()).max().unwrap_or(20);
             for (k, what) in TUNABLE {
                 lines.push(format!("    {} {} {}", Style::new().fg(pal::SKY).paint(&text::pad(k, kw)),
@@ -359,7 +359,7 @@ pub fn safety(ctx: &Ctx) {
         ("plans", "several steps all at once, shows you the plan, and runs none of it if one step isn't understood".into()),
         ("code", "is checked (compiler, made-up names, tests, certainty) before it touches your files - or it says I don't know".into()),
     ];
-    let mut lines = vec![String::new(), format!("  {}", style::gradient_styled("✦ what Aegist will and won't do", 0.3, true))];
+    let mut lines = vec![String::new(), format!("  {}", widgets::heading("Safety protocol", 0.3, ctx.width().saturating_sub(4)))];
     for (k, v) in rows {
         let color = match k {
             "never" => pal::RED,

@@ -414,8 +414,17 @@ pub fn screenshot(url: &str, w: u32, h: u32, wait_ms: u32) -> Result<Shot> {
     std::fs::create_dir_all(&dir)?;
     let png = dir.join("shot.png");
     let mut cmd = Command::new(&browser);
+    // the page's console messages come from the browser's log. On Windows
+    // the browser has no stderr to write it to, so it goes to a file there.
+    let log_file = dir.join("browser.log");
     cmd.args(["--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars", "--mute-audio", "--no-first-run",
-              "--no-default-browser-check", "--enable-logging=stderr", "--log-level=0"])
+              "--no-default-browser-check", "--log-level=0"]);
+    if cfg!(windows) {
+        cmd.arg("--enable-logging").arg(format!("--log-file={}", log_file.display()));
+    } else {
+        cmd.arg("--enable-logging=stderr");
+    }
+    cmd
         .arg(format!("--user-data-dir={}", dir.join("profile").display()))
         .arg(format!("--window-size={w},{h}"))
         .arg(format!("--virtual-time-budget={wait_ms}"))
@@ -426,10 +435,12 @@ pub fn screenshot(url: &str, w: u32, h: u32, wait_ms: u32) -> Result<Shot> {
         bail!("the browser didn't produce a screenshot: {}", out.combined().lines().last().unwrap_or("no output"));
     }
     let re = regex::Regex::new(r#"CONSOLE(?::\d+|\(\d+\))\] "(.*)", source: (.*?) \((\d+)\)"#).expect("valid regex");
-    let console = out.stderr.lines().filter_map(|l| re.captures(l)).map(|c| {
+    let logged = format!("{}\n{}", out.stderr, std::fs::read_to_string(&log_file).unwrap_or_default());
+    let mut seen = std::collections::HashSet::new();
+    let console = logged.lines().filter_map(|l| re.captures(l)).map(|c| {
         let src = c[2].rsplit('/').next().unwrap_or(&c[2]).to_string();
         format!("{} ({src}:{})", &c[1], &c[3])
-    }).collect();
+    }).filter(|l| seen.insert(l.clone())).collect();
     Ok(Shot { png, console })
 }
 

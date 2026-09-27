@@ -29,19 +29,19 @@ impl Rgb {
 /// Aegist's colors (the same ones the session uses for its text).
 pub mod theme {
     use super::Rgb;
-    pub const BG: Rgb = Rgb::hex(0x0E1018);
-    pub const HEADER: Rgb = Rgb::hex(0x141726);
-    pub const FG: Rgb = Rgb::hex(0xE2E4F0);
-    pub const FAINT: Rgb = Rgb::hex(0x646A80);
-    pub const CYAN: Rgb = Rgb::hex(0x5EEAD4);
-    pub const VIOLET: Rgb = Rgb::hex(0xA78BFA);
-    pub const PINK: Rgb = Rgb::hex(0xF472B6);
-    pub const SELECTION: Rgb = Rgb::hex(0x34386A);
+    pub const BG: Rgb = Rgb::hex(0x0C0915);
+    pub const HEADER: Rgb = Rgb::hex(0x1A1030);
+    pub const FG: Rgb = Rgb::hex(0xEDE9FE);
+    pub const FAINT: Rgb = Rgb::hex(0x7A6E9E);
+    pub const CYAN: Rgb = Rgb::hex(0x818CF8);
+    pub const VIOLET: Rgb = Rgb::hex(0xA855F7);
+    pub const PINK: Rgb = Rgb::hex(0xE879F9);
+    pub const SELECTION: Rgb = Rgb::hex(0x3B2566);
     pub const ANSI: [Rgb; 16] = [
-        Rgb::hex(0x1B1E2B), Rgb::hex(0xF87171), Rgb::hex(0x34D399), Rgb::hex(0xFBBF24),
-        Rgb::hex(0x7AA2F7), Rgb::hex(0xA78BFA), Rgb::hex(0x5EEAD4), Rgb::hex(0xC8CBD9),
-        Rgb::hex(0x4B5068), Rgb::hex(0xFCA5A5), Rgb::hex(0x6EE7B7), Rgb::hex(0xFDE68A),
-        Rgb::hex(0x93C5FD), Rgb::hex(0xC4B5FD), Rgb::hex(0x99F6E4), Rgb::hex(0xF5F6FA),
+        Rgb::hex(0x1E1433), Rgb::hex(0xFB7185), Rgb::hex(0x4ADE80), Rgb::hex(0xFBBF24),
+        Rgb::hex(0x818CF8), Rgb::hex(0xA855F7), Rgb::hex(0x8B9DFF), Rgb::hex(0xD6CFF0),
+        Rgb::hex(0x4C3B7A), Rgb::hex(0xFDA4AF), Rgb::hex(0x86EFAC), Rgb::hex(0xFDE68A),
+        Rgb::hex(0xA5B4FC), Rgb::hex(0xD8B4FE), Rgb::hex(0xC4B5FD), Rgb::hex(0xF5F3FF),
     ];
 
     pub fn aurora(t: f32) -> Rgb {
@@ -261,6 +261,7 @@ impl Painter {
     pub fn draw(&mut self, buf: &mut [u32], w: usize, h: usize, term: &Term, view: &View) {
         let mut fb = Frame { buf, w, h };
         fb.fill(0, 0, w, h, theme::BG);
+        backdrop(&mut fb, self.scale);
         self.draw_header(&mut fb, term, view);
         let (ox, oy) = self.origin();
         let total = term.total_lines();
@@ -326,15 +327,29 @@ impl Painter {
         }
         let ty = (hh.saturating_sub(self.cell_h)) / 2;
         let mut x = pad + side + (10.0 * self.scale) as usize;
-        x = self.text(fb, x, ty, "Aegist", theme::FG, true);
+        // A E G I S T, letter-spaced, each letter a step along the gradient
+        for (i, c) in "AEGIST".chars().enumerate() {
+            let cell = Cell { ch: c, style: Default::default(), spacer: false };
+            self.draw_glyph(fb, x, ty, &cell, theme::aurora(i as f32 / 5.0), theme::HEADER, true, false);
+            x += self.cell_w * 2;
+        }
         let sub = match &term.title {
-            Some(t) if !t.trim().is_empty() && !t.contains("Aegist") => format!("  ·  {t}"),
-            _ => "  ·  a coding AI grown from scratch".into(),
+            Some(t) if !t.trim().is_empty() && !t.contains("Aegist") => format!(" // {t}"),
+            _ => " // NEURAL CODE ENGINE".into(),
         };
         let sub_end = self.text(fb, x, ty, &sub, theme::FAINT, false);
+        // on the right: the hint, then three status lights
+        let led = (6.0 * self.scale).round() as usize;
+        let leds_w = 3 * led + 2 * led;
+        let lx = fb.w.saturating_sub(pad + leds_w);
+        for (i, c) in [theme::CYAN, theme::VIOLET, theme::PINK].iter().enumerate() {
+            let cx = lx + i * led * 2;
+            let on = if i == 1 { view.cursor_on || !view.focused } else { true };
+            dot(fb, cx, hh / 2 - led / 2, led, if on { *c } else { c.mix(theme::HEADER, 0.6) });
+        }
         let hint_w = view.hint.chars().count() * self.cell_w;
-        if !view.hint.is_empty() && sub_end + hint_w + 3 * pad < fb.w {
-            self.text(fb, fb.w - pad - hint_w, ty, &view.hint, theme::FAINT, false);
+        if !view.hint.is_empty() && sub_end + hint_w + leds_w + 4 * pad < fb.w {
+            self.text(fb, lx - pad - hint_w, ty, &view.hint, theme::FAINT, false);
         }
     }
 
@@ -403,6 +418,47 @@ impl Painter {
                         fb.blend(px as usize, py as usize, fg, a as f32 / 255.0);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The window's background: a violet glow in the top corner fading into
+/// the dark, and faint scanlines, like an old terminal's screen.
+fn backdrop(fb: &mut Frame, scale: f32) {
+    let (w, h) = (fb.w as f32, fb.h as f32);
+    let r = (w.max(h) * 0.7).max(1.0);
+    let step = (3.0 * scale).round().max(2.0) as usize;
+    for y in 0..fb.h {
+        let scan = y % step == 0;
+        for x in 0..fb.w {
+            let (dx, dy) = (w - x as f32, y as f32);
+            let d = (dx * dx + dy * dy).sqrt() / r;
+            let glow = (1.0 - d).clamp(0.0, 1.0).powi(2) * 0.10;
+            let mut a = glow;
+            if scan {
+                a += 0.025;
+            }
+            if a > 0.004 {
+                fb.blend(x, y, theme::VIOLET, a);
+            }
+        }
+    }
+}
+
+/// A small round light.
+fn dot(fb: &mut Frame, x: usize, y: usize, d: usize, c: Rgb) {
+    let r = d as f32 / 2.0;
+    for yy in 0..d + 2 {
+        for xx in 0..d + 2 {
+            let (fx, fy) = (xx as f32 - r, yy as f32 - r);
+            let dist = (fx * fx + fy * fy).sqrt();
+            let a = (r + 0.5 - dist).clamp(0.0, 1.0);
+            let halo = ((r * 2.2 - dist) / (r * 1.2)).clamp(0.0, 1.0) * 0.25;
+            if a > 0.0 {
+                fb.blend(x + xx, y + yy, c, a);
+            } else if halo > 0.0 {
+                fb.blend(x + xx, y + yy, c, halo);
             }
         }
     }
@@ -658,7 +714,7 @@ mod tests {
         let mut buf = vec![0u32; w * h];
         p.draw(&mut buf, w, h, &e.term, &View { focused: true, cursor_on: true, ..View::default() });
         let (ox, oy) = p.origin();
-        let violet = theme::VIOLET.u32();
+        let violet = Rgb(167, 139, 250).u32();
         let row0: Vec<u32> = (0..cols * p.cell_w).map(|x| buf[(oy + p.cell_h / 2) * w + ox + x]).collect();
         assert!(row0.iter().filter(|&&v| v == violet).count() >= p.cell_w * 2, "the box's top line is drawn");
         assert!(buf.iter().any(|&v| v != theme::BG.u32() && v != violet), "text and the header are drawn");

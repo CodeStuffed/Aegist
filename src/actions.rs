@@ -38,7 +38,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("code", "Code"),
     ("run", "Run things"),
     ("look", "Look around"),
-    ("screen", "Your screen: be the mouse and keyboard"),
+    ("screen", "Screen: mouse and keyboard"),
     ("auto", "Autopilot"),
     ("think", "Decide and predict"),
     ("model", "The model"),
@@ -239,7 +239,7 @@ pub fn help(ctx: &Ctx, args: &str) {
         if !only.is_empty() && !group.starts_with(&only) && !title.to_lowercase().contains(&only) {
             continue;
         }
-        lines.push(format!("  {}", style::gradient_styled(title, i as f32 / GROUPS.len() as f32, true)));
+        lines.push(format!("  {}", widgets::heading(title.split(':').next().unwrap_or(title), i as f32 / GROUPS.len() as f32 * 0.6, w.saturating_sub(4))));
         for c in COMMANDS.iter().filter(|c| c.group == *group) {
             let left = format!("{} {}", Style::new().fg(pal::VIOLET).bold().paint(&format!("/{}", c.name)), style::faint(c.args));
             lines.push(text::truncate(&format!("    {}  {}", text::pad(&text::truncate(&left, name_w + 1), name_w + 1), style::dim(c.about)), w));
@@ -250,14 +250,14 @@ pub fn help(ctx: &Ctx, args: &str) {
         ctx.print(lines);
         return;
     }
-    lines.push(format!("  {}", style::gradient_styled("Or just say it", 0.3, true)));
+    lines.push(format!("  {}", widgets::heading("Or just say it", 0.3, w.saturating_sub(4))));
     for ex in ["write a snake game as a web page", "complete src/app.py:42", "fix `pytest -q`", "run main.py",
                "open notepad, type hello world and press enter", "switch to firefox then scroll down 5", "take a screenshot",
                "click 640 400", "fix the tests then run main.py", "draw a red rectangle in paint", "good / bad"] {
         lines.push(format!("    {} {}", style::fg(pal::VIOLET, "❯"), ex));
     }
     lines.push(String::new());
-    lines.push(format!("  {}", style::gradient_styled("Keys", 0.5, true)));
+    lines.push(format!("  {}", widgets::heading("Keys", 0.5, w.saturating_sub(4))));
     for (k, what) in [("enter", "send"), ("shift/alt+enter  \\+enter", "new line"), ("tab", "complete a command or path"),
                       ("↑ ↓", "history"), ("esc / ctrl+c", "stop the work in progress (and take the mouse back)"), ("!command", "run a shell command"),
                       ("ctrl+l", "clear the screen"), ("ctrl+d", "leave")] {
@@ -1121,12 +1121,13 @@ pub fn welcome(ctx: &Ctx) -> Vec<String> {
     let mut lines = vec![String::new()];
     lines.extend(widgets::banner(w));
     lines.push(String::new());
-    lines.push(format!("  {}  {}", style::gradient_styled("a coding AI grown from scratch", 0.0, true), style::faint(&format!("v{}", env!("CARGO_PKG_VERSION")))));
+    lines.push(format!("  {} {}  {}", style::badge(&format!("v{}", env!("CARGO_PKG_VERSION"))), style::gradient_styled(&style::spaced("neural code engine"), 0.0, true),
+                       style::faint("// grown from scratch")));
     lines.push(format!("  {}", style::dim("its own transformer and tokenizer, trained on code alone · no borrowed brains")));
     lines.push(String::new());
     let mut card = Vec::new();
     let key = |k: &str| Style::new().fg(pal::VIOLET).bold().paint(&text::pad(k, 9));
-    let dot = |ok: bool| if ok { style::fg(pal::CYAN, "◆") } else { style::fg(pal::YELLOW, "◇") };
+    let dot = |ok: bool| if ok { widgets::tag("OK", pal::VIOLET) } else { widgets::tag("WAIT", pal::YELLOW) };
     match checkpoint::load_meta(settings) {
         Some(meta) => {
             let c = &meta.config;
@@ -1153,10 +1154,10 @@ pub fn welcome(ctx: &Ctx) -> Vec<String> {
         None => cwd.display().to_string(),
     };
     card.push(format!("{} {} {place}", dot(true), key("folder")));
-    lines.extend(widgets::boxed(Some(&style::gradient_styled("✦ aegist", 0.2, true)), &card, w.min(78), pal::BORDER).into_iter().map(|l| format!("  {l}")));
+    lines.extend(widgets::boxed(Some(&style::gradient_styled(&style::spaced("system"), 0.2, true)), &card, w.min(80), pal::BORDER).into_iter().map(|l| format!("  {l}")));
     if checkpoint::load_meta(settings).is_none() {
         lines.push(String::new());
-        lines.push(format!("  {}", Style::new().bold().paint("Getting started")));
+        lines.push(format!("  {}", widgets::heading("Getting started", 0.4, w.saturating_sub(4).min(78))));
         for (n, cmd, what) in [("1", "/learn --pack python", "download well-known code to learn from (or /learn <your folder>)"),
                                ("2", "/train 1", "train for an hour - longer is smarter; ctrl+c stops and saves"),
                                ("3", "write a function that ...", "ask for code; everything is checked before you get it")] {
@@ -1170,16 +1171,25 @@ pub fn welcome(ctx: &Ctx) -> Vec<String> {
     };
     let chips = [chip("⌨", pal::CYAN, "code", "write · complete · fix · run"), chip("◉", pal::PINK, "screen", "click · type · keys · apps"),
                  chip("✦", pal::VIOLET, "autopilot", "many steps, planned first")];
-    if w >= 100 {
-        lines.push(format!("  {}", chips.join(&style::faint("   │   "))));
+    let one_line = format!("  {}", chips.join(&style::faint("   │   ")));
+    if text::width(&one_line) <= w.saturating_sub(1) {
+        lines.push(one_line);
     } else {
         lines.extend(chips.iter().map(|c| format!("  {c}")));
     }
     lines.push(String::new());
     let tries = ["write a snake game as a web page", "open notepad, type hello and press enter", "take a screenshot", "fix the tests then run main.py"];
-    lines.push(format!("  {} {}", style::faint("try"), tries.iter().map(|t| Style::new().fg(pal::SKY).paint(t)).collect::<Vec<_>>()
-        .join(&style::faint(" · "))));
-    lines.push(format!("  {}", style::faint("/help for everything · /help screen · /safety for what it will and won't do on your computer")));
+    // as many examples as fit on one line
+    let mut try_line = format!("  {}", style::faint("try"));
+    for (i, t) in tries.iter().enumerate() {
+        let piece = format!("{}{}", if i == 0 { " ".to_string() } else { style::faint(" · ") }, Style::new().fg(pal::SKY).paint(t));
+        if text::width(&try_line) + text::width(&piece) > w.saturating_sub(2) {
+            break;
+        }
+        try_line.push_str(&piece);
+    }
+    lines.push(try_line);
+    lines.push(text::truncate(&format!("  {}", style::faint("/help for everything · /help screen · /safety for what it will and won't do on your computer")), w));
     lines.push(String::new());
     lines
 }

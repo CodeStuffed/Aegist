@@ -1,7 +1,7 @@
 //! The input box: a multi-line editor with history, word movement, paste,
 //! and a menu of completions (slash commands, file paths).
 
-use super::style::{pal, Style};
+use super::style::{self, pal, Style};
 use super::text::{self, char_width};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -319,7 +319,14 @@ impl Editor {
         let inner = w - 4;
         let border = Style::new().fg(if accent { pal::VIOLET.shade(0.75) } else { pal::BORDER });
         let prompt = Style::new().fg(pal::VIOLET).bold().paint("❯");
-        let mut rows: Vec<String> = vec![border.paint(&format!("╭{}╮", "─".repeat(w - 2)))];
+        // the top border carries a small label: ╭─ ◆ AEGIST ──…──╮
+        let top = if w >= 30 {
+            let label = format!("{} {} ", Style::new().fg(pal::VIOLET).bold().paint("◆"), style::gradient_styled("AEGIST", 0.2, true));
+            format!("{}{label}{}", border.paint("╭─ "), border.paint(&format!("{}╮", "─".repeat(w - 2 - 11))))
+        } else {
+            border.paint(&format!("╭{}╮", "─".repeat(w - 2)))
+        };
+        let mut rows: Vec<String> = vec![top];
         let mut cursor = (1, 4);
         if self.buf.is_empty() {
             let ph = Style::new().fg(pal::FAINT).italic().paint(&text::truncate(placeholder, inner - 2));
@@ -366,24 +373,36 @@ impl Editor {
     }
 
     /// The completion menu, under the box.
+    /// The completions, as a dropdown box under the input: the chosen row
+    /// on a violet bar, the rest dimmed, and a count when there are more.
     pub fn render_menu(&self, width: usize) -> Vec<String> {
-        let label_w = self.menu.iter().map(|c| text::width(&c.label)).max().unwrap_or(0).min(28);
-        self.menu
-            .iter()
-            .enumerate()
-            .take(8)
-            .map(|(i, c)| {
-                let sel = i == self.menu_sel;
-                let label = text::pad(&c.label, label_w);
-                let line = if sel {
-                    format!("  {} {}  {}", Style::new().fg(pal::VIOLET).bold().paint("▸"), Style::new().fg(pal::VIOLET).bold().paint(&label),
-                            Style::new().fg(pal::DIM).paint(&c.detail))
-                } else {
-                    format!("    {}  {}", Style::new().fg(pal::SKY).paint(&label), Style::new().fg(pal::FAINT).paint(&c.detail))
-                };
-                text::truncate(&line, width.saturating_sub(1))
-            })
-            .collect()
+        if self.menu.is_empty() {
+            return Vec::new();
+        }
+        let shown = 8;
+        let start = self.menu_sel.saturating_sub(shown - 1);
+        let label_w = self.menu.iter().map(|c| text::width(&c.label)).max().unwrap_or(0).min(34);
+        let inner = width.saturating_sub(8).clamp(20, 110);
+        let b = Style::new().fg(pal::BORDER);
+        let mut out = vec![format!("  {}", b.paint(&format!("┌{}┐", "─".repeat(inner + 2))))];
+        for (i, c) in self.menu.iter().enumerate().skip(start).take(shown) {
+            let sel = i == self.menu_sel;
+            let label = text::pad(&text::truncate(&c.label, label_w), label_w);
+            let detail_w = inner.saturating_sub(label_w + 4);
+            let detail = text::truncate(&c.detail, detail_w);
+            let row = if sel {
+                let body = text::pad(&format!("▸ {label}  {detail}"), inner);
+                Style::new().fg(pal::INK).bg(pal::VIOLET).bold().paint(&body)
+            } else {
+                text::pad(&format!("  {}  {}", Style::new().fg(pal::SKY).paint(&label), Style::new().fg(pal::FAINT).paint(&detail)), inner)
+            };
+            out.push(format!("  {} {row} {}", b.paint("│"), b.paint("│")));
+        }
+        let more = if self.menu.len() > shown { format!(" {}/{} ", self.menu_sel + 1, self.menu.len()) } else { String::new() };
+        let hint = " tab completes · ↑↓ choose ";
+        let fill = (inner + 2).saturating_sub(text::width(hint) + text::width(&more));
+        out.push(format!("  {}{}{}{}", b.paint("└"), style::faint(hint), b.paint(&format!("{}{more}", "─".repeat(fill))), b.paint("┘")));
+        out.into_iter().map(|l| text::truncate(&l, width.saturating_sub(1))).collect()
     }
 }
 

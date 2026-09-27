@@ -45,6 +45,26 @@ pub fn banner(width: usize) -> Vec<String> {
         .collect()
 }
 
+/// A section heading, the techy way: `▍ C O M M A N D S ━━━━━━━━──────`,
+/// the capitals in the gradient and the rule fading out.
+pub fn heading(title: &str, phase: f32, width: usize) -> String {
+    let label = style::gradient_styled(&style::spaced(title), phase, true);
+    let used = text::width(&style::spaced(title)) + 4;
+    let rest = width.saturating_sub(used + 2).min(48);
+    let mut rule = String::new();
+    for i in 0..rest {
+        let t = i as f32 / rest.max(1) as f32;
+        let c = pal::aurora(phase + t * 0.3).lerp(pal::BORDER, t);
+        rule.push_str(&Style::new().fg(c).paint(if i < rest / 3 { "━" } else { "─" }));
+    }
+    format!("{} {label} {rule}", Style::new().fg(pal::VIOLET).bold().paint("▍"))
+}
+
+/// A boot-screen style status tag: `[ OK ]`, `[WAIT]`, `[FAIL]`.
+pub fn tag(state: &str, color: Rgb) -> String {
+    format!("{}{}{}", style::faint("["), Style::new().fg(color).bold().paint(&format!("{state:^4}")), style::faint("]"))
+}
+
 /// `lines` in a box with rounded corners and an optional title in the top border.
 pub fn boxed(title: Option<&str>, lines: &[String], width: usize, border: Rgb) -> Vec<String> {
     let inner = width.saturating_sub(4).max(10);
@@ -306,12 +326,31 @@ pub fn report(r: &Report, lang_name: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Spinner frames and the shimmering status text beside them.
+/// The working line: a spinner, a scanner bar sweeping back and forth,
+/// and the shimmering status text.
 pub fn spinner(tick: u64, label: &str) -> String {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let phase = (tick % 60) as f32 / 60.0;
     let glyph = Style::new().fg(pal::aurora(phase)).bold().paint(FRAMES[(tick % 10) as usize]);
-    format!("{glyph} {}", shimmer(label, tick))
+    format!("{glyph} {} {}", scanner(tick, 10), shimmer(label, tick))
+}
+
+/// A little bar with a light running back and forth: `▱▱▰▰▰▱▱▱▱▱`.
+pub fn scanner(tick: u64, width: usize) -> String {
+    if !style::enabled() {
+        return String::new();
+    }
+    let span = (width.max(2) - 1) as u64 * 2;
+    let p = (tick / 2) % span;
+    let pos = if p < width as u64 { p } else { span - p } as f32;
+    let mut out = String::new();
+    for i in 0..width {
+        let d = (i as f32 - pos).abs();
+        let lit = d < 1.6;
+        let c = if lit { pal::aurora(i as f32 / width as f32).lerp(Rgb(255, 255, 255), (1.0 - d / 1.6) * 0.35) } else { pal::BORDER };
+        out.push_str(&Style::new().fg(c).paint(if lit { "▰" } else { "▱" }));
+    }
+    out
 }
 
 /// Text with a soft highlight sweeping across it.
